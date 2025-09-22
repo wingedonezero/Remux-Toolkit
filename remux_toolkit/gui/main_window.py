@@ -5,6 +5,7 @@ from remux_toolkit.core.managers import AppManager
 from remux_toolkit.tools.silence_checker.silence_checker_gui import SilenceCheckerWidget
 from remux_toolkit.tools.media_comparator.media_comparator_gui import MediaComparatorWidget
 from remux_toolkit.tools.video_renamer.video_renamer_gui import VideoRenamerWidget
+from remux_toolkit.tools.mkv_splitter.mkv_splitter_gui import MKVSplitterWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -26,8 +27,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_silence_checker_action.triggered.connect(self.open_silence_checker)
         self.open_media_comparator_action = QtGui.QAction("Media Comparator", self)
         self.open_media_comparator_action.triggered.connect(self.open_media_comparator)
-        self.open_video_renamer_action = QtGui.QAction("Video Renamer", self)
+        self.open_video_renamer_action = QtGui.QAction("Video Episode Renamer", self)
         self.open_video_renamer_action.triggered.connect(self.open_video_renamer)
+        self.open_mkv_splitter_action = QtGui.QAction("MKV Episode Splitter", self)
+        self.open_mkv_splitter_action.triggered.connect(self.open_mkv_splitter)
 
     def _create_menus(self):
         menu_bar = self.menuBar()
@@ -35,15 +38,12 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_silence_checker_action)
         tools_menu.addAction(self.open_media_comparator_action)
         tools_menu.addAction(self.open_video_renamer_action)
+        tools_menu.addAction(self.open_mkv_splitter_action)
 
-    def open_silence_checker(self):
-        self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
-
-    def open_media_comparator(self):
-        self._open_tool("MediaComparator", "Media Comparator", MediaComparatorWidget)
-
-    def open_video_renamer(self):
-        self._open_tool("VideoRenamer", "Video Episode Renamer", VideoRenamerWidget)
+    def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
+    def open_media_comparator(self): self._open_tool("MediaComparator", "Media Comparator", MediaComparatorWidget)
+    def open_video_renamer(self): self._open_tool("VideoRenamer", "Video Episode Renamer", VideoRenamerWidget)
+    def open_mkv_splitter(self): self._open_tool("MKVSplitter", "MKV Episode Splitter", MKVSplitterWidget)
 
     def _open_tool(self, tool_name, tab_title, widget_class):
         if tool_name in self.open_tools:
@@ -58,15 +58,12 @@ class MainWindow(QtWidgets.QMainWindow):
         widget_to_close = self.tab_widget.widget(index)
         if not widget_to_close: return
         tool_name_to_remove = next((name for name, widget in self.open_tools.items() if widget == widget_to_close), None)
-
         if hasattr(widget_to_close, 'save_settings'):
             print(f"Saving settings for {tool_name_to_remove}...")
             widget_to_close.save_settings()
-
         if hasattr(widget_to_close, 'shutdown'):
             print(f"Closing tab for {tool_name_to_remove}. Shutting down worker...")
             widget_to_close.shutdown()
-
         self.tab_widget.removeTab(index)
         if tool_name_to_remove: del self.open_tools[tool_name_to_remove]
         widget_to_close.deleteLater()
