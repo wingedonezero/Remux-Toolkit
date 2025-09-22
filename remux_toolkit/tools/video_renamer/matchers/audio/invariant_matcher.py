@@ -40,9 +40,9 @@ class InvariantMatcher(BaseMatcher):
             print("ERROR: librosa is not installed. Please run 'pip install librosa'")
             return None
 
-        cache_key = (path, language, "invariant")
-        if hasattr(self, '_fingerprint_cache') and cache_key in self._fingerprint_cache:
-            return self._fingerprint_cache[cache_key]
+        cached_fp = self.cache.get_invariant_fingerprint(path, language)
+        if cached_fp is not None:
+            return cached_fp
 
         duration = get_media_duration(path)
         if not duration: return None
@@ -93,10 +93,7 @@ class InvariantMatcher(BaseMatcher):
                 h = sha1(hash_input).hexdigest()[0:20]
                 fingerprint[h] = anchor_time
 
-        if not hasattr(self, '_fingerprint_cache'):
-            self._fingerprint_cache = {}
-        self._fingerprint_cache[cache_key] = fingerprint
-
+        self.cache.set_invariant_fingerprint(path, language, fingerprint)
         return fingerprint
 
     def compare_fingerprints(self, fp1: Any, fp2: Any) -> float:

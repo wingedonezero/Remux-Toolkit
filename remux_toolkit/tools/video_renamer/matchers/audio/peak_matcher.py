@@ -37,9 +37,9 @@ class PeakMatcher(BaseMatcher):
             print("ERROR: librosa is not installed. Please run 'pip install librosa'")
             return None
 
-        cache_key = (path, language)
-        if hasattr(self, '_fingerprint_cache') and cache_key in self._fingerprint_cache:
-            return self._fingerprint_cache[cache_key]
+        cached_fp = self.cache.get_peak_fingerprint(path, language)
+        if cached_fp is not None:
+            return cached_fp
 
         duration = get_media_duration(path)
         if not duration: return None
@@ -87,10 +87,7 @@ class PeakMatcher(BaseMatcher):
                 h = sha1(hash_input).hexdigest()[0:20]
                 fingerprint[h] = time1
 
-        if not hasattr(self, '_fingerprint_cache'):
-            self._fingerprint_cache = {}
-        self._fingerprint_cache[cache_key] = fingerprint
-
+        self.cache.set_peak_fingerprint(path, language, fingerprint)
         return fingerprint
 
     def compare_fingerprints(self, fp1: Any, fp2: Any) -> float:

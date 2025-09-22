@@ -23,10 +23,13 @@ class MediaCache:
         # Video caches
         self._video_hash_cache: Dict[Tuple[Path, str], Any] = {}
         self._scene_cache: Dict[Path, list] = {}
+        self._videohash_cache: Dict[Path, str] = {}
 
         # Audio fingerprint caches
         self._chromaprint_cache: Dict[Tuple[Path, int], str] = {}
         self._mfcc_cache: Dict[Tuple[Path, int], np.ndarray] = {}
+        self._peak_fp_cache: Dict[Tuple[Path, Optional[str]], dict] = {}
+        self._invariant_fp_cache: Dict[Tuple[Path, Optional[str]], dict] = {}
 
     def clear(self):
         """Clear all caches"""
@@ -37,8 +40,11 @@ class MediaCache:
             self._audio_cache_size = 0
             self._video_hash_cache.clear()
             self._scene_cache.clear()
+            self._videohash_cache.clear()
             self._chromaprint_cache.clear()
             self._mfcc_cache.clear()
+            self._peak_fp_cache.clear()
+            self._invariant_fp_cache.clear()
 
     def get_duration(self, path: Path) -> Optional[float]:
         """Get cached duration or None"""
@@ -68,7 +74,6 @@ class MediaCache:
         with self._lock:
             key = (path, stream_idx, sample_rate)
 
-            # Check if we need to evict old entries
             audio_bytes = audio.nbytes
             if self._audio_cache_size + audio_bytes > self.max_audio_bytes:
                 self._evict_audio(audio_bytes)
@@ -78,7 +83,6 @@ class MediaCache:
 
     def _evict_audio(self, needed_bytes: int):
         """Evict oldest audio entries to make room"""
-        # Simple FIFO eviction
         while self._audio_cache and self._audio_cache_size + needed_bytes > self.max_audio_bytes:
             key = next(iter(self._audio_cache))
             audio = self._audio_cache.pop(key)
@@ -125,3 +129,34 @@ class MediaCache:
         with self._lock:
             key = (path, stream_idx)
             self._mfcc_cache[key] = features
+
+    def get_peak_fingerprint(self, path: Path, language: Optional[str]) -> Optional[dict]:
+        """Get cached peak matcher fingerprint"""
+        key = (path, language)
+        return self._peak_fp_cache.get(key)
+
+    def set_peak_fingerprint(self, path: Path, language: Optional[str], fingerprint: dict):
+        """Cache peak matcher fingerprint"""
+        with self._lock:
+            key = (path, language)
+            self._peak_fp_cache[key] = fingerprint
+
+    def get_invariant_fingerprint(self, path: Path, language: Optional[str]) -> Optional[dict]:
+        """Get cached invariant matcher fingerprint"""
+        key = (path, language)
+        return self._invariant_fp_cache.get(key)
+
+    def set_invariant_fingerprint(self, path: Path, language: Optional[str], fingerprint: dict):
+        """Cache invariant matcher fingerprint"""
+        with self._lock:
+            key = (path, language)
+            self._invariant_fp_cache[key] = fingerprint
+
+    def get_videohash(self, path: Path) -> Optional[str]:
+        """Get cached videohash fingerprint"""
+        return self._videohash_cache.get(path)
+
+    def set_videohash(self, path: Path, fingerprint: str):
+        """Cache videohash fingerprint"""
+        with self._lock:
+            self._videohash_cache[path] = fingerprint

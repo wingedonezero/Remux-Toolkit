@@ -6,3 +6,4 @@ imagehash>=4.3.0
 librosa>=0.10.0
 scenedetect[opencv]>=0.6.0
 opencv-python>=4.8.0
+videohash>=1.0.0
