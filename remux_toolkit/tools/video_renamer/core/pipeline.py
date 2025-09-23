@@ -1,7 +1,4 @@
-"""
-core/pipeline.py - Main matching pipeline orchestrator
-"""
-
+# remux_toolkit/tools/video_renamer/core/pipeline.py
 from pathlib import Path
 from typing import List, Dict, Generator, Optional
 from dataclasses import dataclass
@@ -16,6 +13,8 @@ from remux_toolkit.tools.video_renamer.matchers.audio.mfcc import MFCCMatcher
 from remux_toolkit.tools.video_renamer.matchers.video.phash import PerceptualHashMatcher
 from remux_toolkit.tools.video_renamer.matchers.video.scene import SceneDetectionMatcher
 from remux_toolkit.tools.video_renamer.matchers.video.videohash_matcher import VideoHashMatcher
+# --- FIXED: Import the utility function directly ---
+from remux_toolkit.tools.video_renamer.utils.media import extract_audio_segment
 
 @dataclass
 class MatchConfig:
@@ -66,6 +65,8 @@ class MatchingPipeline:
         fingerprinting_modes = ['chromaprint', 'peak_matcher', 'invariant_matcher', 'videohash']
         if self._mode in fingerprinting_modes:
             yield from self._run_fingerprint_batch(references, remuxes)
+        elif self._mode == 'correlation':
+             yield from self._run_correlation_batch(references, remuxes)
         else:
             yield from self._run_exhaustive_compare(references, remuxes)
 
@@ -74,6 +75,73 @@ class MatchingPipeline:
         else:
              yield {'type': 'progress', 'message': 'Matching stopped', 'value': 0}
 
+    def _run_correlation_batch(self, references: List[Path], remuxes: List[Path]):
+        if not isinstance(self._matcher, CorrelationMatcher):
+             yield {'type': 'progress', 'message': 'ERROR: Correlation mode selected with wrong matcher type.', 'value': 0}
+             return
+
+        yield {'type': 'progress', 'message': f'Analyzing {len(references)} reference files...', 'value': 0}
+        ref_templates = {}
+        with ThreadPoolExecutor(max_workers=self._num_workers) as executor:
+            tasks = {executor.submit(self._matcher.get_template, path, self._language): path for path in references}
+            for i, future in enumerate(as_completed(tasks)):
+                if not self._running:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return
+                path = tasks[future]
+                try:
+                    template = future.result()
+                    if template:
+                        ref_templates[path] = template
+                except Exception as e:
+                    print(f"Error creating template for {path.name}: {e}")
+                progress = int(((i + 1) / len(references)) * 50) if references else 0
+                yield {'type': 'progress', 'message': f'Analyzing reference files: {i+1}/{len(references)}', 'value': progress}
+
+        if not self._running: return
+
+        for i, remux_path in enumerate(remuxes):
+            if not self._running: return
+            if not ref_templates:
+                yield {'type': 'match_list', 'data': {'remux_path': str(remux_path), 'matches': []}}
+                continue
+
+            yield {'type': 'progress', 'message': f'Matching {remux_path.name} ({i+1}/{len(remuxes)})...', 'value': 50 + int((i / len(remuxes)) * 50)}
+
+            remux_stream_idx = self._matcher.get_audio_stream_index(remux_path, self._language)
+            if remux_stream_idx is None:
+                yield {'type': 'match_list', 'data': {'remux_path': str(remux_path), 'matches': []}}
+                continue
+
+            # --- FIXED: Call the imported function correctly and request mono audio ---
+            remux_audio = extract_audio_segment(remux_path, remux_stream_idx, 48000, num_channels=1)
+
+            if remux_audio is None:
+                yield {'type': 'match_list', 'data': {'remux_path': str(remux_path), 'matches': []}}
+                continue
+
+            best_score = -1.0
+            best_match_ref_path = None
+            best_match_info = ""
+
+            for ref_path, ref_template in ref_templates.items():
+                 remux_chunks = self._matcher._extract_chunks_at_times(remux_audio, ref_template['times'], 48000)
+                 score, offset_ms = self._matcher.compare_templates(ref_template['chunks'], remux_chunks)
+                 if score > best_score:
+                     best_score = score
+                     best_match_ref_path = ref_path
+                     best_match_info = f"Delay={offset_ms:.0f}ms, {score:.0%} accepted chunks"
+
+            # --- FIXED: Compare score (0-1) to threshold (0-1) correctly ---
+            if best_match_ref_path and best_score >= self._threshold:
+                match_data = [{'ref': best_match_ref_path, 'score': best_score, 'info': best_match_info}]
+                yield {'type': 'match_list', 'data': {'remux_path': str(remux_path), 'matches': match_data}}
+                del ref_templates[best_match_ref_path]
+            else:
+                yield {'type': 'match_list', 'data': {'remux_path': str(remux_path), 'matches': []}}
+
+        for ref_path in ref_templates.keys():
+            yield {'type': 'unused_ref', 'data': {'reference_path': str(ref_path)}}
 
     def _run_fingerprint_batch(self, references: List[Path], remuxes: List[Path]):
         total_files = len(references) + len(remuxes)
@@ -103,8 +171,15 @@ class MatchingPipeline:
         used_references = set()
         for remux_path, remux_fp in remux_fingerprints.items():
             for ref_path, ref_fp in ref_fingerprints.items():
-                score = self._matcher.compare_fingerprints(ref_fp, remux_fp)
-                all_matches[remux_path].append({'ref': ref_path, 'score': score})
+                result = self._matcher.compare_fingerprints(ref_fp, remux_fp)
+                match_data = {'ref': ref_path}
+                if isinstance(result, (tuple, list)):
+                    score, offset = result
+                    match_data['score'] = score
+                    match_data['info'] = f'offset={offset:.2f}s'
+                else:
+                    match_data['score'] = result
+                all_matches[remux_path].append(match_data)
         for remux_path, matches in all_matches.items():
             sorted_matches = sorted(matches, key=lambda x: x['score'], reverse=True)
             if sorted_matches and sorted_matches[0]['score'] >= self._threshold: used_references.add(sorted_matches[0]['ref'])

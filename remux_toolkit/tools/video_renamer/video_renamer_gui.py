@@ -50,6 +50,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Renamer Settings")
         self.setMinimumWidth(500)
         layout = QVBoxLayout(self)
+
         general_group = QGroupBox("General Matching Settings")
         form_layout = QtWidgets.QFormLayout(general_group)
         self.offset_spinbox = QSpinBox()
@@ -61,6 +62,16 @@ class SettingsDialog(QDialog):
         self.workers_spinbox.setRange(1, max_threads)
         self.workers_spinbox.setSuffix(" threads")
         form_layout.addRow("Number of Workers:", self.workers_spinbox)
+
+        # --- NEW WIDGET: Algorithm Selector ---
+        self.algorithm_combo = QComboBox()
+        self.algorithm_combo.addItem("Algorithm 2 (Fast/Default)", 2)
+        self.algorithm_combo.addItem("Algorithm 3 (Accurate)", 3)
+        self.algorithm_combo.addItem("Algorithm 4 (Balanced)", 4)
+        self.algorithm_combo.addItem("Algorithm 5 (Latest)", 5)
+        form_layout.addRow("Chromaprint Algorithm:", self.algorithm_combo)
+        # --- END NEW WIDGET ---
+
         layout.addWidget(general_group)
         panako_group = QGroupBox("Panako Fingerprinter (Deprecated)")
         panako_layout = QHBoxLayout(panako_group)
@@ -70,21 +81,38 @@ class SettingsDialog(QDialog):
         panako_layout.addWidget(QtWidgets.QLabel("panako.jar Path:"))
         panako_layout.addWidget(self.panako_path_edit)
         panako_layout.addWidget(browse_btn)
+
         layout.addWidget(panako_group)
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
         self._load_settings()
+
     def _browse(self, title, file_filter, line_edit):
         file_path, _ = QFileDialog.getOpenFileName(self, title, "", file_filter)
         if file_path: line_edit.setText(file_path)
+
     def _load_settings(self):
         self.panako_path_edit.setText(self.current_settings.get('panako_jar', ''))
         self.offset_spinbox.setValue(self.current_settings.get('analysis_start_percent', 15))
         self.workers_spinbox.setValue(self.current_settings.get('num_workers', 8))
+
+        # --- NEW LOGIC: Load algorithm setting ---
+        algo = self.current_settings.get('chromaprint_algorithm', 2)
+        index = self.algorithm_combo.findData(algo)
+        if index >= 0:
+            self.algorithm_combo.setCurrentIndex(index)
+        # --- END NEW LOGIC ---
+
     def get_settings(self) -> dict:
-        return {'panako_jar': self.panako_path_edit.text(), 'analysis_start_percent': self.offset_spinbox.value(), 'num_workers': self.workers_spinbox.value()}
+        return {
+            'panako_jar': self.panako_path_edit.text(),
+            'analysis_start_percent': self.offset_spinbox.value(),
+            'num_workers': self.workers_spinbox.value(),
+            # --- NEW SETTING: Save algorithm choice ---
+            'chromaprint_algorithm': self.algorithm_combo.currentData()
+        }
 
 class VideoRenamerWidget(QWidget):
     def __init__(self, app_manager, parent=None):
@@ -106,13 +134,16 @@ class VideoRenamerWidget(QWidget):
         folder_group = QGroupBox("Folder Selection")
         folder_layout = QtWidgets.QFormLayout(folder_group)
         self.ref_folder = QLineEdit()
+
         ref_btn = QPushButton("Browse...")
         ref_btn.clicked.connect(lambda: self._select_folder(self.ref_folder))
-        ref_row = QHBoxLayout(); ref_row.addWidget(self.ref_folder); ref_row.addWidget(ref_btn)
+        ref_row = QHBoxLayout();
+        ref_row.addWidget(self.ref_folder); ref_row.addWidget(ref_btn)
         self.remux_folder = QLineEdit()
         remux_btn = QPushButton("Browse...")
         remux_btn.clicked.connect(lambda: self._select_folder(self.remux_folder))
-        remux_row = QHBoxLayout(); remux_row.addWidget(self.remux_folder); remux_row.addWidget(remux_btn)
+        remux_row = QHBoxLayout();
+        remux_row.addWidget(self.remux_folder); remux_row.addWidget(remux_btn)
         folder_layout.addRow("Reference (Correctly Named):", ref_row)
         folder_layout.addRow("Remux (To Rename):", remux_row)
         layout.addWidget(folder_group)
@@ -126,20 +157,30 @@ class VideoRenamerWidget(QWidget):
             "Perceptual Hash (Video)", "Scene Detection (Video)"
         ])
         config_layout.addWidget(self.mode_combo)
-        self.lang_label = QLabel("Language:"); config_layout.addWidget(self.lang_label)
-        self.lang_input = QLineEdit(); self.lang_input.setMaximumWidth(60); self.lang_input.setPlaceholderText("jpn"); config_layout.addWidget(self.lang_input)
+        self.lang_label = QLabel("Language:");
+        config_layout.addWidget(self.lang_label)
+        self.lang_input = QLineEdit(); self.lang_input.setMaximumWidth(60); self.lang_input.setPlaceholderText("jpn");
+        config_layout.addWidget(self.lang_input)
         config_layout.addWidget(QLabel("Min Confidence:"))
-        self.confidence_slider = QSlider(Qt.Orientation.Horizontal); self.confidence_slider.setRange(50, 95); self.confidence_slider.setValue(75); self.confidence_slider.setTickPosition(QSlider.TickPosition.TicksBelow); self.confidence_slider.setTickInterval(5); config_layout.addWidget(self.confidence_slider)
-        self.confidence_label = QLabel("75%"); self.confidence_slider.valueChanged.connect(lambda v: self.confidence_label.setText(f"{v}%")); config_layout.addWidget(self.confidence_label)
+        self.confidence_slider = QSlider(Qt.Orientation.Horizontal);
+        self.confidence_slider.setRange(50, 95); self.confidence_slider.setValue(75); self.confidence_slider.setTickPosition(QSlider.TickPosition.TicksBelow); self.confidence_slider.setTickInterval(5); config_layout.addWidget(self.confidence_slider)
+        self.confidence_label = QLabel("75%"); self.confidence_slider.valueChanged.connect(lambda v: self.confidence_label.setText(f"{v}%"));
+        config_layout.addWidget(self.confidence_label)
         config_layout.addStretch()
         layout.addWidget(config_group)
         control_layout = QHBoxLayout()
-        self.start_btn = QPushButton("Start Matching"); self.start_btn.clicked.connect(self.start_matching)
-        self.stop_btn = QPushButton("Stop"); self.stop_btn.clicked.connect(self.stop_matching); self.stop_btn.setEnabled(False)
-        self.settings_btn = QPushButton("Settings..."); self.settings_btn.clicked.connect(self._open_settings_dialog)
-        self.clear_cache_btn = QPushButton("Clear Cache"); self.clear_cache_btn.clicked.connect(self._clear_cache)
-        self.rename_btn = QPushButton("Rename Matched Files"); self.rename_btn.clicked.connect(self.rename_files); self.rename_btn.setEnabled(False)
-        control_layout.addWidget(self.start_btn); control_layout.addWidget(self.stop_btn); control_layout.addWidget(self.settings_btn); control_layout.addWidget(self.clear_cache_btn); control_layout.addStretch(); control_layout.addWidget(self.rename_btn)
+        self.start_btn = QPushButton("Start Matching");
+        self.start_btn.clicked.connect(self.start_matching)
+        self.stop_btn = QPushButton("Stop"); self.stop_btn.clicked.connect(self.stop_matching);
+        self.stop_btn.setEnabled(False)
+        self.settings_btn = QPushButton("Settings...");
+        self.settings_btn.clicked.connect(self._open_settings_dialog)
+        self.clear_cache_btn = QPushButton("Clear Cache");
+        self.clear_cache_btn.clicked.connect(self._clear_cache)
+        self.rename_btn = QPushButton("Rename Matched Files"); self.rename_btn.clicked.connect(self.rename_files);
+        self.rename_btn.setEnabled(False)
+        control_layout.addWidget(self.start_btn); control_layout.addWidget(self.stop_btn); control_layout.addWidget(self.settings_btn); control_layout.addWidget(self.clear_cache_btn); control_layout.addStretch();
+        control_layout.addWidget(self.rename_btn)
         layout.addLayout(control_layout)
         self.results_tree = QTreeWidget()
         self.results_tree.setColumnCount(4)
@@ -150,10 +191,12 @@ class VideoRenamerWidget(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+
         layout.addWidget(self.results_tree, 1)
         status_layout = QHBoxLayout()
         self.status_label = QLabel("Ready")
-        self.progress = QProgressBar(); self.progress.setTextVisible(True)
+        self.progress = QProgressBar();
+        self.progress.setTextVisible(True)
         status_layout.addWidget(self.status_label, 1)
         status_layout.addWidget(self.progress)
         layout.addLayout(status_layout)
@@ -161,13 +204,16 @@ class VideoRenamerWidget(QWidget):
     def start_matching(self):
         if self.matcher_thread and self.matcher_thread.isRunning(): return
         if not self.ref_folder.text() or not self.remux_folder.text():
-            QMessageBox.warning(self, "Error", "Please select both folders"); return
+            QMessageBox.warning(self, "Error", "Please select both folders");
+            return
         ref_files = self._get_video_files(Path(self.ref_folder.text()))
         remux_files = self._get_video_files(Path(self.remux_folder.text()))
         if not ref_files or not remux_files:
-            QMessageBox.warning(self, "Error", "No video files found in one or both folders."); return
+            QMessageBox.warning(self, "Error", "No video files found in one or both folders.");
+            return
         self.status_label.setText(f"Starting {self.mode_combo.currentText()}..."); self.progress.setValue(0)
-        self.start_btn.setEnabled(False); self.stop_btn.setEnabled(True); self.rename_btn.setEnabled(False)
+        self.start_btn.setEnabled(False); self.stop_btn.setEnabled(True);
+        self.rename_btn.setEnabled(False)
         self.results_tree.clear()
 
         mode_map = {
@@ -176,6 +222,7 @@ class VideoRenamerWidget(QWidget):
             "Invariant Matcher (Audio)": "invariant_matcher", "MFCC (Audio)": "mfcc",
             "Perceptual Hash (Video)": "phash", "Scene Detection (Video)": "scene"
         }
+
         mode = mode_map.get(self.mode_combo.currentText(), "videohash")
 
         settings = self.app_manager.load_config(self.tool_name, config.DEFAULTS)
@@ -187,6 +234,7 @@ class VideoRenamerWidget(QWidget):
         self.matcher_thread.progress.connect(self.update_progress)
         self.matcher_thread.match_list_found.connect(self.add_match_list_result)
         self.matcher_thread.unused_ref_found.connect(self.add_unused_ref_result)
+
         self.matcher_thread.finished.connect(self.matching_finished)
         self.matcher_thread.start()
 
@@ -198,33 +246,29 @@ class VideoRenamerWidget(QWidget):
         parent_item = QTreeWidgetItem(self.results_tree)
         parent_item.setText(0, remux_path.name)
         parent_item.setData(0, Qt.ItemDataRole.UserRole, str(remux_path))
+        parent_item.setExpanded(True)
 
-        if not matches:
+        if not matches or matches[0]['score'] < threshold:
             parent_item.setText(3, "Unmatched")
-            parent_item.setForeground(0, QColor('black'))
-            parent_item.setBackground(0, QColor(255, 182, 193))
+            parent_item.setForeground(0, QBrush(QColor('black')))
+            parent_item.setBackground(0, QBrush(QColor(255, 182, 193))) # Light red
             return
 
-        best_match_score = matches[0]['score']
-        status = "Matched" if best_match_score >= threshold else "Low Confidence"
-        color = QColor(144, 238, 144) if status == "Matched" else QColor(255, 200, 150)
+        best_match = matches[0]
+        ref_path = Path(best_match['ref'])
+        conf = best_match['score']
+        info = best_match.get('info', '')
 
-        parent_item.setText(3, status)
-        parent_item.setForeground(0, QColor('black'))
-        parent_item.setBackground(0, color)
+        parent_item.setText(3, "Matched")
+        parent_item.setForeground(0, QBrush(QColor('black')))
+        parent_item.setBackground(0, QBrush(QColor(144, 238, 144))) # Light green
 
-        for match in matches:
-            ref_path = Path(match['ref'])
-            conf = match['score']
-            info = match.get('info', f"{self.mode_combo.currentText().split(' ')[0]} similarity")
+        child_item = QTreeWidgetItem(parent_item)
+        child_item.setText(0, f"  └─ {ref_path.name}")
+        child_item.setText(1, f"{conf:.1%}")
+        child_item.setText(2, info)
+        child_item.setData(0, Qt.ItemDataRole.UserRole, str(ref_path))
 
-            child_item = QTreeWidgetItem(parent_item)
-            child_item.setText(0, f"  └─ {ref_path.name}")
-            child_item.setText(1, f"{conf:.1%}")
-            child_item.setText(2, f"{info}: {conf:.1%}")
-            child_item.setData(0, Qt.ItemDataRole.UserRole, str(ref_path))
-
-        parent_item.setExpanded(True)
         self.rename_btn.setEnabled(True)
 
     def add_unused_ref_result(self, data):
@@ -232,24 +276,24 @@ class VideoRenamerWidget(QWidget):
         parent_item = QTreeWidgetItem(self.results_tree)
         parent_item.setText(0, ref_path.name)
         parent_item.setText(3, "Unused")
-        parent_item.setForeground(0, QColor('black'))
-        parent_item.setBackground(0, QColor(220, 220, 220))
+        parent_item.setForeground(0, QBrush(QColor('black')))
+        parent_item.setBackground(0, QBrush(QColor(220, 220, 220)))
 
     def rename_files(self):
         rename_list = []
         for i in range(self.results_tree.topLevelItemCount()):
             parent_item = self.results_tree.topLevelItem(i)
-            if parent_item.childCount() > 0:
+            if parent_item.text(3) == "Matched" and parent_item.childCount() > 0:
                 original_full_path = Path(parent_item.data(0, Qt.ItemDataRole.UserRole))
                 best_match_child = parent_item.child(0)
                 proposed_full_path = Path(best_match_child.data(0, Qt.ItemDataRole.UserRole))
 
                 new_path = original_full_path.parent / (proposed_full_path.stem + original_full_path.suffix)
-                if parent_item.text(3) == "Matched":
-                    rename_list.append((original_full_path, new_path))
+                rename_list.append((original_full_path, new_path))
 
         if not rename_list:
-            QMessageBox.information(self, "Info", "No files with a 'Matched' status to rename."); return
+            QMessageBox.information(self, "Info", "No files with a 'Matched' status to rename.");
+            return
 
         msg = f"Rename {len(rename_list)} files?\n\nExamples:\n"
         for orig, new in rename_list[:3]: msg += f"{orig.name} → {new.name}\n"
@@ -262,7 +306,8 @@ class VideoRenamerWidget(QWidget):
         for orig, new in rename_list:
             try:
                 if new.exists():
-                    errors.append(f"{new.name} already exists"); continue
+                    errors.append(f"{new.name} already exists");
+                    continue
                 orig.rename(new)
                 success += 1
             except Exception as e:
@@ -281,7 +326,8 @@ class VideoRenamerWidget(QWidget):
         self.progress.setValue(100)
 
     def _clear_cache(self):
-        self.cache.clear(); self.results_tree.clear(); self.status_label.setText("Cache cleared")
+        self.cache.clear();
+        self.results_tree.clear(); self.status_label.setText("Cache cleared")
     def _open_settings_dialog(self):
         current_settings = self.app_manager.load_config(self.tool_name, config.DEFAULTS)
         dialog = SettingsDialog(current_settings, self)
@@ -293,15 +339,18 @@ class VideoRenamerWidget(QWidget):
             self._load_settings()
     def _on_mode_changed(self, mode_text):
         is_audio = "Audio" in mode_text
-        self.lang_label.setVisible(is_audio); self.lang_input.setVisible(is_audio)
+        self.lang_label.setVisible(is_audio);
+        self.lang_input.setVisible(is_audio)
     def _select_folder(self, line_edit):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder: line_edit.setText(folder)
     def stop_matching(self):
         if self.matcher_thread:
-            self.matcher_thread.stop(); self.stop_btn.setEnabled(False); self.status_label.setText("Stopping...")
+            self.matcher_thread.stop();
+            self.stop_btn.setEnabled(False); self.status_label.setText("Stopping...")
     def update_progress(self, message, value):
-        self.status_label.setText(message); self.progress.setValue(value)
+        self.status_label.setText(message);
+        self.progress.setValue(value)
     def _get_video_files(self, folder: Path) -> List[Path]:
         extensions = {'.mkv', '.mp4', '.avi', '.mov', 'ts', '.m2ts'}
         return sorted([p for ext in extensions for p in folder.glob(f"**/*{ext}")])
@@ -311,6 +360,7 @@ class VideoRenamerWidget(QWidget):
         self.remux_folder.setText(settings.get('remux_folder', ''))
         self.lang_input.setText(settings.get('language', 'jpn'))
         mode_idx = self.mode_combo.findText(settings.get('mode', 'Correlation (Audio)'))
+
         if mode_idx >= 0: self.mode_combo.setCurrentIndex(mode_idx)
         self.confidence_slider.setValue(settings.get('confidence', 75))
         class LoadedConfig:

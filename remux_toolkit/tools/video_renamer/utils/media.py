@@ -1,7 +1,4 @@
-# ===========================================
-# utils/media.py - Media operations
-# ===========================================
-
+# remux_toolkit/tools/video_renamer/utils/media.py
 import subprocess
 import json
 import numpy as np
@@ -38,20 +35,25 @@ def get_media_duration(file_path: Path) -> Optional[float]:
     return None
 
 def extract_audio_segment(file_path: Path, stream_index: int, sample_rate: int,
-                      start_time: float = 0, duration_limit: Optional[float] = None) -> Optional[np.ndarray]:
+                       start_time: float = 0, duration_limit: Optional[float] = None, num_channels: Optional[int] = None) -> Optional[np.ndarray]:
     """Extract audio segment as numpy array"""
     try:
         cmd = [
             'ffmpeg', '-nostdin', '-v', 'error',
             '-ss', str(start_time),
             '-i', str(file_path),
-            # --- CORRECTION: Use absolute stream index ---
             '-map', f'0:{stream_index}',
-            '-ac', '1',
+        ]
+        # --- MODIFIED: Allow specifying channel count ---
+        if num_channels:
+            cmd.extend(['-ac', str(num_channels)])
+
+        cmd.extend([
             '-ar', str(sample_rate),
             '-f', 'f32le',
             '-'
-        ]
+        ])
+
         if duration_limit:
             cmd.extend(['-t', str(duration_limit)])
         result = subprocess.run(cmd, capture_output=True, timeout=60)
@@ -63,18 +65,22 @@ def extract_audio_segment(file_path: Path, stream_index: int, sample_rate: int,
     return None
 
 def extract_audio_to_wav(file_path: Path, stream_index: int, output_path: Path,
-                         sample_rate: int = 22050) -> bool:
+                         sample_rate: int = 22050, num_channels: Optional[int] = None) -> bool:
     """Extract audio stream to WAV file"""
     try:
         cmd = [
             'ffmpeg', '-nostdin', '-y', '-v', 'error',
             '-i', str(file_path),
-            # --- CORRECTION: Use absolute stream index ---
             '-map', f'0:{stream_index}',
-            '-ac', '1',
+        ]
+        # --- MODIFIED: Allow specifying channel count ---
+        if num_channels:
+            cmd.extend(['-ac', str(num_channels)])
+
+        cmd.extend([
             '-ar', str(sample_rate),
             str(output_path)
-        ]
+        ])
         result = subprocess.run(cmd, timeout=60)
         return result.returncode == 0 and output_path.exists()
     except (subprocess.TimeoutExpired, FileNotFoundError):

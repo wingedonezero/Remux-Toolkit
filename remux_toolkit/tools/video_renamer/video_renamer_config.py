@@ -8,5 +8,6 @@ DEFAULTS = {
     'confidence': 75,
     'panako_jar': '',
     'analysis_start_percent': 15,
-    'num_workers': 8, # <-- NEW SETTING
+    'num_workers': 8,
+    'chromaprint_algorithm': 2, # <-- NEW SETTING
 }
