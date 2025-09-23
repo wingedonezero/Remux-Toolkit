@@ -44,7 +44,6 @@ def extract_audio_segment(file_path: Path, stream_index: int, sample_rate: int,
             '-i', str(file_path),
             '-map', f'0:{stream_index}',
         ]
-        # --- MODIFIED: Allow specifying channel count ---
         if num_channels:
             cmd.extend(['-ac', str(num_channels)])
 
@@ -56,7 +55,7 @@ def extract_audio_segment(file_path: Path, stream_index: int, sample_rate: int,
 
         if duration_limit:
             cmd.extend(['-t', str(duration_limit)])
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
         if result.returncode == 0 and result.stdout:
             audio = np.frombuffer(result.stdout, dtype=np.float32)
             return audio
@@ -73,7 +72,6 @@ def extract_audio_to_wav(file_path: Path, stream_index: int, output_path: Path,
             '-i', str(file_path),
             '-map', f'0:{stream_index}',
         ]
-        # --- MODIFIED: Allow specifying channel count ---
         if num_channels:
             cmd.extend(['-ac', str(num_channels)])
 

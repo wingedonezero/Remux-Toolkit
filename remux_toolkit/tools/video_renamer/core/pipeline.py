@@ -13,7 +13,6 @@ from remux_toolkit.tools.video_renamer.matchers.audio.mfcc import MFCCMatcher
 from remux_toolkit.tools.video_renamer.matchers.video.phash import PerceptualHashMatcher
 from remux_toolkit.tools.video_renamer.matchers.video.scene import SceneDetectionMatcher
 from remux_toolkit.tools.video_renamer.matchers.video.videohash_matcher import VideoHashMatcher
-# --- FIXED: Import the utility function directly ---
 from remux_toolkit.tools.video_renamer.utils.media import extract_audio_segment
 
 @dataclass
@@ -113,7 +112,6 @@ class MatchingPipeline:
                 yield {'type': 'match_list', 'data': {'remux_path': str(remux_path), 'matches': []}}
                 continue
 
-            # --- FIXED: Call the imported function correctly and request mono audio ---
             remux_audio = extract_audio_segment(remux_path, remux_stream_idx, 48000, num_channels=1)
 
             if remux_audio is None:
@@ -130,9 +128,8 @@ class MatchingPipeline:
                  if score > best_score:
                      best_score = score
                      best_match_ref_path = ref_path
-                     best_match_info = f"Delay={offset_ms:.0f}ms, {score:.0%} accepted chunks"
+                     best_match_info = f"Delay={offset_ms:.0f}ms, {score:.1%} avg score"
 
-            # --- FIXED: Compare score (0-1) to threshold (0-1) correctly ---
             if best_match_ref_path and best_score >= self._threshold:
                 match_data = [{'ref': best_match_ref_path, 'score': best_score, 'info': best_match_info}]
                 yield {'type': 'match_list', 'data': {'remux_path': str(remux_path), 'matches': match_data}}
