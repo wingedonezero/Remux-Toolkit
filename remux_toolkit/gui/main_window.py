@@ -6,8 +6,8 @@ from remux_toolkit.tools.silence_checker.silence_checker_gui import SilenceCheck
 from remux_toolkit.tools.media_comparator.media_comparator_gui import MediaComparatorWidget
 from remux_toolkit.tools.video_renamer.video_renamer_gui import VideoRenamerWidget
 from remux_toolkit.tools.mkv_splitter.mkv_splitter_gui import MKVSplitterWidget
-# NEW: Import the MakeMKVCon GUI widget
 from remux_toolkit.tools.makemkvcon_gui.makemkvcon_gui_gui import MakeMKVConGUIWidget
+from remux_toolkit.tools.ffmpeg_dvd_remuxer.ffmpeg_dvd_remuxer_gui import FFmpegDVDRemuxerWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -37,9 +37,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_mkv_splitter_action = QtGui.QAction("MKV Episode Splitter", self)
         self.open_mkv_splitter_action.triggered.connect(self.open_mkv_splitter)
 
-        # NEW: Create the QAction for the new tool
         self.open_makemkvcon_gui_action = QtGui.QAction("MakeMKVCon GUI", self)
         self.open_makemkvcon_gui_action.triggered.connect(self.open_makemkvcon_gui)
+
+        self.open_dvd_remuxer_action = QtGui.QAction("FFmpeg DVD Remuxer", self)
+        self.open_dvd_remuxer_action.triggered.connect(self.open_dvd_remuxer)
 
     def _create_menus(self):
         menu_bar = self.menuBar()
@@ -48,24 +50,21 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_media_comparator_action)
         tools_menu.addAction(self.open_video_renamer_action)
         tools_menu.addAction(self.open_mkv_splitter_action)
-
-        # NEW: Add the new tool's action to the menu
         tools_menu.addAction(self.open_makemkvcon_gui_action)
+        tools_menu.addAction(self.open_dvd_remuxer_action)
 
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
     def open_media_comparator(self): self._open_tool("MediaComparator", "Media Comparator", MediaComparatorWidget)
     def open_video_renamer(self): self._open_tool("VideoRenamer", "Video Episode Renamer", VideoRenamerWidget)
     def open_mkv_splitter(self): self._open_tool("MKVSplitter", "MKV Episode Splitter", MKVSplitterWidget)
-
-    # NEW: Add the method to open the MakeMKVCon GUI tool
     def open_makemkvcon_gui(self): self._open_tool("MakeMKVConGUI", "MakeMKVCon GUI", MakeMKVConGUIWidget)
+    def open_dvd_remuxer(self): self._open_tool("FFmpegDVDRemuxer", "FFmpeg DVD Remuxer", FFmpegDVDRemuxerWidget)
 
     def _open_tool(self, tool_name, tab_title, widget_class):
         if tool_name in self.open_tools:
             self.tab_widget.setCurrentWidget(self.open_tools[tool_name])
             return
 
-        # Pass the app_manager instance to the tool's constructor
         tool_widget = widget_class(app_manager=self.app_manager)
         index = self.tab_widget.addTab(tool_widget, tab_title)
         self.tab_widget.setCurrentIndex(index)
