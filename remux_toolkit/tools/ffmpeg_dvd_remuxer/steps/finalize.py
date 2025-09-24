@@ -2,12 +2,11 @@
 from ..utils.helpers import run_stream
 
 class FinalizeStep:
-    def __init__(self, config, logger):
+    def __init__(self, config):
         self.config = config
-        self.log = logger
 
-    def run(self, context: dict, stop_event) -> bool:
-        self.log.emit("[STEP 5/5] Building final MKV file with mkvmerge...")
+    def run(self, context: dict, log_emitter, stop_event) -> bool:
+        log_emitter("[STEP 5/5] Building final MKV file with mkvmerge...")
         final_mkv = context['out_folder'] / f"title_{context['title_num']}.mkv"
         temp_mkv = context['temp_mkv_path']
 
@@ -27,12 +26,12 @@ class FinalizeStep:
             mod_chap_xml = context['mod_chap_xml_path']
             mkvmerge_cmd.extend(["--chapters", str(mod_chap_xml)])
 
-        for line in run_stream(mkvmerge_cmd, stop_event): self.log.emit(line)
+        for line in run_stream(mkvmerge_cmd, stop_event): log_emitter(line)
         if stop_event.is_set(): return False
 
         if not final_mkv.exists() or final_mkv.stat().st_size < 1024:
-             self.log.emit("!! ERROR: mkvmerge failed to create the final file.")
+             log_emitter("!! ERROR: mkvmerge failed to create the final file.")
              return False
 
-        self.log.emit(f"🎉 Successfully created: {final_mkv.name}")
+        log_emitter(f"🎉 Successfully created: {final_mkv.name}")
         return True

@@ -27,12 +27,18 @@ class DetailsPanel(QTreeWidget):
         self.clear()
         title_node = QTreeWidgetItem(["Title", f"#{title_info.get('title', '?')} on {disc_job.base_name}"])
         self.addTopLevelItem(title_node)
+
         if (length := title_info.get('length')):
             QTreeWidgetItem(title_node, ["Length", length])
         if (chapters := title_info.get('chapters')):
             QTreeWidgetItem(title_node, ["Chapters", chapters])
-        if (audio := title_info.get('audio')):
-            QTreeWidgetItem(title_node, ["Audio Streams", audio])
-        if (subs := title_info.get('subs')):
-            QTreeWidgetItem(title_node, ["Subtitles", subs])
+        # Display new rich codec info
+        if (v_codecs := title_info.get('v_codecs')):
+            QTreeWidgetItem(title_node, ["Video Codec(s)", v_codecs])
+        if (a_codecs := title_info.get('a_codecs')):
+            QTreeWidgetItem(title_node, ["Audio Codec(s)", a_codecs])
+
+        QTreeWidgetItem(title_node, ["Audio Streams", title_info.get('audio', 'N/A')])
+        QTreeWidgetItem(title_node, ["Subtitles", title_info.get('subs', 'N/A')])
+
         self.expandAll()

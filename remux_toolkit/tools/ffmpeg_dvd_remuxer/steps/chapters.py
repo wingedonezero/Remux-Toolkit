@@ -3,12 +3,11 @@ import xml.etree.ElementTree as ET
 from ..utils.helpers import run_stream
 
 class ChaptersStep:
-    def __init__(self, config, logger):
+    def __init__(self, config):
         self.config = config
-        self.log = logger
 
-    def run(self, context: dict, stop_event) -> bool:
-        self.log.emit("[STEP 4/5] Extracting and renaming chapters...")
+    def run(self, context: dict, log_emitter, stop_event) -> bool:
+        log_emitter("[STEP 4/5] Extracting and renaming chapters...")
         temp_mkv = context['temp_mkv_path']
         mod_chap_xml = context['out_folder'] / f"title_{context['title_num']}_chapters_mod.xml"
         context['mod_chap_xml_path'] = mod_chap_xml
@@ -31,11 +30,11 @@ class ChaptersStep:
                 tree = ET.ElementTree(root)
                 tree.write(mod_chap_xml, encoding='UTF-8', xml_declaration=True)
                 chapters_ok = True
-                self.log.emit("  -> Chapters processed successfully.")
+                log_emitter("  -> Chapters processed successfully.")
             except Exception as e:
-                self.log.emit(f"!! ERROR: Failed to process chapter XML: {e}")
+                log_emitter(f"!! ERROR: Failed to process chapter XML: {e}")
         else:
-            self.log.emit("  -> No chapters found in temporary file.")
+            log_emitter("  -> No chapters found in temporary file.")
 
         context['chapters_ok'] = chapters_ok
         return True

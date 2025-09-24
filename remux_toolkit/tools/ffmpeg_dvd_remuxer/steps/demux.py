@@ -2,12 +2,11 @@
 from ..utils.helpers import run_stream
 
 class DemuxStep:
-    def __init__(self, config, logger):
+    def __init__(self, config):
         self.config = config
-        self.log = logger
 
-    def run(self, context: dict, stop_event) -> bool:
-        self.log.emit("[STEP 1/5] Demuxing to temporary file with ffmpeg...")
+    def run(self, context: dict, log_emitter, stop_event) -> bool:
+        log_emitter("[STEP 1/5] Demuxing to temporary file with ffmpeg...")
 
         input_path = context['input_path']
         title_num = context['title_num']
@@ -24,12 +23,12 @@ class DemuxStep:
         ffmpeg_cmd.append(str(temp_mkv))
 
         for line in run_stream(ffmpeg_cmd, stop_event):
-            self.log.emit(line)
+            log_emitter(line)
         if stop_event.is_set(): return False
 
         if not temp_mkv.exists() or temp_mkv.stat().st_size < 1024:
-            self.log.emit("!! ERROR: ffmpeg failed to create the temporary MKV file. Aborting.")
+            log_emitter("!! ERROR: ffmpeg failed to create the temporary MKV file. Aborting.")
             return False
 
-        self.log.emit("  -> Temporary file created successfully.")
+        log_emitter("  -> Temporary file created successfully.")
         return True

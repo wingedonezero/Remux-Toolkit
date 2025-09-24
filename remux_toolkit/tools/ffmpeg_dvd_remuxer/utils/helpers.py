@@ -49,6 +49,14 @@ def run_stream(cmd: list[str], stop_event=None) -> Generator[str, None, int]:
         yield f"!! Failed to execute command: {e}"
         return -1
 
+def run_capture(cmd: list[str]) -> tuple[int, str]:
+    """Runs a command and captures its full output, returning stdout on success and stderr on failure."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        return p.returncode, p.stdout if p.returncode == 0 else p.stderr
+    except Exception as e:
+        return -1, str(e)
+
 def get_base_name(path: Path) -> str:
     """Generates a clean base name from the input path."""
     if path.is_dir() and path.name.lower() in ("video_ts", "bmdv"):
@@ -57,10 +65,14 @@ def get_base_name(path: Path) -> str:
 
 def time_str_to_seconds(time_str: str) -> int:
     """Converts an HH:MM:SS.ss string to total seconds."""
-    parts = time_str.split(':')
-    seconds = int(parts[0]) * 3600 + int(parts[1]) * 60
-    if '.' in parts[2]:
-        seconds += int(parts[2].split('.')[0])
-    else:
-        seconds += int(parts[2])
-    return seconds
+    if not time_str: return 0
+    try:
+        parts = time_str.split(':')
+        seconds = int(parts[0]) * 3600 + int(parts[1]) * 60
+        if '.' in parts[2]:
+            seconds += int(parts[2].split('.')[0])
+        else:
+            seconds += int(parts[2])
+        return seconds
+    except (ValueError, IndexError):
+        return 0
