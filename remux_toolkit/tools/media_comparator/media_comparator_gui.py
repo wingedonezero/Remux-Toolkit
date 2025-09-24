@@ -1,5 +1,6 @@
 # remux_toolkit/tools/media_comparator/media_comparator_gui.py
 from PyQt6 import QtWidgets, QtCore, QtGui
+from PyQt6.QtCore import Q_ARG # Import Q_ARG
 from . import media_comparator_core as core
 from . import media_comparator_config as config
 
@@ -8,14 +9,14 @@ class MediaComparatorWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.app_manager = app_manager
         self.tool_name = 'media_comparator'
-        self.thread = None
         self.worker = None
+        self.thread = None
         self._init_ui()
         self._check_dependencies()
         self._load_settings()
+        self._setup_worker()
 
     def _init_ui(self):
-        # This part of the code is unchanged and is provided for completeness.
         self.layout = QtWidgets.QVBoxLayout(self)
         self._create_file_inputs()
         action_layout = QtWidgets.QHBoxLayout()
@@ -35,94 +36,99 @@ class MediaComparatorWidget(QtWidgets.QWidget):
         self.layout.addWidget(self.run_button)
         self._create_progress_and_report()
 
-    # --- NEW SLOTS FOR SAFER UI UPDATES ---
-    def _update_progress(self, value):
-        if self.progress_bar:
-            self.progress_bar.setValue(value)
-
-    def _update_report(self, report_lines):
-        if self.report_text:
-            self.report_text.setText("\n".join(report_lines))
-
-    def _on_worker_finished(self):
-        self.set_controls_enabled(True)
-        if self.progress_bar:
-            self.progress_bar.setVisible(False)
-
-        # Clean up the thread and worker
-        if self.thread:
-            self.thread.quit()
-            self.thread.wait()
-        self.thread = None
-        self.worker = None
-
-    def start_action(self):
-        if self.thread and self.thread.isRunning():
-            return
-
-        file1 = self.file1_input.text().strip()
-        self.report_text.setText("Starting action...")
-        self.progress_bar.setValue(0)
-        self.set_controls_enabled(False)
-
-        self.thread = QtCore.QThread()
+    def _setup_worker(self):
+        """Creates and starts the single, persistent worker thread."""
+        self.thread = QtCore.QThread(self)
         self.worker = core.Worker()
-
-        action_index = self.action_selector.currentIndex()
-        if action_index == 0:
-            file2 = self.file2_input.text().strip()
-            if not file1 or not file2:
-                self.report_text.setText("Error: 'Compare Streams' requires both files."); self.set_controls_enabled(True); return
-            self.progress_bar.setVisible(True)
-            self._start_comparison_task(file1, file2)
-        elif action_index == 1:
-            if not file1:
-                self.report_text.setText("Error: 'Analyze' requires at least File 1."); self.set_controls_enabled(True); return
-            self.progress_bar.setVisible(False)
-            self._start_analysis_task(file1)
-        elif action_index == 2:
-            file2 = self.file2_input.text().strip()
-            if not file1 or not file2:
-                self.report_text.setText("Error: 'Aligned Audio' requires both files."); self.set_controls_enabled(True); return
-            self.progress_bar.setVisible(False)
-            self._start_aligned_audio_task(file1, file2)
-
         self.worker.moveToThread(self.thread)
 
-        # Connect signals to our new, safe slots
-        self.worker.progress_updated.connect(self._update_progress)
-        self.worker.report_ready.connect(self._update_report)
-        self.worker.finished.connect(self._on_worker_finished)
-        self.thread.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
+        self.worker.progress_updated.connect(self.progress_bar.setValue)
+        self.worker.report_ready.connect(lambda r: self.report_text.setText("\n".join(r)))
+        self.worker.finished.connect(self.on_worker_finished)
 
         self.thread.start()
 
-    def shutdown(self):
-        """A safer shutdown method."""
-        if self.worker and self.thread and self.thread.isRunning():
-            # Disconnect signals to prevent updates to deleted widgets
-            try:
-                self.worker.progress_updated.disconnect(self._update_progress)
-                self.worker.report_ready.disconnect(self._update_report)
-            except (TypeError, RuntimeError): # Signals might already be disconnected
-                pass
+    def start_action(self):
+        if self.thread is None or not self.thread.isRunning():
+            self._setup_worker()
 
-            # Ask the worker to stop its loops and quit the thread
-            self.worker.stop()
+        self.set_controls_enabled(False)
+        self.report_text.setText("Starting action...")
+        params = self._gather_params()
+        if not params:
+            self.set_controls_enabled(True)
+            return
+
+        if params.get('action') == 'compare':
+             self.progress_bar.setVisible(True)
+        else:
+             self.progress_bar.setVisible(False)
+
+        # --- THIS IS THE FIX ---
+        # Use Q_ARG to correctly wrap the dictionary for the slot.
+        QtCore.QMetaObject.invokeMethod(
+            self.worker, "start_job", QtCore.Qt.ConnectionType.QueuedConnection,
+            Q_ARG(dict, params)
+        )
+        # --- END FIX ---
+
+    def on_worker_finished(self):
+        self.set_controls_enabled(True)
+        self.progress_bar.setVisible(False)
+
+    def shutdown(self):
+        """A safe shutdown method for the single worker model."""
+        if self.thread and self.thread.isRunning():
+            if self.worker:
+                self.worker.stop()
             self.thread.quit()
-            # Wait for a reasonable time for the thread to finish
             if not self.thread.wait(3000):
-                print("Thread did not stop gracefully, terminating...")
                 self.thread.terminate()
                 self.thread.wait()
-
         self.thread = None
         self.worker = None
 
-    # The rest of the file (_create_file_inputs, _create_compare_panel, _load_settings, etc.)
-    # is unchanged from the version you already have and is provided here for completeness.
-    # ... (all other methods remain the same) ...
+    def _gather_params(self) -> dict | None:
+        """Gathers all UI parameters into a dictionary for the worker."""
+        params = {}
+        file1 = self.file1_input.text().strip()
+        file2 = self.file2_input.text().strip()
+
+        action_index = self.action_selector.currentIndex()
+        if action_index == 0: # Compare Streams
+            if not file1 or not file2:
+                self.report_text.setText("Error: 'Compare Streams' requires both files."); return None
+            params['action'] = 'compare'
+            stream_type = self.compare_stream_type.currentText().lower()
+            params['stream_type_filter'] = None if stream_type == "all" else stream_type
+            method = self.compare_hash_method.currentText()
+            params['method_name'] = method
+            method_map = {
+                "Stream Copy": core.get_stream_hash_copied, "Full Decode": core.get_stream_hash_decoded,
+                "Streamhash Muxer": core.get_stream_hash_streamhash, "Raw In-Memory Hash": None
+            }
+            params['hash_function'] = method_map[method]
+
+        elif action_index == 1: # Analyze Delay
+            if not file1:
+                self.report_text.setText("Error: 'Analyze' requires at least File 1."); return None
+            params['action'] = 'analyze'
+            params['stream_type_filter'] = self.analysis_stream_type.currentText().lower()
+
+        elif action_index == 2: # Aligned Audio
+            if not file1 or not file2:
+                self.report_text.setText("Error: 'Aligned Audio' requires both files."); return None
+            params['action'] = 'align_audio'
+            params['align_apply_to'] = "file1" if self.align_apply_to.currentText() == "File 1" else "file2"
+            params['align_auto'] = (self.align_auto.currentIndex() == 0)
+            sr_txt = (self.align_norm_sr.text().strip() or ""); params['align_norm_sr'] = int(sr_txt) if sr_txt else 48000
+            ch_txt = (self.align_norm_ch.text().strip() or ""); params['align_norm_ch'] = int(ch_txt) if ch_txt else None
+            for key in ['align_offset_ms', 'align_win_ms', 'align_noise_db', 'align_min_gap_ms', 'align_idx1', 'align_idx2']:
+                params[key] = getattr(self, key).value()
+
+        params['file1_path'] = file1
+        params['file2_path'] = file2
+        return params
 
     def _check_dependencies(self):
         ok, msg = core.check_dependencies()
@@ -183,21 +189,22 @@ class MediaComparatorWidget(QtWidgets.QWidget):
         self.report_text = QtWidgets.QTextEdit(); self.report_text.setReadOnly(True); self.report_text.setText("Awaiting action...")
         self.layout.addWidget(self.report_text, 1)
 
-    def _start_comparison_task(self, file1, file2):
-        self.worker.file1_path = file1
-        self.worker.file2_path = file2
+    def _load_settings(self):
+        settings = self.app_manager.load_config(self.tool_name, config.DEFAULTS)
+        self.align_idx1.setValue(settings.get("align_idx1", config.DEFAULTS["align_idx1"]))
+        self.align_idx2.setValue(settings.get("align_idx2", config.DEFAULTS["align_idx2"]))
+        self.align_offset_ms.setValue(settings.get("align_offset_ms", config.DEFAULTS["align_offset_ms"]))
+        self.align_norm_sr.setText(str(settings.get("align_norm_sr", config.DEFAULTS["align_norm_sr"])))
+        self.align_norm_ch.setText(str(settings.get("align_norm_ch", config.DEFAULTS["align_norm_ch"])))
+        self.align_win_ms.setValue(settings.get("align_win_ms", config.DEFAULTS["align_win_ms"]))
+        self.align_noise_db.setValue(settings.get("align_noise_db", config.DEFAULTS["align_noise_db"]))
+        self.align_min_gap.setValue(settings.get("align_min_gap", config.DEFAULTS["align_min_gap"]))
 
-        stream_type = self.compare_stream_type.currentText().lower()
-        self.worker.stream_type_filter = None if stream_type == "all" else stream_type
-
-        method = self.compare_hash_method.currentText()
-        self.worker.method_name = method
-
-        method_map = {
-            "Stream Copy": core.get_stream_hash_copied,
-            "Full Decode": core.get_stream_hash_decoded,
-            "Streamhash Muxer": core.get_stream_hash_streamhash,
-            "Raw In-Memory Hash": None # Special case handled in worker
+    def save_settings(self):
+        current_settings = {
+            "align_idx1": self.align_idx1.value(), "align_idx2": self.align_idx2.value(),
+            "align_offset_ms": self.align_offset_ms.value(), "align_norm_sr": self.align_norm_sr.text(),
+            "align_norm_ch": self.align_norm_ch.text(), "align_win_ms": self.align_win_ms.value(),
+            "align_noise_db": self.align_noise_db.value(), "align_min_gap": self.align_min_gap.value(),
         }
-        self.worker.hash_function = method_map[method]
-        self.thread.started.connect(self.worker.run_full_comparison)
+        self.app_manager.save_config(self.tool_name, current_settings)
