@@ -8,7 +8,7 @@ from ..utils.paths import create_output_folder
 
 class Worker(QObject):
     log = pyqtSignal(str)
-    analysis_finished = pyqtSignal(list)
+    analysis_finished = pyqtSignal(object, list) # job, titles
     progress = pyqtSignal(int, int)
     finished = pyqtSignal()
 
@@ -18,27 +18,27 @@ class Worker(QObject):
         self.stop_event = threading.Event()
         self.orchestrator = Orchestrator(config, self.log)
 
-    def run_analysis(self, input_path_str: str):
+    def run_analysis(self, job):
         self.stop_event.clear()
         try:
-            titles, message = self.orchestrator.analyze_disc(Path(input_path_str), self.stop_event)
-            self.log.emit(message)
-            self.analysis_finished.emit(titles)
+            titles, message = self.orchestrator.analyze_disc(job.source_path, self.stop_event)
+            self.log.emit(f"For '{job.base_name}': {message}")
+            self.analysis_finished.emit(job, titles)
         except Exception as e:
-            self.log.emit(f"!! ANALYSIS ERROR: {e}")
-            self.analysis_finished.emit([])
+            self.log.emit(f"!! ANALYSIS ERROR for '{job.base_name}': {e}")
+            self.analysis_finished.emit(job, [])
         self.finished.emit()
 
-    def run_processing(self, jobs: list): # Expects a list of Job objects
+    def run_processing(self, jobs_to_run: list):
         self.stop_event.clear()
-        total_jobs = len(jobs)
+        total_jobs = len(jobs_to_run)
         self.progress.emit(0, total_jobs)
 
         try:
             output_root = Path(self.config.get("default_output_directory"))
             if not output_root: raise ValueError("Output directory is not set.")
 
-            for i, job in enumerate(jobs):
+            for i, job in enumerate(jobs_to_run):
                 if self.stop_event.is_set():
                     self.log.emit("\n>> Processing stopped by user. <<")
                     break
@@ -46,11 +46,11 @@ class Worker(QObject):
                 output_folder = create_output_folder(output_root, job.base_name, job.group_name)
                 self.log.emit(f"▶ Starting job for '{job.base_name}'. Output: {output_folder}")
 
-                for title_num in job.titles_to_process:
+                for title_num in sorted(list(job.selected_titles)):
                     if self.stop_event.is_set(): break
 
                     context = {
-                        'input_path': job.input_path,
+                        'input_path': job.source_path,
                         'title_num': title_num,
                         'out_folder': output_folder,
                         'config': self.config

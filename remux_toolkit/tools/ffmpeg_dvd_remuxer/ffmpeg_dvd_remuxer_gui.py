@@ -1,17 +1,18 @@
 # remux_toolkit/tools/ffmpeg_dvd_remuxer/ffmpeg_dvd_remuxer_gui.py
 from pathlib import Path
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidgetItem,
-    QHeaderView, QProgressBar, QTextEdit, QCheckBox, QDialog, QSplitter
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTreeWidgetItem,
+    QHeaderView, QProgressBar, QTextEdit, QCheckBox, QDialog, QSplitter, QFileDialog
 )
-from PyQt6.QtCore import QThread
+from PyQt6.QtCore import QThread, Qt
 
 from .ffmpeg_dvd_remuxer_config import DEFAULTS
 from .core.worker import Worker
 from .models.job import Job
 from .gui.prefs_dialog import PrefsDialog
-from .gui.title_table import DropTable
-from .utils.paths import find_dvd_sources, get_base_name
+from .gui.queue_tree import DropTree
+from .gui.details_panel import DetailsPanel
+from .utils.paths import find_dvd_sources
 from .utils.helpers import time_str_to_seconds
 
 class FFmpegDVDRemuxerWidget(QWidget):
@@ -20,32 +21,16 @@ class FFmpegDVDRemuxerWidget(QWidget):
         self.app_manager = app_manager
         self.tool_name = 'ffmpeg_dvd_remuxer'
         self.config = {}
-        self.queue = [] # This will now be a list of analyzed discs
+        self.jobs = []
         self.worker_thread = None
         self.worker = None
+        self._updating_checks = False
 
         self._init_ui()
         self._load_settings()
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
-
-        self.queue_table = DropTable()
-        self.queue_table.setColumnCount(6)
-        self.queue_table.setHorizontalHeaderLabels(["Process", "Source", "Titles", "Length", "Chapters", "Status"])
-        header = self.queue_table.horizontalHeader()
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        for i in range(2, 6): header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
-
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-
-        splitter = QSplitter(self)
-        splitter.setOrientation(self.get_closest_orientation(Qt.Orientation.Vertical))
-        splitter.addWidget(self.queue_table)
-        splitter.addWidget(self.log_box)
-
         action_layout = QHBoxLayout()
         self.add_btn = QPushButton("Add Source(s)...")
         self.clear_btn = QPushButton("Clear Queue")
@@ -59,19 +44,40 @@ class FFmpegDVDRemuxerWidget(QWidget):
         action_layout.addStretch()
         action_layout.addWidget(self.stop_btn)
 
+        # UI components are now structured like the working MakeMKV tool
+        self.queue_tree = DropTree()
+        self.queue_tree.setColumnCount(5)
+        self.queue_tree.setHeaderLabels(["Source / Title", "Length", "Chapters", "Audio", "Subs"])
+        self.queue_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for i in range(1, 5): self.queue_tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+
+        self.details_panel = DetailsPanel()
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
         self.progress_bar = QProgressBar()
 
+        center_splitter = QSplitter(Qt.Orientation.Horizontal)
+        center_splitter.addWidget(self.queue_tree)
+        center_splitter.addWidget(self.details_panel)
+        center_splitter.setSizes([700, 300])
+
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
+        main_splitter.addWidget(center_splitter)
+        main_splitter.addWidget(self.log_box)
+        main_splitter.setSizes([500, 200])
+
         main_layout.addLayout(action_layout)
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(main_splitter)
         main_layout.addWidget(self.progress_bar)
 
-        # Connect signals
         self.add_btn.clicked.connect(self.add_source)
         self.clear_btn.clicked.connect(self.clear_queue)
-        self.queue_table.pathsDropped.connect(self.handle_drop)
+        self.queue_tree.pathsDropped.connect(self.handle_drop)
         self.prefs_btn.clicked.connect(self.open_prefs)
         self.process_btn.clicked.connect(self.start_processing)
         self.stop_btn.clicked.connect(self.stop_processing)
+        self.queue_tree.itemChanged.connect(self._on_item_checked)
+        self.queue_tree.currentItemChanged.connect(self._on_item_selected)
 
         self.set_controls_enabled(True)
 
@@ -99,100 +105,108 @@ class FFmpegDVDRemuxerWidget(QWidget):
 
     def handle_drop(self, paths: list[str]):
         group_name = Path(paths[0]).parent.name if len(paths) > 1 and len(set(Path(p).parent for p in paths)) == 1 else None
-
-        all_sources = []
-        for p_str in paths:
-            all_sources.extend(find_dvd_sources(Path(p_str)))
-
+        all_sources = [source for p_str in paths for source in find_dvd_sources(Path(p_str))]
+        if not all_sources:
+            self.log_box.append("No valid DVD sources (ISO/VIDEO_TS) found.")
+            return
         for source_path in all_sources:
-            self._run_analysis(source_path, group_name)
+            if any(j.source_path == source_path for j in self.jobs): continue
+            job = Job(source_path=source_path, group_name=group_name)
+            self._add_job_to_queue(job)
+            self._run_analysis(job)
 
     def add_source(self):
-        # In a real implementation, you would open a file dialog here.
-        # For simplicity, we'll just log a message.
-        self.log_box.append("Please drag and drop DVD sources (ISO/VIDEO_TS folders) onto the table.")
+        path, _ = QFileDialog.getOpenFileName(self, "Select DVD Source", str(Path.home()), "DVD Sources (*.iso);;All Files (*)")
+        if path:
+            p = Path(path)
+            source_dir = p.parent.parent if p.parent.name.lower() == 'video_ts' else p
+            self.handle_drop([str(source_dir)])
 
     def clear_queue(self):
-        self.queue.clear()
-        self.queue_table.setRowCount(0)
+        self.stop_processing()
+        self.jobs.clear()
+        self.queue_tree.clear()
+        self.details_panel.clear_panel()
         self.log_box.append("Queue cleared.")
 
-    def open_prefs(self):
-        dialog = PrefsDialog(self.config, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.config.update(dialog.get_values())
-            self.save_settings()
-            self.log_box.append("[INFO] Settings saved.")
+    def _add_job_to_queue(self, job: Job):
+        self.jobs.append(job)
+        item = QTreeWidgetItem([job.base_name, "", "", "", ""])
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(0, Qt.CheckState.Unchecked)
+        job._gui_item = item
+        item.setData(0, Qt.ItemDataRole.UserRole, job)
+        self.queue_tree.addTopLevelItem(item)
 
-    def _run_analysis(self, source_path: Path, group_name: str | None):
-        row = self.queue_table.rowCount()
-        self.queue_table.insertRow(row)
-
-        base_name = get_base_name(source_path)
-        self.queue_table.setItem(row, 1, QTableWidgetItem(base_name))
-        self.queue_table.setItem(row, 5, QTableWidgetItem("Analyzing..."))
-
-        # Store path in user data role for later retrieval
-        self.queue_table.item(row, 1).setData(Qt.ItemDataRole.UserRole, (source_path, group_name))
+    def _run_analysis(self, job: Job):
+        job.status = "Analyzing..."
+        job._gui_item.setText(0, f"{job.base_name} [Analyzing...]")
 
         self.worker_thread = QThread()
         self.worker = Worker(self.config)
         self.worker.moveToThread(self.worker_thread)
-        self.worker.analysis_finished.connect(lambda titles, r=row: self.on_analysis_finished(r, titles))
+        self.worker.analysis_finished.connect(self.on_analysis_finished)
         self.worker.finished.connect(self.on_worker_finished)
 
-        self.worker_thread.started.connect(lambda p=str(source_path): self.worker.run_analysis(p))
+        self.worker_thread.started.connect(lambda j=job: self.worker.run_analysis(j))
         self.worker_thread.start()
 
-    def on_analysis_finished(self, row, titles):
-        item = self.queue_table.item(row, 1)
+    def on_analysis_finished(self, job: Job, titles: list):
+        job.titles_info = titles
+        item = job._gui_item
         if not item: return
 
-        (source_path, group_name) = item.data(Qt.ItemDataRole.UserRole)
-        self.queue.append({'path': source_path, 'group': group_name, 'titles': titles, 'row': row})
+        self._updating_checks = True
+        try:
+            item.takeChildren()
+            min_len = self.config.get("minimum_title_length", 120)
 
-        if not titles:
-            self.queue_table.setItem(row, 5, QTableWidgetItem("Analysis Failed"))
-            return
+            if not titles:
+                job.status = "Analysis Failed"
+                item.setText(0, f"{job.base_name} [Failed]")
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+                item.setDisabled(True)
+                return
 
-        min_len = self.config.get("minimum_title_length", 120)
-        long_titles = [t for t in titles if time_str_to_seconds(t['length']) >= min_len]
+            job.status = "Ready"
+            item.setText(0, job.base_name)
 
-        main_title = max(long_titles, key=lambda t: time_str_to_seconds(t['length']), default=None)
+            long_titles = [t for t in titles if time_str_to_seconds(t['length']) >= min_len]
+            main_title = max(long_titles, key=lambda t: time_str_to_seconds(t['length']), default=None)
 
-        self.queue_table.setItem(row, 2, QTableWidgetItem(f"{len(long_titles)}/{len(titles)}")) # Titles
-        if main_title:
-            self.queue_table.setItem(row, 3, QTableWidgetItem(main_title.get('length', '')))
-            self.queue_table.setItem(row, 4, QTableWidgetItem(main_title.get('chapters', '')))
+            for title_data in titles:
+                child = QTreeWidgetItem([
+                    f"  - Title {title_data['title']}", title_data['length'],
+                    title_data['chapters'], title_data['audio'], title_data['subs']
+                ])
+                child.setData(0, Qt.ItemDataRole.UserRole, title_data)
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
 
-        self.queue_table.setItem(row, 5, QTableWidgetItem("Ready"))
+                is_main = main_title and title_data['title'] == main_title['title']
+                child.setCheckState(0, Qt.CheckState.Checked if is_main else Qt.CheckState.Unchecked)
+                item.addChild(child)
 
-        cb = QCheckBox()
-        cb.setChecked(True)
-        w = QWidget()
-        l = QHBoxLayout(w)
-        l.addWidget(cb)
-        l.setContentsMargins(0,0,0,0)
-        self.queue_table.setCellWidget(row, 0, w)
+            item.setExpanded(True)
+            self._set_parent_check_from_children(item)
+        finally:
+            self._updating_checks = False
 
     def start_processing(self):
         jobs_to_run = []
-        for disc in self.queue:
-            row = disc['row']
-            cb_widget = self.queue_table.cellWidget(row, 0)
-            if cb_widget and cb_widget.findChild(QCheckBox).isChecked():
-                min_len = self.config.get("minimum_title_length", 120)
-                titles_to_process = [int(t['title']) for t in disc['titles'] if time_str_to_seconds(t['length']) >= min_len]
-                if titles_to_process:
-                    jobs_to_run.append(Job(
-                        input_path=disc['path'],
-                        base_name=get_base_name(disc['path']),
-                        group_name=disc['group'],
-                        titles_to_process=titles_to_process
-                    ))
+        for job in self.jobs:
+            job.selected_titles.clear()
+            item = job._gui_item
+            if not item: continue
+            for i in range(item.childCount()):
+                child = item.child(i)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    title_data = child.data(0, Qt.ItemDataRole.UserRole)
+                    job.selected_titles.add(int(title_data['title']))
+            if job.selected_titles:
+                jobs_to_run.append(job)
 
         if not jobs_to_run:
-            self.log_box.append("No items in queue selected for processing.")
+            self.log_box.append("No titles selected for processing.")
             return
 
         self.set_controls_enabled(False)
@@ -200,11 +214,58 @@ class FFmpegDVDRemuxerWidget(QWidget):
         self.worker = Worker(self.config)
         self.worker.moveToThread(self.worker_thread)
         self.worker.log.connect(self.log_box.append)
-        self.worker.progress.connect(lambda cur, tot: self.progress_bar.setValue(int(cur / tot * 100)))
+        self.worker.progress.connect(lambda cur, tot: self.progress_bar.setValue(int(cur / tot * 100) if tot > 0 else 0))
         self.worker.finished.connect(self.on_worker_finished)
 
-        self.worker_thread.started.connect(lambda: self.worker.run_processing(jobs_to_run))
+        self.worker_thread.started.connect(lambda j=jobs_to_run: self.worker.run_processing(j))
         self.worker_thread.start()
+
+    def _on_item_checked(self, item, column):
+        if self._updating_checks: return
+        self._updating_checks = True
+        try:
+            if item.parent(): # It's a child (title)
+                self._set_parent_check_from_children(item.parent())
+            else: # It's a parent (disc)
+                for i in range(item.childCount()):
+                    item.child(i).setCheckState(0, item.checkState(0))
+        finally:
+            self._updating_checks = False
+
+    def _set_parent_check_from_children(self, parent_item):
+        child_count = parent_item.childCount()
+        if child_count == 0:
+            parent_item.setCheckState(0, Qt.CheckState.Unchecked)
+            return
+
+        checked_count = sum(1 for i in range(child_count) if parent_item.child(i).checkState(0) == Qt.CheckState.Checked)
+
+        if checked_count == 0:
+            parent_item.setCheckState(0, Qt.CheckState.Unchecked)
+        elif checked_count == child_count:
+            parent_item.setCheckState(0, Qt.CheckState.Checked)
+        else:
+            parent_item.setCheckState(0, Qt.CheckState.PartiallyChecked)
+
+    def _on_item_selected(self, current, previous):
+        if not current:
+            self.details_panel.clear_panel()
+            return
+
+        if current.parent(): # Child selected
+            title_data = current.data(0, Qt.ItemDataRole.UserRole)
+            disc_job = current.parent().data(0, Qt.ItemDataRole.UserRole)
+            self.details_panel.show_title_info(disc_job, title_data)
+        else: # Parent selected
+            job = current.data(0, Qt.ItemDataRole.UserRole)
+            self.details_panel.show_disc_info(job)
+
+    def open_prefs(self):
+        dialog = PrefsDialog(self.config, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.config.update(dialog.get_values())
+            self.save_settings()
+            self.log_box.append("[INFO] Settings saved.")
 
     def stop_processing(self):
         if self.worker:
