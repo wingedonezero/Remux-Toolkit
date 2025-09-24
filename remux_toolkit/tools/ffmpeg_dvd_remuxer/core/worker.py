@@ -10,19 +10,21 @@ from ..utils.paths import create_output_folder
 class Worker(QObject):
     log = pyqtSignal(str)
     analysis_finished = pyqtSignal(object, list)
-    progress = pyqtSignal(int, int)
-    # This is the single, consistent signal for when ANY task is done.
+    title_progress = pyqtSignal(object, int) # job, percent
+    queue_progress = pyqtSignal(int, int) # current_job, total_jobs
     finished = pyqtSignal()
 
-    def __init__(self, config):
+    def __init__(self, config, app_manager):
         super().__init__()
         self.config = config
+        self.app_manager = app_manager
         self.stop_event = threading.Event()
-        self.orchestrator = Orchestrator(config)
+        self.temp_dir = Path(self.app_manager.get_temp_dir('ffmpeg_dvd_remuxer'))
+        self.orchestrator = Orchestrator(config, self.temp_dir)
 
     @pyqtSlot(object)
     def run_analysis(self, job):
-        """A slot to handle analyzing a single disc job."""
+        # This function is unchanged
         self.stop_event.clear()
         try:
             titles, message = self.orchestrator.analyze_disc(job.source_path, self.log.emit, self.stop_event)
@@ -32,21 +34,20 @@ class Worker(QObject):
             self.log.emit(f"!! ANALYSIS ERROR for '{job.base_name}': {e}")
             self.analysis_finished.emit(job, [])
         finally:
-            # Emit the finished signal so the GUI knows this task is complete.
             self.finished.emit()
 
     @pyqtSlot(list)
     def run_processing(self, jobs_to_run: list):
-        """A slot to handle processing a batch of jobs."""
         self.stop_event.clear()
         total_jobs = len(jobs_to_run)
-        self.progress.emit(0, total_jobs)
+        self.queue_progress.emit(0, total_jobs)
 
         try:
             output_root = Path(self.config.get("default_output_directory"))
             if not output_root: raise ValueError("Output directory is not set.")
 
             for i, job in enumerate(jobs_to_run):
+                self.queue_progress.emit(i, total_jobs)
                 if self.stop_event.is_set():
                     self.log.emit("\n>> Processing stopped by user. <<")
                     break
@@ -59,29 +60,31 @@ class Worker(QObject):
                         log_fh.write(message + '\n')
 
                     log_and_write(f"▶ Starting job for '{job.base_name}'. Output: {output_folder}")
-                    log_and_write(f"  Log file: {log_file_path}")
 
                     for title_num in sorted(list(job.selected_titles)):
                         if self.stop_event.is_set(): break
 
                         title_info = next((t for t in job.titles_info if t['title'] == str(title_num)), None)
                         context = {
-                            'input_path': job.source_path,
-                            'title_num': title_num,
-                            'out_folder': output_folder,
-                            'config': self.config,
+                            'input_path': job.source_path, 'title_num': title_num,
+                            'out_folder': output_folder, 'config': self.config,
                             'field_order': title_info.get('field_order') if title_info else None,
+                            'title_info': title_info,
                         }
-                        self.orchestrator.run_pipeline(context, log_and_write, self.stop_event)
 
-                self.progress.emit(i + 1, total_jobs)
+                        # Consume progress updates from the pipeline generator
+                        for progress_update in self.orchestrator.run_pipeline(context, log_and_write, self.stop_event):
+                            if isinstance(progress_update, int):
+                                self.title_progress.emit(job, progress_update)
+
+                self.title_progress.emit(job, 100)
+                self.queue_progress.emit(i + 1, total_jobs)
 
             if not self.stop_event.is_set():
                 self.log.emit("\n🎉 All jobs finished. 🎉")
         except Exception as e:
             self.log.emit(f"!! PROCESSING ERROR: {e}")
         finally:
-            # Emit the finished signal so the GUI knows this task is complete.
             self.finished.emit()
 
     def stop(self):

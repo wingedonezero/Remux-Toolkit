@@ -32,13 +32,43 @@ class DetailsPanel(QTreeWidget):
             QTreeWidgetItem(title_node, ["Length", length])
         if (chapters := title_info.get('chapters')):
             QTreeWidgetItem(title_node, ["Chapters", chapters])
-        # Display new rich codec info
-        if (v_codecs := title_info.get('v_codecs')):
-            QTreeWidgetItem(title_node, ["Video Codec(s)", v_codecs])
-        if (a_codecs := title_info.get('a_codecs')):
-            QTreeWidgetItem(title_node, ["Audio Codec(s)", a_codecs])
 
-        QTreeWidgetItem(title_node, ["Audio Streams", title_info.get('audio', 'N/A')])
-        QTreeWidgetItem(title_node, ["Subtitles", title_info.get('subs', 'N/A')])
+        # This rewritten section now displays full, rich per-stream metadata
+        stream_groups = {}
+        for stream in title_info.get("streams", []):
+            kind = stream.get("codec_type", "other").capitalize()
+            if kind not in stream_groups:
+                stream_groups[kind] = QTreeWidgetItem([kind, ""])
+                self.addTopLevelItem(stream_groups[kind])
+
+            # --- Create a descriptive summary for the track ---
+            stream_index = stream.get('index')
+            codec = stream.get('codec_name', 'N/A')
+            lang_tag = stream.get('tags', {}).get('language', 'und')
+            lang = f"[{lang_tag}]" if lang_tag != 'und' else ""
+            desc_parts = [f"Track #{stream_index}", f"({codec})", lang]
+
+            # Add specific details to the summary line
+            if kind == 'Video':
+                width = stream.get('width', 0)
+                height = stream.get('height', 0)
+                if width and height: desc_parts.append(f"{width}x{height}")
+            if kind == 'Audio':
+                if layout := stream.get('channel_layout'): desc_parts.append(layout)
+                elif ch := stream.get('channels'): desc_parts.append(f"{ch}ch")
+
+            track_node = QTreeWidgetItem(stream_groups[kind], [" ".join(filter(None, desc_parts)), ""])
+
+            # --- Add detailed sub-items for each track ---
+            if (fr := stream.get('r_frame_rate')) and fr != '0/0':
+                QTreeWidgetItem(track_node, ["Frame Rate", fr])
+            if (ar := stream.get('display_aspect_ratio')):
+                 QTreeWidgetItem(track_node, ["Aspect Ratio", ar])
+            if (fo := title_info.get('field_order')):
+                QTreeWidgetItem(track_node, ["Interlacing", fo])
+            if (br := stream.get('bit_rate')):
+                QTreeWidgetItem(track_node, ["Bitrate", f"{int(br) // 1000} kb/s"])
+            if (sr := stream.get('sample_rate')):
+                QTreeWidgetItem(track_node, ["Sample Rate", f"{sr} Hz"])
 
         self.expandAll()
