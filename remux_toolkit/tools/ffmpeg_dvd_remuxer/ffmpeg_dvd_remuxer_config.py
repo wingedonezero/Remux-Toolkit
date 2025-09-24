@@ -4,4 +4,5 @@ DEFAULTS = {
     "minimum_title_length": 120,
     "remove_eia_608": True,
     "run_ccextractor": True,
+    "ffmpeg_trim_padding": True,
 }

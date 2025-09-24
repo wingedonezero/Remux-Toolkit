@@ -23,10 +23,20 @@ class DemuxStep:
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-hide_banner",
             "-progress", "-", "-nostats",
-            "-preindex", "1",  # Added for more reliable stream reading
+            "-preindex", "1",
+        ]
+
+        # Add the -trim option based on settings.
+        # The ffmpeg default is 1 (on), so we only need to add the option
+        # to explicitly turn it OFF if the user unchecks the box.
+        if not self.config.get("ffmpeg_trim_padding", True):
+            ffmpeg_cmd.extend(["-trim", "0"])
+
+        ffmpeg_cmd.extend([
             "-f", "dvdvideo", "-title", str(title_num), "-i", str(input_path),
             "-map", "0", "-c:v", "copy", "-c:a", "copy", "-c:s", "copy"
-        ]
+        ])
+
         if self.config.get("remove_eia_608", True):
             ffmpeg_cmd.extend(["-bsf:v", "filter_units=remove_types=178"])
         ffmpeg_cmd.append(str(temp_mkv))
