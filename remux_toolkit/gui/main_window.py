@@ -6,6 +6,8 @@ from remux_toolkit.tools.silence_checker.silence_checker_gui import SilenceCheck
 from remux_toolkit.tools.media_comparator.media_comparator_gui import MediaComparatorWidget
 from remux_toolkit.tools.video_renamer.video_renamer_gui import VideoRenamerWidget
 from remux_toolkit.tools.mkv_splitter.mkv_splitter_gui import MKVSplitterWidget
+# NEW: Import the MakeMKVCon GUI widget
+from remux_toolkit.tools.makemkvcon_gui.makemkvcon_gui_gui import MakeMKVConGUIWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -25,12 +27,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _create_actions(self):
         self.open_silence_checker_action = QtGui.QAction("Leading Silence Checker", self)
         self.open_silence_checker_action.triggered.connect(self.open_silence_checker)
+
         self.open_media_comparator_action = QtGui.QAction("Media Comparator", self)
         self.open_media_comparator_action.triggered.connect(self.open_media_comparator)
+
         self.open_video_renamer_action = QtGui.QAction("Video Episode Renamer", self)
         self.open_video_renamer_action.triggered.connect(self.open_video_renamer)
+
         self.open_mkv_splitter_action = QtGui.QAction("MKV Episode Splitter", self)
         self.open_mkv_splitter_action.triggered.connect(self.open_mkv_splitter)
+
+        # NEW: Create the QAction for the new tool
+        self.open_makemkvcon_gui_action = QtGui.QAction("MakeMKVCon GUI", self)
+        self.open_makemkvcon_gui_action.triggered.connect(self.open_makemkvcon_gui)
 
     def _create_menus(self):
         menu_bar = self.menuBar()
@@ -40,15 +49,23 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_video_renamer_action)
         tools_menu.addAction(self.open_mkv_splitter_action)
 
+        # NEW: Add the new tool's action to the menu
+        tools_menu.addAction(self.open_makemkvcon_gui_action)
+
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
     def open_media_comparator(self): self._open_tool("MediaComparator", "Media Comparator", MediaComparatorWidget)
     def open_video_renamer(self): self._open_tool("VideoRenamer", "Video Episode Renamer", VideoRenamerWidget)
     def open_mkv_splitter(self): self._open_tool("MKVSplitter", "MKV Episode Splitter", MKVSplitterWidget)
 
+    # NEW: Add the method to open the MakeMKVCon GUI tool
+    def open_makemkvcon_gui(self): self._open_tool("MakeMKVConGUI", "MakeMKVCon GUI", MakeMKVConGUIWidget)
+
     def _open_tool(self, tool_name, tab_title, widget_class):
         if tool_name in self.open_tools:
             self.tab_widget.setCurrentWidget(self.open_tools[tool_name])
             return
+
+        # Pass the app_manager instance to the tool's constructor
         tool_widget = widget_class(app_manager=self.app_manager)
         index = self.tab_widget.addTab(tool_widget, tab_title)
         self.tab_widget.setCurrentIndex(index)
@@ -57,20 +74,27 @@ class MainWindow(QtWidgets.QMainWindow):
     def _close_tab(self, index: int):
         widget_to_close = self.tab_widget.widget(index)
         if not widget_to_close: return
+
         tool_name_to_remove = next((name for name, widget in self.open_tools.items() if widget == widget_to_close), None)
+
         if hasattr(widget_to_close, 'save_settings'):
             print(f"Saving settings for {tool_name_to_remove}...")
             widget_to_close.save_settings()
+
         if hasattr(widget_to_close, 'shutdown'):
             print(f"Closing tab for {tool_name_to_remove}. Shutting down worker...")
             widget_to_close.shutdown()
+
         self.tab_widget.removeTab(index)
-        if tool_name_to_remove: del self.open_tools[tool_name_to_remove]
+        if tool_name_to_remove:
+            del self.open_tools[tool_name_to_remove]
         widget_to_close.deleteLater()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         print("Main window is closing. Saving all settings and shutting down threads...")
         for tool_widget in list(self.open_tools.values()):
-            if hasattr(tool_widget, 'save_settings'): tool_widget.save_settings()
-            if hasattr(tool_widget, 'shutdown'): tool_widget.shutdown()
+            if hasattr(tool_widget, 'save_settings'):
+                tool_widget.save_settings()
+            if hasattr(tool_widget, 'shutdown'):
+                tool_widget.shutdown()
         event.accept()
