@@ -8,7 +8,8 @@ from ..utils.paths import create_output_folder
 
 class Worker(QObject):
     log = pyqtSignal(str)
-    analysis_finished = pyqtSignal(object, list) # job, titles
+    # The signal now sends the original job object back
+    analysis_finished = pyqtSignal(object, list)
     progress = pyqtSignal(int, int)
     finished = pyqtSignal()
 
@@ -27,7 +28,8 @@ class Worker(QObject):
         except Exception as e:
             self.log.emit(f"!! ANALYSIS ERROR for '{job.base_name}': {e}")
             self.analysis_finished.emit(job, [])
-        self.finished.emit()
+        finally:
+            self.finished.emit()
 
     def run_processing(self, jobs_to_run: list):
         self.stop_event.clear()
@@ -46,6 +48,7 @@ class Worker(QObject):
                 output_folder = create_output_folder(output_root, job.base_name, job.group_name)
                 self.log.emit(f"▶ Starting job for '{job.base_name}'. Output: {output_folder}")
 
+                # Use the selected_titles set from the job object
                 for title_num in sorted(list(job.selected_titles)):
                     if self.stop_event.is_set(): break
 
