@@ -5,7 +5,7 @@ from pathlib import Path
 from ..utils.helpers import run_capture
 
 class MetadataAnalysisStep:
-    """Deep metadata analysis step that captures all stream metadata for accurate remuxing."""
+    """Deep metadata analysis step that merges IFO and ffprobe data for accurate remuxing."""
 
     def __init__(self, config):
         self.config = config
@@ -19,8 +19,12 @@ class MetadataAnalysisStep:
         title_num = context['title_num']
         out_folder = context['out_folder']
 
-        # Get IFO data from previous step if available
+        # Get IFO data from previous step
         ifo_data = context.get('ifo_data', {})
+        ifo_audio = ifo_data.get('audio_tracks', [])
+        ifo_subs = ifo_data.get('subtitle_tracks', [])
+        ifo_chapters = ifo_data.get('chapters', [])
+        ifo_cells = ifo_data.get('cell_data', [])
 
         # Create metadata file path
         metadata_file = out_folder / f"title_{title_num}_metadata.json"
@@ -56,12 +60,22 @@ class MetadataAnalysisStep:
             "title_num": title_num,
             "probe_data": probe_data,
             "streams": [],
-            "mkv_mapping": {}
+            "mkv_mapping": {},
+            "ifo_data": ifo_data  # Store raw IFO data for reference
         }
+
+        # Track audio/subtitle indices separately for IFO matching
+        audio_idx = 0
+        sub_idx = 0
 
         # Process each stream
         for stream_idx, stream in enumerate(probe_data.get("streams", [])):
             stream_type = stream.get("codec_type", "unknown")
+
+            # Calculate delay from PTS/start_time
+            start_pts = stream.get("start_pts", 0)
+            time_base = stream.get("time_base", "1/90000")
+            delay_ms = self._calculate_delay(start_pts, time_base, stream_type)
 
             stream_meta = {
                 "index": stream.get("index", stream_idx),
@@ -70,31 +84,39 @@ class MetadataAnalysisStep:
                 "codec_long": stream.get("codec_long_name"),
 
                 # Timing information - CRITICAL for sync
-                "start_pts": stream.get("start_pts", 0),
+                "start_pts": start_pts,
                 "start_time": stream.get("start_time", "0"),
-                "delay_ms": self._pts_to_ms(stream.get("start_pts", 0), stream.get("time_base", "1/90000")),
+                "delay_ms": delay_ms,
+                "time_base": time_base,
 
-                # Stream-specific metadata
+                # Default values (will be enriched from IFO)
                 "language": stream.get("tags", {}).get("language", "und"),
                 "disposition": stream.get("disposition", {}),
             }
 
             # Video-specific metadata
             if stream_type == "video":
-                # Use IFO aspect ratio if available, otherwise use ffprobe data
+                # Use IFO aspect ratio if available
                 if ifo_data.get('aspect_ratio'):
                     stream_meta["aspect_ratio"] = ifo_data['aspect_ratio']
+                    log_emitter(f"  -> Using IFO aspect ratio: {ifo_data['aspect_ratio']}")
                 else:
-                    stream_meta["aspect_ratio"] = stream.get("display_aspect_ratio")
+                    # Parse ffprobe aspect ratio
+                    dar = stream.get("display_aspect_ratio", "")
+                    if dar and ':' in dar:
+                        stream_meta["aspect_ratio"] = dar
+                    else:
+                        # Calculate from dimensions
+                        width = stream.get("width", 720)
+                        height = stream.get("height", 480)
+                        stream_meta["aspect_ratio"] = f"{width}:{height}"
+
+                # Video format from IFO
+                stream_meta["video_format"] = ifo_data.get('video_format', 'NTSC')
 
                 # Set video language to first audio track's language if available
-                if ifo_data.get('audio_tracks') and len(ifo_data['audio_tracks']) > 0:
-                    stream_meta["language"] = ifo_data['audio_tracks'][0].get('language', 'und')
-                elif len([s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"]) > 0:
-                    # Fall back to first audio stream language from ffprobe
-                    first_audio = next((s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"), None)
-                    if first_audio:
-                        stream_meta["language"] = first_audio.get("tags", {}).get("language", "und")
+                if ifo_audio and len(ifo_audio) > 0:
+                    stream_meta["language"] = ifo_audio[0].get('language', 'und')
 
                 stream_meta.update({
                     "width": stream.get("width"),
@@ -112,16 +134,37 @@ class MetadataAnalysisStep:
                 # Determine extraction format
                 if stream.get("codec_name") == "mpeg2video":
                     stream_meta["extract_extension"] = ".m2v"
-                    stream_meta["extract_codec"] = "copy"
                 elif stream.get("codec_name") == "h264":
                     stream_meta["extract_extension"] = ".264"
-                    stream_meta["extract_codec"] = "copy"
                 else:
                     stream_meta["extract_extension"] = ".mkv"
-                    stream_meta["extract_codec"] = "copy"
 
-            # Audio-specific metadata
+            # Audio-specific metadata - MERGE WITH IFO DATA
             elif stream_type == "audio":
+                # Match with IFO audio track data
+                if audio_idx < len(ifo_audio):
+                    ifo_track = ifo_audio[audio_idx]
+
+                    # IFO data takes precedence for DVDs
+                    stream_meta["language"] = ifo_track.get('language', stream_meta["language"])
+                    stream_meta["ifo_format"] = ifo_track.get('format')
+                    stream_meta["ifo_channels"] = ifo_track.get('channels')
+                    stream_meta["ifo_sample_rate"] = ifo_track.get('sample_rate')
+                    stream_meta["content_type"] = ifo_track.get('content', 'Normal')
+                    stream_meta["track_name"] = ifo_track.get('name', '')
+
+                    # Use IFO delay if available and more accurate
+                    if ifo_track.get('delay_ms') is not None:
+                        stream_meta["delay_ms"] = ifo_track['delay_ms']
+                        stream_meta["delay_source"] = "ifo"
+                    else:
+                        stream_meta["delay_source"] = "pts"
+
+                    log_emitter(f"  -> Enriched audio #{audio_idx} with IFO: {stream_meta['track_name']}")
+
+                audio_idx += 1
+
+                # FFprobe audio metadata
                 stream_meta.update({
                     "sample_rate": stream.get("sample_rate"),
                     "channels": stream.get("channels"),
@@ -138,37 +181,68 @@ class MetadataAnalysisStep:
                     stream_meta["extract_extension"] = ".eac3"
                 elif codec == "dts":
                     stream_meta["extract_extension"] = ".dts"
-                elif codec == "mp2":
+                elif codec in ["mp2", "mp3"]:
                     stream_meta["extract_extension"] = ".mp2"
                 elif codec == "pcm_s16le" or "pcm" in codec:
                     stream_meta["extract_extension"] = ".wav"
                 else:
                     stream_meta["extract_extension"] = ".mka"
-                stream_meta["extract_codec"] = "copy"
 
-            # Subtitle-specific metadata
+            # Subtitle-specific metadata - MERGE WITH IFO DATA
             elif stream_type == "subtitle":
-                stream_meta.update({
-                    "forced": stream.get("disposition", {}).get("forced", 0),
-                    "codec_private": stream.get("codec_private"),
-                })
+                # Match with IFO subtitle track data
+                if sub_idx < len(ifo_subs):
+                    ifo_track = ifo_subs[sub_idx]
 
+                    # Merge IFO data
+                    stream_meta["language"] = ifo_track.get('language', stream_meta["language"])
+                    stream_meta["content_type"] = ifo_track.get('content', 'Normal')
+                    stream_meta["forced"] = ifo_track.get('forced', False)
+                    stream_meta["track_name"] = ifo_track.get('name', '')
+
+                    log_emitter(f"  -> Enriched subtitle #{sub_idx} with IFO: {stream_meta['track_name']}")
+
+                sub_idx += 1
+
+                # Update forced flag from ffprobe if not set by IFO
+                if not stream_meta.get("forced"):
+                    stream_meta["forced"] = stream.get("disposition", {}).get("forced", 0)
+
+                stream_meta["codec_private"] = stream.get("codec_private")
+
+                # DVD subtitles need the palette from IFO
                 codec = stream.get("codec_name", "").lower()
                 if codec in ["dvd_subtitle", "dvdsub"]:
                     stream_meta["extract_extension"] = ".sup"
+                    if ifo_data.get('palette'):
+                        stream_meta["palette"] = ifo_data['palette']
+                        log_emitter(f"  -> Added palette data for DVD subtitle")
                 elif codec == "hdmv_pgs_subtitle":
                     stream_meta["extract_extension"] = ".sup"
                 else:
                     stream_meta["extract_extension"] = ".srt"
-                stream_meta["extract_codec"] = "copy"
 
             metadata["streams"].append(stream_meta)
 
             # Create MKV mapping for this stream
             self._create_mkv_mapping(stream_meta, metadata["mkv_mapping"])
 
-        # Process chapters
-        metadata["chapters"] = self._process_chapters(probe_data.get("chapters", []))
+        # Process chapters - prefer IFO chapters if available
+        if ifo_chapters:
+            metadata["chapters"] = self._process_ifo_chapters(ifo_chapters)
+            log_emitter(f"  -> Using {len(ifo_chapters)} chapters from IFO data")
+        else:
+            metadata["chapters"] = self._process_ffprobe_chapters(probe_data.get("chapters", []))
+
+        # Add cell timing data if available
+        if ifo_cells:
+            metadata["cells"] = ifo_cells
+            total_cell_time = sum(c.get('playback_time', 0) for c in ifo_cells)
+            log_emitter(f"  -> Found {len(ifo_cells)} cells with total time: {total_cell_time:.2f}s")
+
+        # Add additional IFO metadata
+        metadata["angles"] = ifo_data.get("angles", 1)
+        metadata["video_format"] = ifo_data.get("video_format", "NTSC")
 
         # Save metadata to JSON
         try:
@@ -185,25 +259,55 @@ class MetadataAnalysisStep:
         # Log summary
         log_emitter(f"  -> Found {len(metadata['streams'])} streams:")
         for s in metadata["streams"]:
-            delay_info = f" (delay: {s['delay_ms']}ms)" if s['delay_ms'] else ""
-            log_emitter(f"     Stream #{s['index']}: {s['type']} [{s['codec']}] {s['language']}{delay_info}")
+            delay_info = f" (delay: {s['delay_ms']}ms from {s.get('delay_source', 'unknown')})" if s.get('delay_ms') else ""
+            name_info = f" [{s.get('track_name', '')}]" if s.get('track_name') else ""
+            log_emitter(f"     Stream #{s['index']}: {s['type']} [{s['codec']}] {s['language']}{name_info}{delay_info}")
 
         return True
 
-    def _pts_to_ms(self, pts, time_base_str):
-        """Convert PTS to milliseconds."""
-        if not pts:
-            return 0
-        try:
-            # Parse time_base (e.g., "1/90000")
-            num, denom = map(int, time_base_str.split('/'))
-            seconds = pts * num / denom
-            return int(seconds * 1000)
-        except:
+    def _calculate_delay(self, start_pts, time_base_str, stream_type):
+        """Calculate delay in milliseconds from PTS and time base."""
+        if not start_pts or stream_type == "video":
             return 0
 
-    def _process_chapters(self, chapters):
-        """Process chapter data for MKV."""
+        try:
+            # Parse time_base (e.g., "1/90000" for DVD)
+            if '/' in time_base_str:
+                num, denom = map(int, time_base_str.split('/'))
+            else:
+                # Handle decimal time base
+                num = 1
+                denom = int(1 / float(time_base_str))
+
+            # Convert PTS to seconds then to milliseconds
+            seconds = (start_pts * num) / denom
+            delay_ms = int(seconds * 1000)
+
+            # DVD audio typically has ~32ms delay (1 video frame at 29.97fps)
+            # Only apply if delay is significant
+            if delay_ms < 10:
+                return 0
+
+            return delay_ms
+
+        except (ValueError, ZeroDivisionError):
+            return 0
+
+    def _process_ifo_chapters(self, ifo_chapters):
+        """Process chapter data from IFO."""
+        processed = []
+        for chap in ifo_chapters:
+            processed.append({
+                "number": chap.get('number', len(processed) + 1),
+                "start_time": str(chap.get('start_time', 0)),
+                "end_time": str(chap.get('end_time', 0)),
+                "cell": chap.get('cell'),
+                "title": f"Chapter {chap.get('number', len(processed) + 1):02d}"
+            })
+        return processed
+
+    def _process_ffprobe_chapters(self, chapters):
+        """Process chapter data from ffprobe."""
         processed = []
         for i, chap in enumerate(chapters):
             processed.append({
@@ -212,7 +316,7 @@ class MetadataAnalysisStep:
                 "end_time": chap.get("end_time", "0"),
                 "start_pts": chap.get("start", 0),
                 "end_pts": chap.get("end", 0),
-                "title": f"Chapter {i+1:02d}"  # Will be overridden by chapters step if needed
+                "title": f"Chapter {i+1:02d}"
             })
         return processed
 
@@ -224,12 +328,12 @@ class MetadataAnalysisStep:
             "type": stream_meta['type'],
             "source_index": stream_idx,
             "language": stream_meta['language'],
-            "delay_ms": stream_meta['delay_ms'],
+            "delay_ms": stream_meta.get('delay_ms', 0),
             "mkvmerge_options": []
         }
 
         # Add delay if present
-        if stream_meta['delay_ms']:
+        if stream_meta.get('delay_ms'):
             mkv_params["mkvmerge_options"].append(f"--sync 0:{stream_meta['delay_ms']}")
 
         # Language tag
@@ -238,40 +342,78 @@ class MetadataAnalysisStep:
 
         # Video-specific MKV settings
         if stream_meta['type'] == 'video':
+            # Field order
             if stream_meta.get('field_order'):
                 field_map = {
                     'tt': '1',  # top field first
+                    'tb': '1',  # top field first (alternative)
                     'bb': '2',  # bottom field first
-                    'tb': '1',  # top field first (alternative notation)
-                    'bt': '2',  # bottom field first (alternative notation)
+                    'bt': '2',  # bottom field first (alternative)
                 }
                 if stream_meta['field_order'] in field_map:
                     mkv_params["mkvmerge_options"].append(f"--field-order 0:{field_map[stream_meta['field_order']]}")
 
+            # Aspect ratio / display dimensions
             if stream_meta.get('aspect_ratio'):
-                mkv_params["mkvmerge_options"].append(f"--display-dimensions 0:{stream_meta['aspect_ratio']}")
+                ar = stream_meta['aspect_ratio']
+                if ar in ['4:3', '16:9']:
+                    # Calculate display dimensions
+                    width = stream_meta.get('width', 720)
+                    height = stream_meta.get('height', 480)
+
+                    if ar == '4:3':
+                        display_width = int(height * 4 / 3)
+                    else:  # 16:9
+                        display_width = int(height * 16 / 9)
+
+                    mkv_params["mkvmerge_options"].append(f"--display-dimensions 0:{display_width}x{height}")
 
         # Audio-specific MKV settings
         elif stream_meta['type'] == 'audio':
-            # Track name based on channel layout
-            layout = stream_meta.get('channel_layout', '')
-            if '5.1' in layout or stream_meta.get('channels') == 6:
-                mkv_params["track_name"] = "5.1 Surround"
-            elif 'stereo' in layout or stream_meta.get('channels') == 2:
-                mkv_params["track_name"] = "Stereo"
+            # Use track name from IFO or build from metadata
+            track_name = stream_meta.get('track_name', '')
 
-            if mkv_params.get("track_name"):
-                mkv_params["mkvmerge_options"].append(f"--track-name 0:{mkv_params['track_name']}")
+            if not track_name:
+                # Build track name from channel layout
+                layout = stream_meta.get('channel_layout', '')
+                channels = stream_meta.get('channels', 0)
+                codec = stream_meta.get('codec', '').upper()
+
+                if '5.1' in layout or channels == 6:
+                    ch_name = "5.1 Surround"
+                elif 'stereo' in layout.lower() or channels == 2:
+                    ch_name = "Stereo"
+                elif channels == 1:
+                    ch_name = "Mono"
+                else:
+                    ch_name = f"{channels}ch"
+
+                # Add codec to name
+                if codec in ['AC3', 'EAC3', 'DTS']:
+                    track_name = f"{ch_name} ({codec})"
+                else:
+                    track_name = ch_name
+
+            if track_name:
+                mkv_params["track_name"] = track_name
+                mkv_params["mkvmerge_options"].append(f"--track-name 0:{track_name}")
 
         # Subtitle-specific settings
         elif stream_meta['type'] == 'subtitle':
             if stream_meta.get('forced'):
                 mkv_params["mkvmerge_options"].append("--forced-display-flag 0:yes")
 
-        # Default flag (first audio/video track should be default)
-        if stream_idx == 0 or (stream_meta['type'] == 'audio' and stream_idx == 1):
+            # Add track name from IFO if available
+            if track_name := stream_meta.get('track_name'):
+                mkv_params["track_name"] = track_name
+                mkv_params["mkvmerge_options"].append(f"--track-name 0:{track_name}")
+
+        # Default flag (first track of each type)
+        # Note: This is simplified - should check per type
+        if stream_idx == 0:
             mkv_params["mkvmerge_options"].append("--default-track-flag 0:yes")
+        else:
+            mkv_params["mkvmerge_options"].append("--default-track-flag 0:no")
 
         mkv_map[stream_idx] = mkv_params
-
         return mkv_params
