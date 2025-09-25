@@ -432,6 +432,9 @@ class IfoParserStep:
         for cell in cell_playback:
             start_time = cumulative_time
             duration = cell.get('playback_time', 0)
+            # Sanity check - if duration is unreasonably long, it's likely a parsing error
+            if duration > 36000:  # More than 10 hours per cell is suspicious
+                duration = 0
             end_time = start_time + duration
             cell_times.append({
                 'start': start_time,
@@ -444,12 +447,14 @@ class IfoParserStep:
         for prog_idx, entry_cell in enumerate(program_map):
             if entry_cell > 0 and entry_cell <= len(cell_times):
                 cell_idx = entry_cell - 1  # Cell numbers are 1-based
-                chapters.append({
-                    'number': prog_idx + 1,
-                    'start_time': cell_times[cell_idx]['start'],
-                    'end_time': cell_times[cell_idx]['end'],
-                    'cell': entry_cell
-                })
+                # Only add if we have valid timing
+                if cell_times[cell_idx]['end'] > cell_times[cell_idx]['start']:
+                    chapters.append({
+                        'number': prog_idx + 1,
+                        'start_time': cell_times[cell_idx]['start'],
+                        'end_time': cell_times[cell_idx]['end'],
+                        'cell': entry_cell
+                    })
 
         return chapters
 

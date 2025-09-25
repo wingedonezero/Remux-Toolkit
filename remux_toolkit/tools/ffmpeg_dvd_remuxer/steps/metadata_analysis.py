@@ -145,8 +145,18 @@ class MetadataAnalysisStep:
                 if audio_idx < len(ifo_audio):
                     ifo_track = ifo_audio[audio_idx]
 
-                    # IFO data takes precedence for DVDs
-                    stream_meta["language"] = ifo_track.get('language', stream_meta["language"])
+                    # Only override with IFO data if it's not 'und' or empty
+                    ifo_lang = ifo_track.get('language', 'und')
+                    ffprobe_lang = stream_meta["language"]
+
+                    # Prefer ffprobe language if IFO doesn't have it
+                    if ifo_lang != 'und':
+                        stream_meta["language"] = ifo_lang
+                    elif ffprobe_lang == 'und' and audio_idx == 0:
+                        # First audio track often defaults to source video language
+                        stream_meta["language"] = 'eng'  # Common default
+
+                    # Add IFO-specific metadata
                     stream_meta["ifo_format"] = ifo_track.get('format')
                     stream_meta["ifo_channels"] = ifo_track.get('channels')
                     stream_meta["ifo_sample_rate"] = ifo_track.get('sample_rate')
@@ -154,13 +164,21 @@ class MetadataAnalysisStep:
                     stream_meta["track_name"] = ifo_track.get('name', '')
 
                     # Use IFO delay if available and more accurate
-                    if ifo_track.get('delay_ms') is not None:
+                    if ifo_track.get('delay_ms') is not None and ifo_track['delay_ms'] > 0:
                         stream_meta["delay_ms"] = ifo_track['delay_ms']
                         stream_meta["delay_source"] = "ifo"
-                    else:
+                    elif delay_ms > 0:
                         stream_meta["delay_source"] = "pts"
+                    else:
+                        stream_meta["delay_source"] = "none"
 
                     log_emitter(f"  -> Enriched audio #{audio_idx} with IFO: {stream_meta['track_name']}")
+                else:
+                    # No IFO data for this track, use ffprobe data only
+                    if delay_ms > 0:
+                        stream_meta["delay_source"] = "pts"
+                    else:
+                        stream_meta["delay_source"] = "none"
 
                 audio_idx += 1
 
@@ -227,18 +245,35 @@ class MetadataAnalysisStep:
             # Create MKV mapping for this stream
             self._create_mkv_mapping(stream_meta, metadata["mkv_mapping"])
 
-        # Process chapters - prefer IFO chapters if available
+        # Process chapters - prefer IFO chapters if available and reasonable
         if ifo_chapters:
-            metadata["chapters"] = self._process_ifo_chapters(ifo_chapters)
-            log_emitter(f"  -> Using {len(ifo_chapters)} chapters from IFO data")
+            # Validate IFO chapters have reasonable timing
+            max_time = max((c.get('end_time', 0) for c in ifo_chapters), default=0)
+            if max_time > 0 and max_time < 36000:  # Less than 10 hours
+                metadata["chapters"] = self._process_ifo_chapters(ifo_chapters)
+                log_emitter(f"  -> Using {len(ifo_chapters)} chapters from IFO data")
+            else:
+                # Fall back to ffprobe if IFO chapters seem wrong
+                metadata["chapters"] = self._process_ffprobe_chapters(probe_data.get("chapters", []))
+                if metadata["chapters"]:
+                    log_emitter(f"  -> Using {len(metadata['chapters'])} chapters from ffprobe (IFO chapters had invalid timing)")
         else:
             metadata["chapters"] = self._process_ffprobe_chapters(probe_data.get("chapters", []))
+            if metadata["chapters"]:
+                log_emitter(f"  -> Using {len(metadata['chapters'])} chapters from ffprobe")
 
-        # Add cell timing data if available
+        # Add cell timing data if available and reasonable
         if ifo_cells:
-            metadata["cells"] = ifo_cells
+            # Validate cell timing
             total_cell_time = sum(c.get('playback_time', 0) for c in ifo_cells)
-            log_emitter(f"  -> Found {len(ifo_cells)} cells with total time: {total_cell_time:.2f}s")
+            if total_cell_time > 0 and total_cell_time < 36000:  # Less than 10 hours
+                metadata["cells"] = ifo_cells
+                log_emitter(f"  -> Found {len(ifo_cells)} cells with total time: {total_cell_time:.2f}s")
+            else:
+                log_emitter(f"  -> Ignoring {len(ifo_cells)} cells with invalid timing")
+                metadata["cells"] = []
+        else:
+            metadata["cells"] = []
 
         # Add additional IFO metadata
         metadata["angles"] = ifo_data.get("angles", 1)
@@ -259,9 +294,19 @@ class MetadataAnalysisStep:
         # Log summary
         log_emitter(f"  -> Found {len(metadata['streams'])} streams:")
         for s in metadata["streams"]:
-            delay_info = f" (delay: {s['delay_ms']}ms from {s.get('delay_source', 'unknown')})" if s.get('delay_ms') else ""
+            # Format delay info
+            delay_info = ""
+            if s.get('delay_ms') and s['delay_ms'] > 0:
+                source = s.get('delay_source', 'unknown')
+                delay_info = f" (delay: {s['delay_ms']}ms from {source})"
+
+            # Format track name
             name_info = f" [{s.get('track_name', '')}]" if s.get('track_name') else ""
-            log_emitter(f"     Stream #{s['index']}: {s['type']} [{s['codec']}] {s['language']}{name_info}{delay_info}")
+
+            # Show language only if it's not 'und'
+            lang = s['language'] if s['language'] != 'und' else ''
+
+            log_emitter(f"     Stream #{s['index']}: {s['type']} [{s['codec']}] {lang}{name_info}{delay_info}")
 
         return True
 
