@@ -84,27 +84,69 @@ class TelecineDetectionStep:
         prog_frames = 0  # Progressive
         undetermined = 0
 
-        for line in run_stream(ffmpeg_cmd, stop_event):
-            # Parse idet output: [Parsed_idet_0 @ ...] Single frame detection: TFF:0 BFF:0 Progressive:1 Undetermined:0
-            if "Single frame detection:" in line:
-                match = re.search(r'TFF:(\d+)\s+BFF:(\d+)\s+Progressive:(\d+)\s+Undetermined:(\d+)', line)
-                if match:
-                    tff_frames = int(match.group(1))
-                    bff_frames = int(match.group(2))
-                    prog_frames = int(match.group(3))
-                    undetermined = int(match.group(4))
-            # Also catch the summary line
-            elif "Multi frame detection:" in line:
-                # This gives us the more accurate multi-frame detection results
-                match = re.search(r'TFF:(\d+)\s+BFF:(\d+)\s+Progressive:(\d+)\s+Undetermined:(\d+)', line)
-                if match:
-                    tff_frames = int(match.group(1))
-                    bff_frames = int(match.group(2))
-                    prog_frames = int(match.group(3))
-                    undetermined = int(match.group(4))
+        # Collect all output since idet prints to stderr
+        import subprocess
+        try:
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
+            )
 
-        if stop_event.is_set():
-            return False
+            # Let it run and collect stderr
+            stdout, stderr = process.communicate(timeout=sample_duration + 30)
+
+            if stop_event.is_set():
+                return False
+
+            # Parse the final idet statistics from stderr
+            # Look for the summary line that appears at the end:
+            # [Parsed_idet_0 @ 0x...] Repeated Fields: Neither: X Top: Y Bottom: Z
+            # [Parsed_idet_0 @ 0x...] Single frame detection: TFF: X BFF: Y Progressive: Z Undetermined: W
+            # [Parsed_idet_0 @ 0x...] Multi frame detection: TFF: X BFF: Y Progressive: Z Undetermined: W
+
+            for line in stderr.split('\n'):
+                # Look for the Multi frame detection line (most accurate)
+                if "Multi frame detection:" in line:
+                    # Parse format: TFF:   123 BFF:   456 Progressive:   789 Undetermined:    10
+                    parts = line.split("Multi frame detection:")[-1]
+
+                    # Extract numbers with more flexible regex
+                    tff_match = re.search(r'TFF:\s*(\d+)', parts)
+                    bff_match = re.search(r'BFF:\s*(\d+)', parts)
+                    prog_match = re.search(r'Progressive:\s*(\d+)', parts)
+                    undet_match = re.search(r'Undetermined:\s*(\d+)', parts)
+
+                    if tff_match: tff_frames = int(tff_match.group(1))
+                    if bff_match: bff_frames = int(bff_match.group(1))
+                    if prog_match: prog_frames = int(prog_match.group(1))
+                    if undet_match: undetermined = int(undet_match.group(1))
+
+                # Also check Single frame as fallback
+                elif "Single frame detection:" in line and (tff_frames + bff_frames + prog_frames == 0):
+                    parts = line.split("Single frame detection:")[-1]
+
+                    tff_match = re.search(r'TFF:\s*(\d+)', parts)
+                    bff_match = re.search(r'BFF:\s*(\d+)', parts)
+                    prog_match = re.search(r'Progressive:\s*(\d+)', parts)
+                    undet_match = re.search(r'Undetermined:\s*(\d+)', parts)
+
+                    if tff_match: tff_frames = int(tff_match.group(1))
+                    if bff_match: bff_frames = int(bff_match.group(1))
+                    if prog_match: prog_frames = int(prog_match.group(1))
+                    if undet_match: undetermined = int(undet_match.group(1))
+
+        except subprocess.TimeoutExpired:
+            log_emitter("  -> Timeout during telecine detection")
+            context['detected_progressive'] = None
+            return True
+        except Exception as e:
+            log_emitter(f"  -> Error during telecine detection: {e}")
+            context['detected_progressive'] = None
+            return True
 
         # Calculate percentages
         total_frames = tff_frames + bff_frames + prog_frames + undetermined
