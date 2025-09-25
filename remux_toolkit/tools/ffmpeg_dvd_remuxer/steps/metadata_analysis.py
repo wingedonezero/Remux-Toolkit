@@ -19,6 +19,9 @@ class MetadataAnalysisStep:
         title_num = context['title_num']
         out_folder = context['out_folder']
 
+        # Get IFO data from previous step if available
+        ifo_data = context.get('ifo_data', {})
+
         # Create metadata file path
         metadata_file = out_folder / f"title_{title_num}_metadata.json"
         context['metadata_file'] = metadata_file
@@ -57,12 +60,11 @@ class MetadataAnalysisStep:
         }
 
         # Process each stream
-        for stream in probe_data.get("streams", []):
-            stream_idx = stream.get("index", -1)
+        for stream_idx, stream in enumerate(probe_data.get("streams", [])):
             stream_type = stream.get("codec_type", "unknown")
 
             stream_meta = {
-                "index": stream_idx,
+                "index": stream.get("index", stream_idx),
                 "type": stream_type,
                 "codec": stream.get("codec_name"),
                 "codec_long": stream.get("codec_long_name"),
@@ -79,10 +81,24 @@ class MetadataAnalysisStep:
 
             # Video-specific metadata
             if stream_type == "video":
+                # Use IFO aspect ratio if available, otherwise use ffprobe data
+                if ifo_data.get('aspect_ratio'):
+                    stream_meta["aspect_ratio"] = ifo_data['aspect_ratio']
+                else:
+                    stream_meta["aspect_ratio"] = stream.get("display_aspect_ratio")
+
+                # Set video language to first audio track's language if available
+                if ifo_data.get('audio_tracks') and len(ifo_data['audio_tracks']) > 0:
+                    stream_meta["language"] = ifo_data['audio_tracks'][0].get('language', 'und')
+                elif len([s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"]) > 0:
+                    # Fall back to first audio stream language from ffprobe
+                    first_audio = next((s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"), None)
+                    if first_audio:
+                        stream_meta["language"] = first_audio.get("tags", {}).get("language", "und")
+
                 stream_meta.update({
                     "width": stream.get("width"),
                     "height": stream.get("height"),
-                    "aspect_ratio": stream.get("display_aspect_ratio"),
                     "pixel_aspect": stream.get("sample_aspect_ratio"),
                     "frame_rate": stream.get("r_frame_rate"),
                     "field_order": stream.get("field_order"),

@@ -6,6 +6,7 @@ from .finalize import FinalizeStep
 from .disc_analysis import DiscAnalysisStep
 from .metadata_analysis import MetadataAnalysisStep
 from .telecine_detection import TelecineDetectionStep
+from .ifo_parser import IfoParserStep
 
 # This makes it easy for the orchestrator to import all available steps
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "DiscAnalysisStep",
     "MetadataAnalysisStep",
     "TelecineDetectionStep",
+    "IfoParserStep",
 ]
