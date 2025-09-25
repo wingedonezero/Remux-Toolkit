@@ -131,7 +131,7 @@ class FinalizeStep:
         if context.get('cc_found', False):
             cc_srt = context.get('cc_srt_path')
             if cc_srt and cc_srt.exists():
-                mkvmerge_cmd.append("+")
+                # The line 'mkvmerge_cmd.append("+")' has been removed.
                 mkvmerge_cmd.extend([
                     "--language", "0:eng",
                     "--track-name", "0:Closed Captions (EIA-608)",
