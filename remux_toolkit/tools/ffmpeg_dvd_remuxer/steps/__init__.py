@@ -4,6 +4,7 @@ from .ccextract import CCExtractStep
 from .chapters import ChaptersStep
 from .finalize import FinalizeStep
 from .disc_analysis import DiscAnalysisStep
+from .metadata_analysis import MetadataAnalysisStep
 
 # This makes it easy for the orchestrator to import all available steps
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "ChaptersStep",
     "FinalizeStep",
     "DiscAnalysisStep",
+    "MetadataAnalysisStep",
 ]

@@ -17,11 +17,24 @@ class CCExtractStep:
 
         step_info = context.get('step_info', '[STEP]')
         log_emitter(f"{step_info} Extracting closed captions...")
-        temp_mkv = context['temp_mkv_path']
+
+        # Find the video stream file from extracted streams
+        extracted_streams = context.get('extracted_streams', [])
+        video_file = None
+        for stream_info in extracted_streams:
+            if stream_info['type'] == 'video':
+                video_file = stream_info['file']
+                break
+
+        if not video_file or not video_file.exists():
+            log_emitter("  -> No video stream found for caption extraction.")
+            context['cc_found'] = False
+            return True
+
         cc_srt = context['out_folder'] / f"title_{context['title_num']}_cc.srt"
         context['cc_srt_path'] = cc_srt
 
-        ccextractor_cmd = ["ccextractor", "-out=srt", "-o", str(cc_srt), str(temp_mkv), "-quiet"]
+        ccextractor_cmd = ["ccextractor", "-out=srt", "-o", str(cc_srt), str(video_file), "-quiet"]
         for line in run_stream(ccextractor_cmd, stop_event): log_emitter(line)
         if stop_event.is_set(): return False
 

@@ -1,7 +1,7 @@
 # remux_toolkit/tools/ffmpeg_dvd_remuxer/core/orchestrator.py
 from pathlib import Path
 
-from ..steps import DemuxStep, CCExtractStep, ChaptersStep, FinalizeStep, DiscAnalysisStep
+from ..steps import DemuxStep, CCExtractStep, ChaptersStep, FinalizeStep, DiscAnalysisStep, MetadataAnalysisStep
 
 class Orchestrator:
     def __init__(self, config, temp_dir: Path):
@@ -13,6 +13,7 @@ class Orchestrator:
 
         # Processing pipeline steps
         self.steps = [
+            MetadataAnalysisStep(self.config),  # First, analyze all metadata
             DemuxStep(self.config),
             CCExtractStep(self.config),
             ChaptersStep(self.config),

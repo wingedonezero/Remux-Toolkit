@@ -8,38 +8,61 @@ class ChaptersStep:
 
     def run(self, context: dict, log_emitter, stop_event) -> bool:
         step_info = context.get('step_info', '[STEP]')
-        log_emitter(f"{step_info} Extracting and renaming chapters...")
-        temp_mkv = context['temp_mkv_path']
+        log_emitter(f"{step_info} Processing chapter information...")
+
+        # Get chapter data from metadata
+        metadata = context.get('title_metadata', {})
+        chapters_data = metadata.get('chapters', [])
+
+        if not chapters_data:
+            log_emitter("  -> No chapters found in metadata.")
+            context['chapters_ok'] = False
+            return True
+
+        # Create XML chapter file for mkvmerge
         mod_chap_xml = context['out_folder'] / f"title_{context['title_num']}_chapters_mod.xml"
         context['mod_chap_xml_path'] = mod_chap_xml
 
-        # --- THIS IS THE FIX ---
-        # Use run_capture to get the entire XML output at once, which is required for mkvextract.
-        mkvextract_cmd = ["mkvextract", str(temp_mkv), "chapters", "-"]
-        rc, out_ext = run_capture(mkvextract_cmd)
-        log_emitter(f">>> Executing: mkvextract ...\n{out_ext}")
-        # --- END FIX ---
+        try:
+            # Build chapter XML structure
+            root = ET.Element("Chapters")
+            edition = ET.SubElement(root, "EditionEntry")
+            ET.SubElement(edition, "EditionFlagHidden").text = "0"
+            ET.SubElement(edition, "EditionFlagDefault").text = "0"
 
-        if stop_event.is_set(): return False
+            for chap in chapters_data:
+                atom = ET.SubElement(edition, "ChapterAtom")
 
-        chapters_ok = False
-        if rc == 0 and out_ext.strip():
-            try:
-                root = ET.fromstring(out_ext)
-                for i, atom in enumerate(root.findall('.//ChapterAtom'), 1):
-                    for display in atom.findall('ChapterDisplay'): atom.remove(display)
-                    new_display = ET.SubElement(atom, 'ChapterDisplay')
-                    ET.SubElement(new_display, 'ChapterString').text = f"Chapter {i:02d}"
-                    ET.SubElement(new_display, 'ChapterLanguage').text = 'eng'
+                # Convert times to HH:MM:SS.nnnnnnnnn format
+                start_seconds = float(chap['start_time'])
+                end_seconds = float(chap['end_time'])
 
-                tree = ET.ElementTree(root)
-                tree.write(mod_chap_xml, encoding='UTF-8', xml_declaration=True)
-                chapters_ok = True
-                log_emitter("  -> Chapters processed successfully.")
-            except Exception as e:
-                log_emitter(f"!! ERROR: Failed to process chapter XML: {e}")
-        else:
-            log_emitter("  -> No chapters found or extraction failed.")
+                def format_time(seconds):
+                    hours = int(seconds // 3600)
+                    minutes = int((seconds % 3600) // 60)
+                    secs = seconds % 60
+                    # Format with 9 decimal places for nanosecond precision
+                    return f"{hours:02d}:{minutes:02d}:{secs:012.9f}"
 
-        context['chapters_ok'] = chapters_ok
+                ET.SubElement(atom, "ChapterTimeStart").text = format_time(start_seconds)
+                ET.SubElement(atom, "ChapterTimeEnd").text = format_time(end_seconds)
+                ET.SubElement(atom, "ChapterFlagHidden").text = "0"
+                ET.SubElement(atom, "ChapterFlagEnabled").text = "1"
+
+                display = ET.SubElement(atom, "ChapterDisplay")
+                ET.SubElement(display, "ChapterString").text = f"Chapter {chap['number']:02d}"
+                ET.SubElement(display, "ChapterLanguage").text = "eng"
+
+            # Write XML file
+            tree = ET.ElementTree(root)
+            ET.indent(tree, space="  ")  # Format nicely
+            tree.write(mod_chap_xml, encoding='UTF-8', xml_declaration=True)
+
+            log_emitter(f"  -> Processed {len(chapters_data)} chapters successfully.")
+            context['chapters_ok'] = True
+
+        except Exception as e:
+            log_emitter(f"!! ERROR: Failed to create chapter XML: {e}")
+            context['chapters_ok'] = False
+
         return True
