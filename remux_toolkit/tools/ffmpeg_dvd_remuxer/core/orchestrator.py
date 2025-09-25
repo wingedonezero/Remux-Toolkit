@@ -1,89 +1,160 @@
-# remux_toolkit/tools/ffmpeg_dvd_remuxer/core/orchestrator.py
-from pathlib import Path
+# remux_toolkit/tools/ffmpeg_dvd_remuxer/gui/prefs_dialog.py
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QSpinBox, QCheckBox, QDialogButtonBox, QFileDialog, QComboBox,
+    QSlider, QGroupBox
+)
+from PyQt6.QtCore import Qt
 
-from ..steps import DemuxStep, CCExtractStep, ChaptersStep, FinalizeStep, DiscAnalysisStep, MetadataAnalysisStep
-
-class Orchestrator:
-    def __init__(self, config, temp_dir: Path):
+class PrefsDialog(QDialog):
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
         self.config = config
-        self.temp_dir = temp_dir
+        self.setWindowTitle("FFmpeg DVD Remuxer Settings")
+        self.setMinimumWidth(550)
 
-        # Analysis step is separate since it runs during queue addition
-        self.analysis_step = DiscAnalysisStep(self.config)
+        layout = QVBoxLayout(self)
 
-        # Processing pipeline steps
-        self.steps = [
-            MetadataAnalysisStep(self.config),  # First, analyze all metadata
-            DemuxStep(self.config),
-            CCExtractStep(self.config),
-            ChaptersStep(self.config),
-            FinalizeStep(self.config),
-        ]
+        # Output directory
+        self.out_dir_edit = QLineEdit(self.config.get("default_output_directory", ""))
+        self.out_dir_btn = QPushButton("Browse...")
+        self.out_dir_btn.clicked.connect(self.browse_output_dir)
+        out_dir_layout = QHBoxLayout()
+        out_dir_layout.addWidget(self.out_dir_edit)
+        out_dir_layout.addWidget(self.out_dir_btn)
 
-    def analyze_disc(self, path: Path, log_emitter, stop_event) -> tuple[list, str]:
-        """Delegate disc analysis to the DiscAnalysisStep."""
-        return self.analysis_step.run(path, self.temp_dir, log_emitter, stop_event)
+        # Minimum title length
+        self.min_len_spin = QSpinBox()
+        self.min_len_spin.setRange(0, 10000)
+        self.min_len_spin.setSuffix(" seconds")
+        self.min_len_spin.setValue(self.config.get("minimum_title_length", 120))
+        min_len_layout = QHBoxLayout()
+        min_len_layout.addWidget(QLabel("Minimum Title Length for 'Process All':"))
+        min_len_layout.addWidget(self.min_len_spin)
 
-    def run_pipeline(self, context: dict, log_emitter, stop_event):
-        """Run the processing pipeline. This is a generator that yields progress updates."""
-        title_num = context['title_num']
-        log_emitter(f"--- Processing Title {title_num} ---")
+        # Processing options
+        self.remove_eia_check = QCheckBox("Remove EIA-608 caption data from video stream")
+        self.remove_eia_check.setChecked(self.config.get("remove_eia_608", True))
 
-        out_folder = context['out_folder']
-        context['temp_mkv_path'] = out_folder / f"title_{title_num}_temp.mkv"
-        context['cc_srt_path'] = out_folder / f"title_{title_num}_cc.srt"
-        context['mod_chap_xml_path'] = out_folder / f"title_{title_num}_chapters_mod.xml"
+        self.ccextractor_check = QCheckBox("Run CCExtractor to create SRT subtitle track")
+        self.ccextractor_check.setChecked(self.config.get("run_ccextractor", True))
 
-        files_to_clean = [
-            context['temp_mkv_path'],
-            context['cc_srt_path'],
-            context['mod_chap_xml_path']
-        ]
+        self.trim_padding_check = QCheckBox("Trim initial padding cells from DVD source (recommended)")
+        self.trim_padding_check.setToolTip("Uses ffmpeg's -trim option to skip short filler cells at the start of a title.")
+        self.trim_padding_check.setChecked(self.config.get("ffmpeg_trim_padding", True))
 
-        # Get list of enabled steps for accurate numbering
-        enabled_steps = []
-        for step in self.steps:
-            # Check if step has is_enabled property and if it's False, skip it
-            if hasattr(step, 'is_enabled') and not step.is_enabled:
-                continue
-            enabled_steps.append(step)
+        # Telecine Detection Group
+        telecine_group = QGroupBox("Telecine Detection (Film on Video)")
+        telecine_layout = QVBoxLayout()
 
-        total_steps = len(enabled_steps)
+        # Mode selection
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Detection Mode:"))
+        self.telecine_mode = QComboBox()
+        self.telecine_mode.addItems([
+            "Disabled",
+            "Auto-detect",
+            "Force Progressive",
+            "Force Interlaced"
+        ])
+        # Map config value to combo index
+        mode_map = {
+            "disabled": 0,
+            "auto": 1,
+            "force_progressive": 2,
+            "force_interlaced": 3
+        }
+        current_mode = self.config.get("telecine_detection_mode", "disabled")
+        self.telecine_mode.setCurrentIndex(mode_map.get(current_mode, 0))
+        self.telecine_mode.currentIndexChanged.connect(self.on_telecine_mode_changed)
+        mode_layout.addWidget(self.telecine_mode)
+        mode_layout.addStretch()
 
-        try:
-            step_num = 0
-            for step in self.steps:
-                if stop_event.is_set(): return
+        # Threshold slider
+        threshold_layout = QHBoxLayout()
+        threshold_layout.addWidget(QLabel("Progressive Threshold:"))
+        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.threshold_slider.setRange(60, 99)
+        self.threshold_slider.setValue(self.config.get("telecine_threshold", 85))
+        self.threshold_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.threshold_slider.setTickInterval(5)
+        self.threshold_label = QLabel(f"{self.threshold_slider.value()}%")
+        self.threshold_slider.valueChanged.connect(
+            lambda v: self.threshold_label.setText(f"{v}%")
+        )
+        threshold_layout.addWidget(self.threshold_slider)
+        threshold_layout.addWidget(self.threshold_label)
 
-                # Check if this step should be counted/numbered
-                is_numbered_step = not (hasattr(step, 'is_enabled') and not step.is_enabled)
-                if is_numbered_step:
-                    step_num += 1
-                    context['step_info'] = f"[STEP {step_num}/{total_steps}]"
-                else:
-                    context['step_info'] = "[OPTIONAL]"
+        # Sample duration
+        sample_layout = QHBoxLayout()
+        sample_layout.addWidget(QLabel("Sample Duration:"))
+        self.sample_duration = QSpinBox()
+        self.sample_duration.setRange(10, 300)
+        self.sample_duration.setSuffix(" seconds")
+        self.sample_duration.setValue(self.config.get("telecine_sample_duration", 60))
+        self.sample_duration.setToolTip("How many seconds of video to analyze for telecine detection")
+        sample_layout.addWidget(self.sample_duration)
+        sample_layout.addStretch()
 
-                step_runner = step.run(context, log_emitter, stop_event)
-                if hasattr(step_runner, '__iter__') or hasattr(step_runner, '__next__'):
-                    final_status = False
-                    for progress_update in step_runner:
-                        if isinstance(progress_update, bool):
-                            final_status = progress_update
-                        else:
-                            yield progress_update
-                    success = final_status
-                else:
-                    success = step_runner
+        # Help text
+        help_label = QLabel(
+            "Auto-detect will analyze video for 3:2 pulldown patterns.\n"
+            "If progressive frames exceed the threshold, the video will be\n"
+            "flagged as progressive for optimal playback on all devices."
+        )
+        help_label.setStyleSheet("QLabel { color: #888; font-size: 11px; }")
 
-                if not success:
-                    log_emitter(f"!! Step {step.__class__.__name__} failed for Title {title_num}. Aborting title.")
-                    return
-        finally:
-            log_emitter(f"Cleaning up temporary files for Title {title_num}...")
-            # Improved cleanup logic to remove all temp files
-            for f in files_to_clean:
-                if f.exists():
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
+        telecine_layout.addLayout(mode_layout)
+        telecine_layout.addLayout(threshold_layout)
+        telecine_layout.addLayout(sample_layout)
+        telecine_layout.addWidget(help_label)
+        telecine_group.setLayout(telecine_layout)
+
+        # Enable/disable threshold and duration based on mode
+        self.on_telecine_mode_changed(self.telecine_mode.currentIndex())
+
+        # Dialog buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        # Add all to main layout
+        layout.addWidget(QLabel("Default Output Directory:"))
+        layout.addLayout(out_dir_layout)
+        layout.addLayout(min_len_layout)
+        layout.addWidget(self.remove_eia_check)
+        layout.addWidget(self.ccextractor_check)
+        layout.addWidget(self.trim_padding_check)
+        layout.addWidget(telecine_group)
+        layout.addWidget(buttons)
+
+    def on_telecine_mode_changed(self, index):
+        """Enable/disable controls based on telecine mode."""
+        # Only enable threshold and duration for auto-detect mode
+        is_auto = (index == 1)
+        self.threshold_slider.setEnabled(is_auto)
+        self.threshold_label.setEnabled(is_auto)
+        self.sample_duration.setEnabled(is_auto)
+
+    def browse_output_dir(self):
+        dir_name = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        if dir_name: self.out_dir_edit.setText(dir_name)
+
+    def get_values(self):
+        # Map combo index to config value
+        mode_map = {
+            0: "disabled",
+            1: "auto",
+            2: "force_progressive",
+            3: "force_interlaced"
+        }
+        return {
+            "default_output_directory": self.out_dir_edit.text(),
+            "minimum_title_length": self.min_len_spin.value(),
+            "remove_eia_608": self.remove_eia_check.isChecked(),
+            "run_ccextractor": self.ccextractor_check.isChecked(),
+            "ffmpeg_trim_padding": self.trim_padding_check.isChecked(),
+            "telecine_detection_mode": mode_map[self.telecine_mode.currentIndex()],
+            "telecine_threshold": self.threshold_slider.value(),
+            "telecine_sample_duration": self.sample_duration.value(),
+        }

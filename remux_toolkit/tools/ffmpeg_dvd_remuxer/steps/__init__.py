@@ -5,6 +5,7 @@ from .chapters import ChaptersStep
 from .finalize import FinalizeStep
 from .disc_analysis import DiscAnalysisStep
 from .metadata_analysis import MetadataAnalysisStep
+from .telecine_detection import TelecineDetectionStep
 
 # This makes it easy for the orchestrator to import all available steps
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "FinalizeStep",
     "DiscAnalysisStep",
     "MetadataAnalysisStep",
+    "TelecineDetectionStep",
 ]

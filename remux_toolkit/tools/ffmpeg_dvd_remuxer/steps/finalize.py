@@ -77,9 +77,17 @@ class FinalizeStep:
 
             # Video-specific options
             if stream_type == 'video':
-                # Field order
+                # Check if telecine detection determined this should be progressive
+                detected_progressive = context.get('detected_progressive')
+
+                # Field order handling
                 field_order = stream_meta.get('field_order')
-                if field_order:
+                if detected_progressive is True:
+                    # Force progressive flag for telecined content
+                    mkvmerge_cmd.extend(["--field-order", "0:0"])
+                    log_emitter(f"  -> Setting field order: progressive (telecine detected)")
+                elif field_order and detected_progressive is not False:
+                    # Use original field order if not forced interlaced
                     field_map = {
                         'tt': '1', 'tb': '1',  # top field first
                         'bb': '2', 'bt': '2',  # bottom field first
