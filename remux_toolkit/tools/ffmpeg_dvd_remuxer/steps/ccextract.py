@@ -11,11 +11,12 @@ class CCExtractStep:
 
     def run(self, context: dict, log_emitter, stop_event) -> bool:
         if not self.is_enabled:
-            log_emitter("[STEP 3/5] Skipping CCExtractor (disabled in settings).")
+            log_emitter(f"{context.get('step_info', '[OPTIONAL]')} Skipping CCExtractor (disabled in settings).")
             context['cc_found'] = False
             return True
 
-        log_emitter("[STEP 3/5] Extracting closed captions...")
+        step_info = context.get('step_info', '[STEP]')
+        log_emitter(f"{step_info} Extracting closed captions...")
         temp_mkv = context['temp_mkv_path']
         cc_srt = context['out_folder'] / f"title_{context['title_num']}_cc.srt"
         context['cc_srt_path'] = cc_srt

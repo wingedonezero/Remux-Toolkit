@@ -6,7 +6,8 @@ class FinalizeStep:
         self.config = config
 
     def run(self, context: dict, log_emitter, stop_event) -> bool:
-        log_emitter("[STEP 5/5] Building final MKV file with mkvmerge...")
+        step_info = context.get('step_info', '[STEP]')
+        log_emitter(f"{step_info} Building final MKV file with mkvmerge...")
         final_mkv = context['out_folder'] / f"title_{context['title_num']}.mkv"
         temp_mkv = context['temp_mkv_path']
 

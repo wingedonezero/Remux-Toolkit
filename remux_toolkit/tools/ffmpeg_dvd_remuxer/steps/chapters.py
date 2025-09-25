@@ -7,7 +7,8 @@ class ChaptersStep:
         self.config = config
 
     def run(self, context: dict, log_emitter, stop_event) -> bool:
-        log_emitter("[STEP 4/5] Extracting and renaming chapters...")
+        step_info = context.get('step_info', '[STEP]')
+        log_emitter(f"{step_info} Extracting and renaming chapters...")
         temp_mkv = context['temp_mkv_path']
         mod_chap_xml = context['out_folder'] / f"title_{context['title_num']}_chapters_mod.xml"
         context['mod_chap_xml_path'] = mod_chap_xml

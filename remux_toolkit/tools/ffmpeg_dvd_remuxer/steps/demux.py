@@ -8,7 +8,8 @@ class DemuxStep:
 
     def run(self, context: dict, log_emitter, stop_event):
         """This step is now a generator to yield real-time ffmpeg progress."""
-        log_emitter("[STEP 1/5] Demuxing to temporary file with ffmpeg...")
+        step_info = context.get('step_info', '[STEP]')
+        log_emitter(f"{step_info} Demuxing to temporary file with ffmpeg...")
 
         input_path = context['input_path']
         title_num = context['title_num']
