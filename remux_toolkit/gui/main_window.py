@@ -7,7 +7,7 @@ from remux_toolkit.tools.media_comparator.media_comparator_gui import MediaCompa
 from remux_toolkit.tools.video_renamer.video_renamer_gui import VideoRenamerWidget
 from remux_toolkit.tools.mkv_splitter.mkv_splitter_gui import MKVSplitterWidget
 from remux_toolkit.tools.makemkvcon_gui.makemkvcon_gui_gui import MakeMKVConGUIWidget
-from remux_toolkit.tools.ffmpeg_dvd_remuxer.ffmpeg_dvd_remuxer_gui import FFmpegDVDRemuxerWidget
+from remux_toolkit.tools.ifo_reader.ifo_reader_gui import IfoReaderWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -40,8 +40,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_makemkvcon_gui_action = QtGui.QAction("MakeMKVCon GUI", self)
         self.open_makemkvcon_gui_action.triggered.connect(self.open_makemkvcon_gui)
 
-        self.open_dvd_remuxer_action = QtGui.QAction("FFmpeg DVD Remuxer", self)
-        self.open_dvd_remuxer_action.triggered.connect(self.open_dvd_remuxer)
+        self.open_ifo_reader_action = QtGui.QAction("IFO Reader", self)
+        self.open_ifo_reader_action.triggered.connect(self.open_ifo_reader)
 
     def _create_menus(self):
         menu_bar = self.menuBar()
@@ -51,14 +51,14 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_video_renamer_action)
         tools_menu.addAction(self.open_mkv_splitter_action)
         tools_menu.addAction(self.open_makemkvcon_gui_action)
-        tools_menu.addAction(self.open_dvd_remuxer_action)
+        tools_menu.addAction(self.open_ifo_reader_action)
 
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
     def open_media_comparator(self): self._open_tool("MediaComparator", "Media Comparator", MediaComparatorWidget)
     def open_video_renamer(self): self._open_tool("VideoRenamer", "Video Episode Renamer", VideoRenamerWidget)
     def open_mkv_splitter(self): self._open_tool("MKVSplitter", "MKV Episode Splitter", MKVSplitterWidget)
     def open_makemkvcon_gui(self): self._open_tool("MakeMKVConGUI", "MakeMKVCon GUI", MakeMKVConGUIWidget)
-    def open_dvd_remuxer(self): self._open_tool("FFmpegDVDRemuxer", "FFmpeg DVD Remuxer", FFmpegDVDRemuxerWidget)
+    def open_ifo_reader(self): self._open_tool("IfoReader", "IFO Reader", IfoReaderWidget)
 
     def _open_tool(self, tool_name, tab_title, widget_class):
         if tool_name in self.open_tools:
