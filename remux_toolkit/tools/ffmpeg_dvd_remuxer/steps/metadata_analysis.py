@@ -54,6 +54,9 @@ class MetadataAnalysisStep:
             log_emitter(f"!! ERROR: Invalid probe JSON: {e}")
             return False
 
+        # Calculate relative delays from PTS with video as reference
+        stream_delays = self._calculate_relative_delays(probe_data)
+
         # Parse and enhance metadata
         metadata = {
             "source": str(input_path),
@@ -61,7 +64,8 @@ class MetadataAnalysisStep:
             "probe_data": probe_data,
             "streams": [],
             "mkv_mapping": {},
-            "ifo_data": ifo_data  # Store raw IFO data for reference
+            "ifo_data": ifo_data,  # Store raw IFO data for reference
+            "keep_metadata_json": self.config.get("keep_metadata_json", False)
         }
 
         # Track audio/subtitle indices separately for IFO matching
@@ -72,11 +76,6 @@ class MetadataAnalysisStep:
         for stream_idx, stream in enumerate(probe_data.get("streams", [])):
             stream_type = stream.get("codec_type", "unknown")
 
-            # Calculate delay from PTS/start_time
-            start_pts = stream.get("start_pts", 0)
-            time_base = stream.get("time_base", "1/90000")
-            delay_ms = self._calculate_delay(start_pts, time_base, stream_type)
-
             stream_meta = {
                 "index": stream.get("index", stream_idx),
                 "type": stream_type,
@@ -84,10 +83,10 @@ class MetadataAnalysisStep:
                 "codec_long": stream.get("codec_long_name"),
 
                 # Timing information - CRITICAL for sync
-                "start_pts": start_pts,
+                "start_pts": stream.get("start_pts", 0),
                 "start_time": stream.get("start_time", "0"),
-                "delay_ms": delay_ms,
-                "time_base": time_base,
+                "delay_ms": stream_delays.get(stream_idx, 0),
+                "time_base": stream.get("time_base", "1/90000"),
 
                 # Default values (will be enriched from IFO)
                 "language": stream.get("tags", {}).get("language", "und"),
@@ -141,6 +140,9 @@ class MetadataAnalysisStep:
 
             # Audio-specific metadata - MERGE WITH IFO DATA
             elif stream_type == "audio":
+                # Store the calculated delay for this specific audio stream
+                stream_meta["delay_ms"] = stream_delays.get(stream_idx, 0)
+
                 # Match with IFO audio track data
                 if audio_idx < len(ifo_audio):
                     ifo_track = ifo_audio[audio_idx]
@@ -161,21 +163,24 @@ class MetadataAnalysisStep:
                     stream_meta["ifo_channels"] = ifo_track.get('channels')
                     stream_meta["ifo_sample_rate"] = ifo_track.get('sample_rate')
                     stream_meta["content_type"] = ifo_track.get('content', 'Normal')
-                    stream_meta["track_name"] = ifo_track.get('name', '')
 
-                    # Use IFO delay if available and more accurate
-                    if ifo_track.get('delay_ms') is not None and ifo_track['delay_ms'] > 0:
-                        stream_meta["delay_ms"] = ifo_track['delay_ms']
-                        stream_meta["delay_source"] = "ifo"
-                    elif delay_ms > 0:
+                    # Only use track name if enabled in config
+                    if self.config.get("audio_track_names", True):
+                        stream_meta["track_name"] = ifo_track.get('name', '')
+                    else:
+                        stream_meta["track_name"] = ''
+
+                    # Track delay source
+                    if stream_meta["delay_ms"] > 0:
                         stream_meta["delay_source"] = "pts"
                     else:
                         stream_meta["delay_source"] = "none"
 
-                    log_emitter(f"  -> Enriched audio #{audio_idx} with IFO: {stream_meta['track_name']}")
+                    log_emitter(f"  -> Enriched audio #{audio_idx} with IFO: {stream_meta.get('track_name', 'no name')}")
                 else:
                     # No IFO data for this track, use ffprobe data only
-                    if delay_ms > 0:
+                    stream_meta["track_name"] = ''
+                    if stream_meta["delay_ms"] > 0:
                         stream_meta["delay_source"] = "pts"
                     else:
                         stream_meta["delay_source"] = "none"
@@ -284,8 +289,12 @@ class MetadataAnalysisStep:
             with open(metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
             log_emitter(f"  -> Metadata saved to {metadata_file.name}")
+
+            # Store whether to keep metadata file after processing
+            context['keep_metadata_json'] = self.config.get("keep_metadata_json", False)
         except IOError as e:
             log_emitter(f"!! ERROR: Failed to save metadata: {e}")
+            return Falseemitter(f"!! ERROR: Failed to save metadata: {e}")
             return False
 
         # Store in context for other steps
@@ -310,32 +319,62 @@ class MetadataAnalysisStep:
 
         return True
 
-    def _calculate_delay(self, start_pts, time_base_str, stream_type):
-        """Calculate delay in milliseconds from PTS and time base."""
-        if not start_pts or stream_type == "video":
-            return 0
+    def _calculate_relative_delays(self, probe_data):
+        """Calculate relative delays with video as reference (PTS 0).
+        Returns dict of stream_index -> delay_ms
+        """
+        delays = {}
+        video_pts = None
+        video_timebase = None
 
-        try:
-            # Parse time_base (e.g., "1/90000" for DVD)
-            if '/' in time_base_str:
-                num, denom = map(int, time_base_str.split('/'))
+        # First find the video stream's PTS as reference
+        for stream in probe_data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                video_pts = int(stream.get("start_pts", 0))
+                video_timebase = stream.get("time_base", "1/90000")
+                break
+
+        # Calculate all stream delays relative to video
+        for stream in probe_data.get("streams", []):
+            stream_idx = stream.get("index", 0)
+            stream_type = stream.get("codec_type")
+
+            if stream_type == "video":
+                # Video is always the reference, delay = 0
+                delays[stream_idx] = 0
             else:
-                # Handle decimal time base
+                # Calculate relative delay from video
+                stream_pts = int(stream.get("start_pts", 0))
+                stream_timebase = stream.get("time_base", video_timebase)
+
+                # Convert both to milliseconds
+                video_ms = self._pts_to_ms(video_pts, video_timebase)
+                stream_ms = self._pts_to_ms(stream_pts, stream_timebase)
+
+                # Calculate relative delay (positive means stream starts after video)
+                relative_delay = stream_ms - video_ms
+
+                # Only apply positive delays (never cut content)
+                # Negative delay means stream starts before video - we keep it at 0
+                if relative_delay > 0:
+                    delays[stream_idx] = relative_delay
+                else:
+                    delays[stream_idx] = 0
+
+        return delays
+
+    def _pts_to_ms(self, pts, timebase_str):
+        """Convert PTS to milliseconds."""
+        try:
+            if '/' in timebase_str:
+                num, denom = map(int, timebase_str.split('/'))
+            else:
                 num = 1
-                denom = int(1 / float(time_base_str))
+                denom = int(1 / float(timebase_str))
 
-            # Convert PTS to seconds then to milliseconds
-            seconds = (start_pts * num) / denom
-            delay_ms = int(seconds * 1000)
-
-            # DVD audio typically has ~32ms delay (1 video frame at 29.97fps)
-            # Only apply if delay is significant
-            if delay_ms < 10:
-                return 0
-
-            return delay_ms
-
-        except (ValueError, ZeroDivisionError):
+            seconds = (pts * num) / denom
+            return int(seconds * 1000)
+        except:
             return 0
 
     def _process_ifo_chapters(self, ifo_chapters):

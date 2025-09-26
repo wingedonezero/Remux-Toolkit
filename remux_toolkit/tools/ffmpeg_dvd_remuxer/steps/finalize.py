@@ -32,6 +32,7 @@ class FinalizeStep:
 
         # Track which streams we're adding
         added_streams = []
+        default_tracks = {'video': None, 'audio': None, 'subtitle': None}
 
         # Process each extracted stream
         for i, stream_info in enumerate(extracted_streams):
@@ -44,8 +45,8 @@ class FinalizeStep:
             # Get MKV options for this stream
             mkv_params = mkv_mapping.get(stream_idx, {})
 
-            # Add delay if present
-            if delay_ms:
+            # Add delay if present (positive only, we never cut content)
+            if delay_ms and delay_ms > 0:
                 mkvmerge_cmd.extend(["--sync", f"0:{delay_ms}"])
                 log_emitter(f"  -> Applying {delay_ms}ms delay to {stream_type} stream #{stream_idx}")
 
@@ -54,29 +55,45 @@ class FinalizeStep:
             if lang != 'und':
                 mkvmerge_cmd.extend(["--language", f"0:{lang}"])
 
-            # Track name for audio
-            if stream_type == 'audio':
-                channels = stream_meta.get('channels', 0)
-                layout = stream_meta.get('channel_layout', '')
+            # Track name handling based on config
+            track_name = None
 
-                if '5.1' in layout or channels == 6:
-                    track_name = "5.1 Surround"
-                elif 'stereo' in layout.lower() or channels == 2:
-                    track_name = "Stereo"
-                elif channels == 1:
-                    track_name = "Mono"
-                else:
-                    track_name = f"{channels}ch Audio"
+            if stream_type == 'audio' and self.config.get("audio_track_names", True):
+                track_name = stream_meta.get('track_name')
+                if not track_name:
+                    # Build track name from metadata
+                    channels = stream_meta.get('channels', 0)
+                    layout = stream_meta.get('channel_layout', '')
+                    codec = stream_meta.get('codec', '').upper()
 
-                # Add codec info to track name
-                codec = stream_meta.get('codec', '').upper()
-                if codec in ['AC3', 'EAC3', 'DTS']:
-                    track_name = f"{track_name} ({codec})"
+                    if '5.1' in layout or channels == 6:
+                        ch_name = "5.1 Surround"
+                    elif 'stereo' in layout.lower() or channels == 2:
+                        ch_name = "Stereo"
+                    elif channels == 1:
+                        ch_name = "Mono"
+                    else:
+                        ch_name = f"{channels}ch"
 
+                    # Add codec info
+                    if codec in ['AC3', 'EAC3', 'DTS']:
+                        track_name = f"{ch_name} ({codec})"
+                    else:
+                        track_name = ch_name
+
+            elif stream_type == 'subtitle' and self.config.get("subtitle_track_names", True):
+                track_name = stream_meta.get('track_name')
+                if not track_name and lang != 'und':
+                    # Basic subtitle name
+                    track_name = self._lang_to_name(lang)
+                    if stream_meta.get('forced'):
+                        track_name += " [Forced]"
+
+            if track_name:
                 mkvmerge_cmd.extend(["--track-name", f"0:{track_name}"])
 
             # Video-specific options
-            if stream_type == 'video':
+            if stream_type == "video":
                 # Check if telecine detection determined this should be progressive
                 detected_progressive = context.get('detected_progressive')
 
@@ -98,19 +115,25 @@ class FinalizeStep:
 
                 # Display dimensions/aspect ratio
                 if aspect := stream_meta.get('aspect_ratio'):
-                    if 'x' in aspect:  # If it's dimensions like "720x480"
-                        mkvmerge_cmd.extend(["--display-dimensions", f"0:{aspect}"])
-                    elif ':' in aspect:  # If it's ratio like "4:3"
-                        width = stream_meta.get('width', 720)
-                        height = stream_meta.get('height', 480)
-                        # Calculate display width from aspect ratio
-                        if aspect == "4:3":
-                            display_width = int(height * 4 / 3)
-                        elif aspect == "16:9":
-                            display_width = int(height * 16 / 9)
+                    width = stream_meta.get('width', 720)
+                    height = stream_meta.get('height', 480)
+
+                    if aspect == "4:3":
+                        display_width = int(height * 4 / 3)
+                    elif aspect == "16:9":
+                        display_width = int(height * 16 / 9)
+                    else:
+                        # Try to parse aspect if it's like "720:480"
+                        if ':' in aspect:
+                            try:
+                                w, h = map(int, aspect.split(':'))
+                                display_width = int(height * w / h)
+                            except:
+                                display_width = width
                         else:
                             display_width = width
-                        mkvmerge_cmd.extend(["--display-dimensions", f"0:{display_width}x{height}"])
+
+                    mkvmerge_cmd.extend(["--display-dimensions", f"0:{display_width}x{height}"])
 
             # Subtitle-specific options
             if stream_type == 'subtitle':
@@ -118,8 +141,9 @@ class FinalizeStep:
                     mkvmerge_cmd.extend(["--forced-display-flag", "0:yes"])
 
             # Default track flags (first of each type is default)
-            if stream_type not in [s['type'] for s in added_streams]:
+            if default_tracks[stream_type] is None:
                 mkvmerge_cmd.extend(["--default-track-flag", "0:yes"])
+                default_tracks[stream_type] = stream_idx
             else:
                 mkvmerge_cmd.extend(["--default-track-flag", "0:no"])
 
@@ -131,10 +155,17 @@ class FinalizeStep:
         if context.get('cc_found', False):
             cc_srt = context.get('cc_srt_path')
             if cc_srt and cc_srt.exists():
-                # The line 'mkvmerge_cmd.append("+")' has been removed.
                 mkvmerge_cmd.extend([
                     "--language", "0:eng",
-                    "--track-name", "0:Closed Captions (EIA-608)",
+                ])
+
+                # Add track name if enabled
+                if self.config.get("cc_track_names", True):
+                    mkvmerge_cmd.extend([
+                        "--track-name", "0:Closed Captions (EIA-608)",
+                    ])
+
+                mkvmerge_cmd.extend([
                     "--default-track-flag", "0:no",
                     str(cc_srt)
                 ])
@@ -168,14 +199,39 @@ class FinalizeStep:
             except OSError:
                 pass
 
-        # Also clean up any metadata files if configured
-        if context.get('cleanup_metadata', True):
-            try:
-                if meta_file := context.get('metadata_file'):
+        # Clean up metadata file unless configured to keep it
+        keep_metadata = context.get('keep_metadata_json', False)
+        if not keep_metadata:
+            if meta_file := context.get('metadata_file'):
+                try:
                     if meta_file.exists():
                         meta_file.unlink()
-            except OSError:
-                pass
+                        log_emitter("  -> Removed metadata JSON file")
+                except OSError:
+                    pass
+        else:
+            log_emitter("  -> Keeping metadata JSON file for debugging")
 
         log_emitter(f"🎉 Successfully created: {final_mkv.name} ({final_mkv.stat().st_size / 1024 / 1024:.1f} MB)")
         return True
+
+    def _lang_to_name(self, code):
+        """Convert language code to display name."""
+        lang_map = {
+            'eng': 'English',
+            'spa': 'Spanish',
+            'fre': 'French',
+            'fra': 'French',
+            'ger': 'German',
+            'deu': 'German',
+            'ita': 'Italian',
+            'jpn': 'Japanese',
+            'chi': 'Chinese',
+            'zho': 'Chinese',
+            'por': 'Portuguese',
+            'rus': 'Russian',
+            'kor': 'Korean',
+            'dut': 'Dutch',
+            'nld': 'Dutch',
+        }
+        return lang_map.get(code, code.upper())

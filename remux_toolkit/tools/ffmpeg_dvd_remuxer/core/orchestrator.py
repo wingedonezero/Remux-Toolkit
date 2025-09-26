@@ -1,7 +1,11 @@
 # remux_toolkit/tools/ffmpeg_dvd_remuxer/core/orchestrator.py
 from pathlib import Path
 
-from ..steps import DemuxStep, CCExtractStep, ChaptersStep, FinalizeStep, DiscAnalysisStep, MetadataAnalysisStep, TelecineDetectionStep, IfoParserStep
+from ..steps import (
+    DemuxStep, CCExtractStep, ChaptersStep, FinalizeStep,
+    DiscAnalysisStep, MetadataAnalysisStep, TelecineDetectionStep,
+    IfoParserStep, TimingAnalysisStep, ChapterNormalizationStep
+)
 
 class Orchestrator:
     def __init__(self, config, temp_dir: Path):
@@ -11,15 +15,17 @@ class Orchestrator:
         # Analysis step is separate since it runs during queue addition
         self.analysis_step = DiscAnalysisStep(self.config)
 
-        # Processing pipeline steps
+        # Processing pipeline steps (in order)
         self.steps = [
-            IfoParserStep(self.config),  # First, parse IFO for DVD metadata
-            MetadataAnalysisStep(self.config),  # Then analyze with ffprobe and merge
-            DemuxStep(self.config),
-            CCExtractStep(self.config),
-            ChaptersStep(self.config),
-            TelecineDetectionStep(self.config),  # Detect telecined content
-            FinalizeStep(self.config),
+            IfoParserStep(self.config),           # Parse IFO for DVD metadata
+            MetadataAnalysisStep(self.config),    # Analyze with ffprobe and merge
+            TimingAnalysisStep(self.config),      # Comprehensive timing analysis
+            DemuxStep(self.config),                # Extract streams
+            CCExtractStep(self.config),           # Extract closed captions
+            ChaptersStep(self.config),            # Process chapters
+            ChapterNormalizationStep(self.config), # Fix chapter issues
+            TelecineDetectionStep(self.config),   # Detect telecined content
+            FinalizeStep(self.config),            # Mux to final MKV
         ]
 
     def analyze_disc(self, path: Path, log_emitter, stop_event) -> tuple[list, str]:
@@ -42,6 +48,10 @@ class Orchestrator:
             context['mod_chap_xml_path']
         ]
 
+        # Add metadata file to cleanup list if not keeping it
+        if not self.config.get("keep_metadata_json", False):
+            files_to_clean.append(out_folder / f"title_{title_num}_metadata.json")
+
         # Get list of enabled steps for accurate numbering
         enabled_steps = []
         for step in self.steps:
@@ -55,7 +65,8 @@ class Orchestrator:
         try:
             step_num = 0
             for step in self.steps:
-                if stop_event.is_set(): return
+                if stop_event.is_set():
+                    return
 
                 # Check if this step should be counted/numbered
                 is_numbered_step = not (hasattr(step, 'is_enabled') and not step.is_enabled)
@@ -80,12 +91,14 @@ class Orchestrator:
                 if not success:
                     log_emitter(f"!! Step {step.__class__.__name__} failed for Title {title_num}. Aborting title.")
                     return
+
         finally:
-            log_emitter(f"Cleaning up temporary files for Title {title_num}...")
-            # Improved cleanup logic to remove all temp files
-            for f in files_to_clean:
-                if f.exists():
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
+            # Clean up temporary files
+            if not self.config.get("keep_temp_files", False):
+                log_emitter(f"Cleaning up temporary files for Title {title_num}...")
+                for f in files_to_clean:
+                    if f and f.exists():
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass

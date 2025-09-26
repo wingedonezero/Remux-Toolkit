@@ -7,6 +7,8 @@ from .disc_analysis import DiscAnalysisStep
 from .metadata_analysis import MetadataAnalysisStep
 from .telecine_detection import TelecineDetectionStep
 from .ifo_parser import IfoParserStep
+from .timing_analysis import TimingAnalysisStep
+from .chapter_normalization import ChapterNormalizationStep
 
 # This makes it easy for the orchestrator to import all available steps
 __all__ = [
@@ -18,4 +20,6 @@ __all__ = [
     "MetadataAnalysisStep",
     "TelecineDetectionStep",
     "IfoParserStep",
+    "TimingAnalysisStep",
+    "ChapterNormalizationStep",
 ]
