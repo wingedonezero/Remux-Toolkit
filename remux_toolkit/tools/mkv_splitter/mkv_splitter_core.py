@@ -28,35 +28,41 @@ def run_command(command, tool_name, capture_json=True):
     except json.JSONDecodeError as e:
         return None, f"Error: Could not parse JSON output from {tool_name}.\nRaw output: {result.stdout}"
 
-def get_chapter_info(file_path):
+def get_mkv_info(file_path):
+    """Gets full container and chapter info for an MKV file."""
     mkvmerge_command = ["mkvmerge", "-J", file_path]
     container_info, error = run_command(mkvmerge_command, "mkvmerge")
     if error: return None, error
+
+    # Use a temporary file to extract chapters XML
     with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix=".xml") as tmp:
         temp_xml_path = tmp.name
+
     chapters, error_msg = [], None
     try:
         mkvextract_command = ["mkvextract", file_path, "chapters", temp_xml_path]
         _, error = run_command(mkvextract_command, "mkvextract", capture_json=False)
         if error:
-            if os.path.exists(temp_xml_path): os.remove(temp_xml_path)
-            # This is not a fatal error, could just be a file with no chapters
-            return container_info, None
-        tree = ET.parse(temp_xml_path)
-        root = tree.getroot()
-        ns = {'c': 'urn:matroskachapters'}
-        chapter_atoms = root.findall('.//c:ChapterAtom', ns)
-        if not chapter_atoms: chapter_atoms = root.findall('.//ChapterAtom')
-        for atom in chapter_atoms:
-            start_time_element = atom.find('c:ChapterTimeStart', ns)
-            if start_time_element is None: start_time_element = atom.find('ChapterTimeStart')
-            if start_time_element is not None:
-                chapters.append({'properties': {'time_start': start_time_element.text}})
+            # Not a fatal error, the file might just not have chapters
+            pass
+        else:
+            tree = ET.parse(temp_xml_path)
+            root = tree.getroot()
+            ns = {'c': 'urn:matroskachapters'}
+            chapter_atoms = root.findall('.//c:ChapterAtom', ns)
+            if not chapter_atoms: chapter_atoms = root.findall('.//ChapterAtom')
+            for atom in chapter_atoms:
+                start_time_element = atom.find('c:ChapterTimeStart', ns)
+                if start_time_element is None: start_time_element = atom.find('ChapterTimeStart')
+                if start_time_element is not None:
+                    chapters.append({'properties': {'time_start': start_time_element.text}})
     except Exception as e:
         error_msg = f"An unexpected error occurred while parsing chapters: {e}"
     finally:
         if os.path.exists(temp_xml_path): os.remove(temp_xml_path)
+
     if error_msg: return None, error_msg
+
     container_info['chapters'] = chapters
     return container_info, None
 
@@ -71,12 +77,14 @@ def parse_time(time_str):
         s, ms = s_ms_part, '0'
     return timedelta(hours=h, minutes=m, seconds=int(s), microseconds=int(ms))
 
-def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target_duration, input_file_path):
+def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target_duration):
+    """Performs chapter analysis and returns the log and a list of split points."""
     analysis_log, split_points = [], []
     chapters = mkv_info.get("chapters", [])
     container_duration_ns = mkv_info.get("container", {}).get("properties", {}).get("duration", 0)
-    if not chapters: return "❌ No chapters found in this file.", ""
-    if container_duration_ns == 0: return "❌ Could not determine container duration.", ""
+    if not chapters: return "❌ No chapters found in this file.", []
+    if container_duration_ns == 0: return "❌ Could not determine container duration.", []
+
     container_duration = timedelta(microseconds=container_duration_ns / 1000)
     analysis_log.append("--- Step 1: Chapter Analysis ---")
     chapter_durations = []
@@ -93,6 +101,7 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         chapter_durations.append({"num": i + 1, "duration_min": duration.total_seconds() / 60})
         analysis_log.append(f"  Chapter {i+1:<3} | Duration: {duration.total_seconds() / 60:.2f} minutes")
 
+    # (The rest of the analysis logic remains the same as before)
     if analysis_mode == "Time-based Grouping":
         analysis_log.append(f"\n--- Step 2 (Time-based): Learning Episode Structure ---")
         current_sum, start_chapter_index, learned_duration = 0.0, 0, target_duration
@@ -121,7 +130,7 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         long_chapters = [ch for ch in chapter_durations if ch["duration_min"] > min_duration]
         if not long_chapters:
             analysis_log.append(f"❌ No chapters found longer than {min_duration} minutes.")
-            return "\n".join(analysis_log), ""
+            return "\n".join(analysis_log), []
         main_content_chapter_nums = {ch['num'] for ch in long_chapters}
         analysis_log.append("Found potential main content chapters: " + ", ".join(str(n) for n in sorted(list(main_content_chapter_nums))))
         sorted_main_nums = sorted(list(main_content_chapter_nums))
@@ -185,11 +194,32 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
     analysis_log.append("\n--- Final Step: Finalizing Split Points ---")
     analysis_log.append(f"Final split points (chapter numbers to split BEFORE): {split_points if split_points else 'None'}")
     analysis_log.append(f"\n✅ Total Episodes Found: {len(split_points) + 1}")
-    if not split_points: return "\n".join(analysis_log) + "\n\nℹ️ No split points found.", ""
+
+    return "\n".join(analysis_log), split_points
+
+def generate_mkvmerge_command(input_file_path, split_points, track_mods):
+    """Generates the final mkvmerge command string including track modifications."""
+    if not input_file_path:
+        return ""
 
     output_dir = os.path.dirname(input_file_path)
     base_name = os.path.splitext(os.path.basename(input_file_path))[0]
-    output_pattern = os.path.join(output_dir, f"{base_name} - S01E%02d.mkv")
-    split_string = ",".join(str(ch-1) for ch in split_points) # mkvmerge splits by chapter number-1
-    final_command = f'mkvmerge -o "{output_pattern}" --split chapters:{split_string} "{input_file_path}"'
-    return "\n".join(analysis_log), final_command
+    output_pattern = os.path.join(output_dir, f"{base_name} - S01E%%02d.mkv")
+
+    command_parts = ['mkvmerge', '-o', f'"{output_pattern}"']
+
+    # Add track language modifications
+    for mod in track_mods:
+        tid = mod.get('tid')
+        lang = mod.get('language')
+        if tid is not None and lang:
+            command_parts.append(f'--language {tid}:"{lang}"')
+
+    # Add split command if there are split points
+    if split_points:
+        split_string = ",".join(str(ch) for ch in split_points)
+        command_parts.append(f'--split chapters:{split_string}')
+
+    command_parts.append(f'"{input_file_path}"')
+
+    return " ".join(command_parts)
