@@ -8,6 +8,8 @@ from remux_toolkit.tools.video_renamer.video_renamer_gui import VideoRenamerWidg
 from remux_toolkit.tools.mkv_splitter.mkv_splitter_gui import MKVSplitterWidget
 from remux_toolkit.tools.makemkvcon_gui.makemkvcon_gui_gui import MakeMKVConGUIWidget
 from remux_toolkit.tools.ifo_reader.ifo_reader_gui import IfoReaderWidget
+# --- NEW IMPORT ---
+from remux_toolkit.tools.video_ab_comparator.video_ab_comparator_gui import VideoABComparatorWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -43,6 +45,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_ifo_reader_action = QtGui.QAction("IFO Reader", self)
         self.open_ifo_reader_action.triggered.connect(self.open_ifo_reader)
 
+        # --- NEW ACTION ---
+        self.open_video_ab_comparator_action = QtGui.QAction("Video A/B Comparator", self)
+        self.open_video_ab_comparator_action.triggered.connect(self.open_video_ab_comparator)
+
     def _create_menus(self):
         menu_bar = self.menuBar()
         tools_menu = menu_bar.addMenu("&Tools")
@@ -52,6 +58,8 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_mkv_splitter_action)
         tools_menu.addAction(self.open_makemkvcon_gui_action)
         tools_menu.addAction(self.open_ifo_reader_action)
+        # --- NEW MENU ITEM ---
+        tools_menu.addAction(self.open_video_ab_comparator_action)
 
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
     def open_media_comparator(self): self._open_tool("MediaComparator", "Media Comparator", MediaComparatorWidget)
@@ -59,6 +67,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_mkv_splitter(self): self._open_tool("MKVSplitter", "MKV Episode Splitter", MKVSplitterWidget)
     def open_makemkvcon_gui(self): self._open_tool("MakeMKVConGUI", "MakeMKVCon GUI", MakeMKVConGUIWidget)
     def open_ifo_reader(self): self._open_tool("IfoReader", "IFO Reader", IfoReaderWidget)
+    # --- NEW METHOD ---
+    def open_video_ab_comparator(self): self._open_tool("VideoABComparator", "Video A/B Comparator", VideoABComparatorWidget)
 
     def _open_tool(self, tool_name, tab_title, widget_class):
         if tool_name in self.open_tools:
