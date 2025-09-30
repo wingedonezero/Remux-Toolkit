@@ -1,5 +1,4 @@
 # remux_toolkit/tools/video_ab_comparator/video_ab_comparator_gui.py
-
 from PyQt6 import QtWidgets, QtCore, QtGui
 import json
 from .core.pipeline import ComparisonPipeline
@@ -46,7 +45,7 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.settings_button.clicked.connect(self.open_settings)
         self.export_button = QtWidgets.QPushButton("Export to HTML")
         self.export_button.clicked.connect(self.export_html)
-        self.export_button.setEnabled(False) # Disabled until results are ready
+        self.export_button.setEnabled(False)  # Disabled until results are ready
 
         controls_layout.addWidget(self.start_button)
         controls_layout.addWidget(self.settings_button)
@@ -158,40 +157,38 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.pipeline_thread.quit()
         self.pipeline_thread.wait()
 
+    # --------- moved OUT of on_finished (fixes IndentationError) ---------
     def on_scorecard_item_clicked(self, item, column):
-        """Loads and displays frames when an issue is clicked."""
         if not self.pipeline or not self.results_data:
             return
 
         issue_name = item.text(0).strip()
-        # Handle nested items from audio report
         if item.parent():
             issue_name = item.parent().text(0)
 
         issue_results = self.results_data.get("issues", {}).get(issue_name, {})
-
         ts_a = issue_results.get('a', {}).get('worst_frame_timestamp')
         if ts_a is None:
             self.results_widget.frame_a_label.setText("No specific frame\nfor this metric")
             self.results_widget.frame_b_label.setText("No specific frame\nfor this metric")
             return
 
-        # Apply the alignment offset to get the corresponding time in video B
-        time_offset = self.results_data.get("alignment_offset_secs", 0.0)
-        ts_b = ts_a - time_offset # If B starts later, its timestamp will be smaller
-
+        ts_b = self.results_widget.map_ts_b(ts_a)
         self.display_frames(ts_a, ts_b)
 
     def display_frames(self, ts_a, ts_b):
-        """Fetches and displays the two frames in the viewer."""
-        frame_a = self.pipeline.source_a.get_frame(ts_a)
-        frame_b = self.pipeline.source_b.get_frame(ts_b)
+        # accurate=True eliminates the ±1 frame wobble
+        frame_a = self.pipeline.source_a.get_frame(ts_a, accurate=True)
+        frame_b = self.pipeline.source_b.get_frame(ts_b, accurate=True)
 
         if frame_a is not None:
             h, w, ch = frame_a.shape
             q_img = QtGui.QImage(frame_a.data, w, h, ch * w, QtGui.QImage.Format.Format_BGR888)
             pixmap = QtGui.QPixmap.fromImage(q_img)
-            self.results_widget.frame_a_label.setPixmap(pixmap.scaled(self.results_widget.frame_a_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+            self.results_widget.frame_a_label.setPixmap(
+                pixmap.scaled(self.results_widget.frame_a_label.size(),
+                              QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                              QtCore.Qt.TransformationMode.SmoothTransformation))
         else:
             self.results_widget.frame_a_label.setText(f"Frame A\n(Could not load at {ts_a:.2f}s)")
 
@@ -199,7 +196,10 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
             h, w, ch = frame_b.shape
             q_img = QtGui.QImage(frame_b.data, w, h, ch * w, QtGui.QImage.Format.Format_BGR888)
             pixmap = QtGui.QPixmap.fromImage(q_img)
-            self.results_widget.frame_b_label.setPixmap(pixmap.scaled(self.results_widget.frame_b_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+            self.results_widget.frame_b_label.setPixmap(
+                pixmap.scaled(self.results_widget.frame_b_label.size(),
+                              QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                              QtCore.Qt.TransformationMode.SmoothTransformation))
         else:
             self.results_widget.frame_b_label.setText(f"Frame B\n(Could not load at {ts_b:.2f}s)")
 

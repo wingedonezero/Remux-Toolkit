@@ -50,12 +50,12 @@ class VideoSource:
                     )
                     self.info.streams.append(stream)
             return True
-        except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
-            print(f"Error probing {self.path.name}: {e}")
+        except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
             return False
 
+    # ---- frame IO ----
+
     def _read_raw_frame(self, cmd, width: int, height: int) -> Optional[np.ndarray]:
-        """Common runner/validator."""
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         expected = width * height * 3
         if proc.returncode != 0 or len(proc.stdout) != expected:
@@ -78,7 +78,6 @@ class VideoSource:
         width, height = map(int, video_stream.resolution.split('x'))
 
         if not accurate:
-            # FAST seek: -ss before -i (don’t decode from start)
             cmd = [
                 'ffmpeg', '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
                 '-ss', str(timestamp), '-i', str(self.path),
@@ -87,7 +86,6 @@ class VideoSource:
             ]
             return self._read_raw_frame(cmd, width, height)
 
-        # ACCURATE seek: -ss after -i (decode to ts)
         cmd = [
             'ffmpeg', '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
             '-i', str(self.path),
@@ -96,6 +94,8 @@ class VideoSource:
             '-f', 'image2pipe', '-vcodec', 'rawvideo', '-'
         ]
         return self._read_raw_frame(cmd, width, height)
+
+    # ---- fingerprints (fast path) ----
 
     def generate_fingerprints(self, num_frames: int = 100) -> List[imagehash.ImageHash]:
         """Generates perceptual hashes for a sample of frames (FAST seek)."""

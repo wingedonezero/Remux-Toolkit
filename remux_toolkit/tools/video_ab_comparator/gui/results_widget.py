@@ -1,5 +1,4 @@
 # remux_toolkit/tools/video_ab_comparator/gui/results_widget.py
-
 from PyQt6 import QtWidgets, QtGui, QtCore
 
 class ResultsWidget(QtWidgets.QWidget):
@@ -35,62 +34,46 @@ class ResultsWidget(QtWidgets.QWidget):
         scorecard_layout.addWidget(self.scorecard_tree)
         main_splitter.addWidget(scorecard_group)
 
-        # --- Frame Viewer ---
+        # --- Frame viewer ---
         viewer_group = QtWidgets.QGroupBox("Frame Viewer")
-        viewer_layout = QtWidgets.QVBoxLayout(viewer_group)
+        viewer_layout = QtWidgets.QHBoxLayout(viewer_group)
         self.frame_a_label = QtWidgets.QLabel("Source A Frame")
         self.frame_a_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.frame_a_label.setMinimumSize(480, 270)
         self.frame_b_label = QtWidgets.QLabel("Source B Frame")
         self.frame_b_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.frame_b_label.setMinimumSize(480, 270)
-
-        viewer_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        viewer_splitter.addWidget(self.frame_a_label)
-        viewer_splitter.addWidget(self.frame_b_label)
-        viewer_layout.addWidget(viewer_splitter)
+        viewer_layout.addWidget(self.frame_a_label, 1)
+        sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.Shape.VLine); viewer_layout.addWidget(sep)
+        viewer_layout.addWidget(self.frame_b_label, 1)
         main_splitter.addWidget(viewer_group)
 
-        main_splitter.setSizes([400, 800])
-        main_layout.addWidget(main_splitter, 1)
+        main_layout.addWidget(main_splitter)
+
+    # ---------- public API used by the GUI shell ----------
 
     def clear(self):
-        """Clears all results from the view."""
         self.verdict_label.setText("<i>Run a comparison to see the verdict.</i>")
         self.scorecard_tree.clear()
         self.frame_a_label.setText("Source A Frame")
         self.frame_b_label.setText("Source B Frame")
 
-    def populate(self, results_data: dict):
-        """Populates the widget with data from the pipeline."""
-        self.clear()
-        self.verdict_label.setText(results_data.get("verdict", "Verdict could not be determined."))
+    def populate(self, results):
+        self.results = results
+        self.verdict_label.setText(results.get("verdict", ""))
+        self.scorecard_tree.clear()
 
-        issues = results_data.get("issues", {})
-        for issue_name, issue_data in issues.items():
-            a = issue_data.get('a', {})
-            b = issue_data.get('b', {})
-
-            # --- NEW LOGIC for multi-part data ---
-            if 'data' in a and isinstance(a['data'], dict):
-                parent_item = QtWidgets.QTreeWidgetItem([issue_name])
-                self.scorecard_tree.addTopLevelItem(parent_item)
-                for key, val_a in a['data'].items():
-                    val_b = b.get('data', {}).get(key, 'N/A')
-                    child_item = QtWidgets.QTreeWidgetItem([f"  - {key}", str(val_a), str(val_b), "---"])
-                    parent_item.addChild(child_item)
-                parent_item.setExpanded(True)
-                continue
-            # --- END NEW LOGIC ---
-
-            # Determine winner for scored issues
-            winner = "---"
-            if a.get('score', -1) != -1 and b.get('score', -1) != -1:
-                if a['score'] < b['score']: winner = "A"
-                elif b['score'] < a['score']: winner = "B"
-                else: winner = "Tie"
-
-            item = QtWidgets.QTreeWidgetItem([
-                issue_name, a.get('summary', 'N/A'), b.get('summary', 'N/A'), winner
-            ])
+        # Build score rows
+        for issue, data in results.get("issues", {}).items():
+            a_s = data['a'].get('summary', ''); b_s = data['b'].get('summary', '')
+            winner = data.get('winner', '')
+            item = QtWidgets.QTreeWidgetItem([issue, a_s, b_s, winner])
             self.scorecard_tree.addTopLevelItem(item)
+
+    # The outer GUI calls this when a scorecard item is clicked
+    def map_ts_b(self, ts_a: float) -> float:
+        off = float(self.results.get("alignment_offset_secs", 0.0))
+        drift = float(self.results.get("alignment_drift_ppm", 0.0))
+        # map with linear drift compensation
+        return max(0.0, ts_a - (off + drift * ts_a))
+
