@@ -1,49 +1,48 @@
 # remux_toolkit/tools/video_ab_comparator/detectors/compression.py
-
 import cv2
 import numpy as np
 from .base_detector import BaseDetector
 from ..core.source import VideoSource
 
 class BlockingDetector(BaseDetector):
-    """Detects 8x8 block artifacts from video compression."""
-
     @property
-    def issue_name(self) -> str:
-        return "Compression Blocking"
+    def issue_name(self) -> str: return "Compression Blocking"
 
     def run(self, source: VideoSource) -> dict:
-        """Analyzes multiple frames and reports the worst one."""
-        worst_score = -1
-        worst_ts = source.info.duration / 2
+        v_stream = source.info.video_stream
+        if not v_stream: return {'score': -1}
 
-        for i in range(3):
-            timestamp = source.info.duration * (i + 1) / 4.0
-            frame = source.get_frame(timestamp)
-            if frame is None:
-                continue
+        scores, frame_idx = [], 0
+        threshold = 1.0
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            height, width = gray.shape
+        with source as s:
+            if not s: return {'score': -1}
+            while (frame := s.read_frame()) is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                height, width = gray.shape
+                grad_h = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
+                grad_v = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+                h_strength = np.sum([grad_h[:, j] for j in range(0, width, 8)])
+                v_strength = np.sum([grad_v[j, :] for j in range(0, height, 8)])
 
-            grad_h = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
-            grad_v = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+                strength = (h_strength + v_strength) / (height * width * 0.01)
+                # FORMULA RECALIBRATED: Less sensitive to blocking
+                score = min(100, max(0, (strength - 15.0) * 6.0))
+                scores.append(score)
+                frame_idx += 1
 
-            h_block_strength = np.sum([grad_h[:, i] for i in range(0, width, 8)])
-            v_block_strength = np.sum([grad_v[i, :] for i in range(0, height, 8)])
+        if not scores: return {'score': 0, 'summary': 'Not detected'}
 
-            total_strength = (h_block_strength + v_block_strength) / (height * width * 0.01)
-            score = min(100, max(0, (total_strength - 10) * 10))
-
-            if score > worst_score:
-                worst_score = score
-                worst_ts = timestamp
-
-        if worst_score == -1:
-            return {'score': -1, 'summary': 'Frame extract failed'}
+        scores_arr = np.array(scores)
+        avg_score = np.mean(scores_arr)
+        peak_score = np.max(scores_arr)
+        occurrences = np.sum(scores_arr > threshold)
+        occurrence_rate = (occurrences / len(scores_arr)) * 100 if scores else 0
+        worst_idx = np.argmax(scores_arr)
+        worst_ts = worst_idx / v_stream.fps if v_stream.fps > 0 else 0
 
         return {
-            'score': worst_score,
-            'summary': f"Strength: {(worst_score/10)+10:.2f}",
+            'score': avg_score,
+            'summary': f"Avg: {avg_score:.1f} | Peak: {peak_score:.1f} | Occ: {occurrence_rate:.1f}%",
             'worst_frame_timestamp': worst_ts
         }

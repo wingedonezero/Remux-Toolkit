@@ -6,84 +6,113 @@ from .base_detector import BaseDetector
 from ..core.source import VideoSource
 
 class BandingDetector(BaseDetector):
-    """Detects color banding in smooth gradients."""
-
+    # This detector's logic is generally fine, no change needed
     @property
-    def issue_name(self) -> str:
-        return "Color Banding"
+    def issue_name(self) -> str: return "Color Banding"
 
     def run(self, source: VideoSource) -> dict:
-        """Analyzes luminance histograms in low-variance areas."""
-        worst_score = -1
-        worst_ts = source.info.duration / 3
+        v_stream = source.info.video_stream
+        if not v_stream: return {'score': -1}
 
-        for i in range(3):
-            timestamp = source.info.duration * (i + 1) / 4.0
-            frame = source.get_frame(timestamp)
-            if frame is None: continue
+        scores, frame_idx = [], 0
+        threshold = 1.0
 
-            lab_image = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-            l_channel, _, _ = cv2.split(lab_image)
-            smoothed_l = cv2.bilateralFilter(l_channel, 9, 75, 75)
-            mean = cv2.boxFilter(smoothed_l, -1, (5, 5))
-            mean_sq = cv2.boxFilter(smoothed_l**2, -1, (5, 5))
-            variance = mean_sq - mean**2
-            low_variance_mask = (variance < 10).astype(np.uint8) * 255
-            if np.sum(low_variance_mask) < low_variance_mask.size * 0.01: continue
+        with source as s:
+            if not s: return {'score': -1}
+            while (frame := s.read_frame()) is not None:
+                lab_image = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                l_channel, _, _ = cv2.split(lab_image)
+                # Check for low variance areas where banding is visible
+                mean = cv2.boxFilter(l_channel.astype(np.float32), -1, (5, 5))
+                mean_sq = cv2.boxFilter(l_channel.astype(np.float32)**2, -1, (5, 5))
+                variance = mean_sq - mean**2
+                low_variance_mask = (variance < 20).astype(np.uint8) * 255
 
-            hist = cv2.calcHist([l_channel], [0], low_variance_mask, [256], [0, 256])
-            num_colors = np.count_nonzero(hist)
-            score = max(0, 100 - (num_colors / 2.0))
+                if np.sum(low_variance_mask) < low_variance_mask.size * 0.01:
+                    scores.append(0)
+                    frame_idx += 1
+                    continue
 
-            if score > worst_score:
-                worst_score = score
-                worst_ts = timestamp
+                hist = cv2.calcHist([l_channel], [0], low_variance_mask, [256], [0, 256])
+                score = max(0, 100 - (np.count_nonzero(hist) / 2.0))
+                scores.append(score)
+                frame_idx += 1
 
-        if worst_score == -1: return {'score': 0, 'summary': 'Not detected', 'worst_frame_timestamp': worst_ts}
-        return {'score': worst_score, 'summary': f"Score: {worst_score:.1f}", 'worst_frame_timestamp': worst_ts}
+        if not scores: return {'score': 0, 'summary': 'Not detected'}
+
+        scores_arr = np.array(scores)
+        avg_score, peak_score = np.mean(scores_arr), np.max(scores_arr)
+        occurrences = np.sum(scores_arr > threshold)
+        occurrence_rate = (occurrences / len(scores_arr)) * 100 if scores else 0
+        worst_idx = np.argmax(scores_arr)
+        worst_ts = worst_idx / v_stream.fps if v_stream.fps > 0 else 0
+
+        return {'score': avg_score, 'summary': f"Avg: {avg_score:.1f} | Peak: {peak_score:.1f} | Occ: {occurrence_rate:.1f}%", 'worst_frame_timestamp': worst_ts}
 
 class RingingDetector(BaseDetector):
-    """Detects ringing/halos from over-sharpening."""
-
     @property
-    def issue_name(self) -> str:
-        return "Ringing / Halos"
+    def issue_name(self) -> str: return "Ringing / Halos"
 
     def run(self, source: VideoSource) -> dict:
-        timestamp = source.info.duration * 0.5
-        frame = source.get_frame(timestamp)
-        if frame is None: return {'score': -1, 'summary': 'Frame extract failed'}
+        v_stream = source.info.video_stream
+        if not v_stream: return {'score': -1}
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        ringing_energy = np.mean(np.abs(laplacian))
-        score = min(100, max(0, (ringing_energy - 3.0) * 15))
+        scores, frame_idx = [], 0
+        threshold = 1.0
 
-        return {'score': score, 'summary': f"Energy: {ringing_energy:.2f}", 'worst_frame_timestamp': timestamp}
+        with source as s:
+            if not s: return {'score': -1}
+            while (frame := s.read_frame()) is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+                energy = np.mean(np.abs(laplacian))
+                # FORMULA RECALIBRATED: Less sensitive to ringing
+                score = min(100, max(0, (energy - 5.0) * 10.0))
+                scores.append(score)
+                frame_idx += 1
+
+        if not scores: return {'score': 0, 'summary': 'Not detected'}
+
+        scores_arr = np.array(scores)
+        avg_score, peak_score = np.mean(scores_arr), np.max(scores_arr)
+        occurrences = np.sum(scores_arr > threshold)
+        occurrence_rate = (occurrences / len(scores_arr)) * 100 if scores else 0
+        worst_idx = np.argmax(scores_arr)
+        worst_ts = worst_idx / v_stream.fps if v_stream.fps > 0 else 0
+
+        return {'score': avg_score, 'summary': f"Avg: {avg_score:.1f} | Peak: {peak_score:.1f} | Occ: {occurrence_rate:.1f}%", 'worst_frame_timestamp': worst_ts}
 
 class DotCrawlDetector(BaseDetector):
-    """Detects dot crawl, a composite video artifact."""
-
     @property
-    def issue_name(self) -> str:
-        return "Dot Crawl"
+    def issue_name(self) -> str: return "Dot Crawl"
 
     def run(self, source: VideoSource) -> dict:
-        """Looks for high-frequency checkerboard patterns in the chroma."""
-        timestamp = source.info.duration * 0.25
-        frame = source.get_frame(timestamp)
-        if frame is None: return {'score': -1, 'summary': 'Frame extract failed'}
+        v_stream = source.info.video_stream
+        if not v_stream: return {'score': -1}
 
-        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-        _, cr, cb = cv2.split(ycrcb)
+        scores, frame_idx = [], 0
+        threshold = 1.0
 
-        # Dot crawl appears as high-frequency noise in chroma
-        cr_lap = cv2.Laplacian(cr, cv2.CV_64F)
-        cb_lap = cv2.Laplacian(cb, cv2.CV_64F)
+        with source as s:
+            if not s: return {'score': -1}
+            while (frame := s.read_frame()) is not None:
+                ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+                _, cr, cb = cv2.split(ycrcb)
+                cr_lap = cv2.Laplacian(cr, cv2.CV_64F)
+                cb_lap = cv2.Laplacian(cb, cv2.CV_64F)
+                energy = np.mean(np.abs(cr_lap) + np.abs(cb_lap))
+                # FORMULA RECALIBRATED: Less sensitive to dot crawl
+                score = min(100, max(0, (energy - 2.0) * 12.0))
+                scores.append(score)
+                frame_idx += 1
 
-        dot_crawl_energy = np.mean(np.abs(cr_lap) + np.abs(cb_lap))
+        if not scores: return {'score': 0, 'summary': 'Not detected'}
 
-        # Heuristic scoring
-        score = min(100, max(0, (dot_crawl_energy - 1.0) * 20))
+        scores_arr = np.array(scores)
+        avg_score, peak_score = np.mean(scores_arr), np.max(scores_arr)
+        occurrences = np.sum(scores_arr > threshold)
+        occurrence_rate = (occurrences / len(scores_arr)) * 100 if scores else 0
+        worst_idx = np.argmax(scores_arr)
+        worst_ts = worst_idx / v_stream.fps if v_stream.fps > 0 else 0
 
-        return {'score': score, 'summary': f"Energy: {dot_crawl_energy:.2f}", 'worst_frame_timestamp': timestamp}
+        return {'score': avg_score, 'summary': f"Avg: {avg_score:.1f} | Peak: {peak_score:.1f} | Occ: {occurrence_rate:.1f}%", 'worst_frame_timestamp': worst_ts}

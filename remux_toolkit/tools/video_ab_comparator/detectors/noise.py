@@ -6,75 +6,73 @@ from .base_detector import BaseDetector
 from ..core.source import VideoSource
 
 class DNRDetector(BaseDetector):
-    """Detects overly aggressive DNR (Digital Noise Reduction) leading to waxy textures."""
-
     @property
-    def issue_name(self) -> str:
-        return "Over-DNR / Waxiness"
+    def issue_name(self) -> str: return "Over-DNR / Waxiness"
 
     def run(self, source: VideoSource) -> dict:
-        """Measures high-frequency energy in non-edge regions."""
-        timestamp = source.info.duration * 0.4 # Sample a different point
-        frame = source.get_frame(timestamp)
-        if frame is None:
-            return {'score': -1, 'summary': 'Frame extract failed'}
+        v_stream = source.info.video_stream
+        if not v_stream: return {'score': -1}
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        scores, frame_idx = [], 0
+        threshold = 1.0
 
-        # Find strong edges, and then dilate them to create a mask
-        # of areas to EXCLUDE from our analysis.
-        edges = cv2.Canny(gray, 100, 200)
-        dilated_edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=1)
+        with source as s:
+            if not s: return {'score': -1}
+            while (frame := s.read_frame()) is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                edges = cv2.Canny(gray, 100, 200)
+                texture_mask = cv2.bitwise_not(cv2.dilate(edges, np.ones((5, 5), np.uint8)))
 
-        # The "texture mask" is everywhere that ISN'T a strong edge.
-        texture_mask = cv2.bitwise_not(dilated_edges)
+                if np.sum(texture_mask) == 0:
+                    texture_detail = 10
+                else:
+                    texture_detail = np.std(cv2.Laplacian(gray, cv2.CV_64F), where=(texture_mask > 0))
 
-        # Calculate high-frequency content (similar to sharpening detector but inverted)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+                # FORMULA RECALIBRATED: Less sensitive to waxiness
+                score = min(100, max(0, (8.0 - texture_detail) * 12.0))
+                scores.append(score)
+                frame_idx += 1
 
-        # We only care about the high-frequency content within the texture areas.
-        # A healthy image has texture detail (high laplacian variance). A waxy one does not.
-        texture_detail = np.std(laplacian, where=(texture_mask > 0))
+        if not scores: return {'score': 0, 'summary': 'Not detected'}
 
-        # Heuristic scoring: very low variance in texture areas is bad.
-        score = min(100, max(0, (10 - texture_detail) * 15))
+        scores_arr = np.array(scores)
+        avg_score, peak_score = np.mean(scores_arr), np.max(scores_arr)
+        occurrences = np.sum(scores_arr > threshold)
+        occurrence_rate = (occurrences / len(scores_arr)) * 100 if scores else 0
+        worst_idx = np.argmax(scores_arr)
+        worst_ts = worst_idx / v_stream.fps if v_stream.fps > 0 else 0
 
-        return {
-            'score': score,
-            'summary': f"Texture Detail: {texture_detail:.2f}",
-            'worst_frame_timestamp': timestamp
-        }
-
+        return {'score': avg_score, 'summary': f"Avg: {avg_score:.1f} | Peak: {peak_score:.1f} | Occ: {occurrence_rate:.1f}%", 'worst_frame_timestamp': worst_ts}
 
 class SharpeningDetector(BaseDetector):
-    """Detects excessive sharpening applied to the video."""
-
     @property
-    def issue_name(self) -> str:
-        return "Excessive Sharpening"
+    def issue_name(self) -> str: return "Excessive Sharpening"
 
     def run(self, source: VideoSource) -> dict:
-        """Measures high-frequency energy not associated with natural edges."""
-        timestamp = source.info.duration * 0.6
-        frame = source.get_frame(timestamp)
-        if frame is None:
-            return {'score': -1, 'summary': 'Frame extract failed'}
+        v_stream = source.info.video_stream
+        if not v_stream: return {'score': -1}
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        scores, frame_idx = [], 0
+        threshold = 1.0
 
-        # Unsharp masking: sharpened image = original + (original - blurred) * amount
-        # We can find the "sharpening residue" by getting (original - blurred).
-        blurred = cv2.GaussianBlur(gray, (0, 0), 3)
-        residue = gray.astype(np.float32) - blurred.astype(np.float32)
+        with source as s:
+            if not s: return {'score': -1}
+            while (frame := s.read_frame()) is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                residue = gray.astype(np.float32) - cv2.GaussianBlur(gray, (0, 0), 3).astype(np.float32)
+                energy = np.mean(np.abs(residue))
+                # FORMULA RECALIBRATED: Less sensitive to sharpening
+                score = min(100, max(0, (energy - 4.0) * 10.0))
+                scores.append(score)
+                frame_idx += 1
 
-        # Excessive sharpening creates high energy in this residue.
-        sharpening_energy = np.mean(np.abs(residue))
+        if not scores: return {'score': 0, 'summary': 'Not detected'}
 
-        # Heuristic scoring
-        score = min(100, max(0, (sharpening_energy - 2.0) * 20))
+        scores_arr = np.array(scores)
+        avg_score, peak_score = np.mean(scores_arr), np.max(scores_arr)
+        occurrences = np.sum(scores_arr > threshold)
+        occurrence_rate = (occurrences / len(scores_arr)) * 100 if scores else 0
+        worst_idx = np.argmax(scores_arr)
+        worst_ts = worst_idx / v_stream.fps if v_stream.fps > 0 else 0
 
-        return {
-            'score': score,
-            'summary': f"Residue Energy: {sharpening_energy:.2f}",
-            'worst_frame_timestamp': timestamp
-        }
+        return {'score': avg_score, 'summary': f"Avg: {avg_score:.1f} | Peak: {peak_score:.1f} | Occ: {occurrence_rate:.1f}%", 'worst_frame_timestamp': worst_ts}

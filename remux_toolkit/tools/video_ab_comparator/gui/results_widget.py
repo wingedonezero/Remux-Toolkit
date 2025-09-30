@@ -10,7 +10,7 @@ class ResultsWidget(QtWidgets.QWidget):
     def _init_ui(self):
         main_layout = QtWidgets.QVBoxLayout(self)
 
-        # --- Verdict ---
+        # --- Verdict (stays at the top) ---
         verdict_group = QtWidgets.QGroupBox("Verdict")
         verdict_layout = QtWidgets.QVBoxLayout(verdict_group)
         self.verdict_label = QtWidgets.QLabel("<i>Run a comparison to see the verdict.</i>")
@@ -19,22 +19,10 @@ class ResultsWidget(QtWidgets.QWidget):
         verdict_layout.addWidget(self.verdict_label)
         main_layout.addWidget(verdict_group)
 
-        # --- Main Splitter (Scorecard | Frame Viewer) ---
-        main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        # --- Main Splitter (NOW VERTICAL) ---
+        main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
 
-        # --- Scorecard ---
-        scorecard_group = QtWidgets.QGroupBox("Scorecard")
-        scorecard_layout = QtWidgets.QVBoxLayout(scorecard_group)
-        self.scorecard_tree = QtWidgets.QTreeWidget()
-        self.scorecard_tree.setHeaderLabels(["Metric", "Source A", "Source B", "Winner"])
-        self.scorecard_tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.scorecard_tree.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.scorecard_tree.header().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.scorecard_tree.header().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        scorecard_layout.addWidget(self.scorecard_tree)
-        main_splitter.addWidget(scorecard_group)
-
-        # --- Frame viewer ---
+        # --- Frame viewer (NOW ON TOP) ---
         viewer_group = QtWidgets.QGroupBox("Frame Viewer")
         viewer_layout = QtWidgets.QHBoxLayout(viewer_group)
         self.frame_a_label = QtWidgets.QLabel("Source A Frame")
@@ -44,13 +32,27 @@ class ResultsWidget(QtWidgets.QWidget):
         self.frame_b_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.frame_b_label.setMinimumSize(480, 270)
         viewer_layout.addWidget(self.frame_a_label, 1)
-        sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.Shape.VLine); viewer_layout.addWidget(sep)
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        viewer_layout.addWidget(sep)
         viewer_layout.addWidget(self.frame_b_label, 1)
-        main_splitter.addWidget(viewer_group)
+        main_splitter.addWidget(viewer_group) # Viewer is added FIRST
 
-        main_layout.addWidget(main_splitter)
+        # --- Scorecard (NOW ON BOTTOM) ---
+        scorecard_group = QtWidgets.QGroupBox("Scorecard")
+        scorecard_layout = QtWidgets.QVBoxLayout(scorecard_group)
+        self.scorecard_tree = QtWidgets.QTreeWidget()
+        self.scorecard_tree.setHeaderLabels(["Metric", "Source A", "Source B", "Winner"])
+        self.scorecard_tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.scorecard_tree.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.scorecard_tree.header().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.scorecard_tree.header().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        scorecard_layout.addWidget(self.scorecard_tree)
+        main_splitter.addWidget(scorecard_group) # Scorecard is added SECOND
 
-    # ---------- public API used by the GUI shell ----------
+        # Set some default sizes for a nice initial layout
+        main_splitter.setSizes([600, 300])
+        main_layout.addWidget(main_splitter, 1) # The '1' makes the splitter stretch
 
     def clear(self):
         self.verdict_label.setText("<i>Run a comparison to see the verdict.</i>")
@@ -63,17 +65,14 @@ class ResultsWidget(QtWidgets.QWidget):
         self.verdict_label.setText(results.get("verdict", ""))
         self.scorecard_tree.clear()
 
-        # Build score rows
         for issue, data in results.get("issues", {}).items():
-            a_s = data['a'].get('summary', ''); b_s = data['b'].get('summary', '')
+            a_s = data['a'].get('summary', '')
+            b_s = data['b'].get('summary', '')
             winner = data.get('winner', '')
             item = QtWidgets.QTreeWidgetItem([issue, a_s, b_s, winner])
             self.scorecard_tree.addTopLevelItem(item)
 
-    # The outer GUI calls this when a scorecard item is clicked
     def map_ts_b(self, ts_a: float) -> float:
         off = float(self.results.get("alignment_offset_secs", 0.0))
         drift = float(self.results.get("alignment_drift_ppm", 0.0))
-        # map with linear drift compensation
         return max(0.0, ts_a - (off + drift * ts_a))
-

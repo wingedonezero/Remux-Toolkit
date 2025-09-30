@@ -13,6 +13,8 @@ class StreamInfo:
     dar: Optional[str] = None
     colorspace: Optional[str] = None
     frame_rate: Optional[str] = None
+    fps: float = 0.0  # NEW: For calculations
+    frame_count: int = 0  # NEW: For looping
     bitrate: Optional[str] = None
 
 @dataclass
@@ -23,7 +25,7 @@ class SourceInfo:
     duration: float
     bitrate: str
     streams: List[StreamInfo] = field(default_factory=list)
-    is_upscaled: Optional[bool] = None
+    video_stream: Optional[StreamInfo] = None # NEW: Quick access to main video stream
 
 @dataclass
 class DetectedIssue:
@@ -31,13 +33,13 @@ class DetectedIssue:
     issue_name: str
     score: float  # 0-100, lower is better
     summary: str
-    worst_frame_timestamp: Optional[float] = None # <-- ADDED
+    worst_frame_timestamp: Optional[float] = None
 
 @dataclass
 class ComparisonResult:
     """Top-level object containing the full A/B comparison results."""
     source_a: SourceInfo
     source_b: SourceInfo
-    alignment_offset_secs: float = 0.0  # Offset in seconds of B relative to A
+    alignment_offset_secs: float = 0.0
     verdict: str = "Analysis not yet complete."
     issues: Dict[str, Dict[str, Any]] = field(default_factory=dict)
