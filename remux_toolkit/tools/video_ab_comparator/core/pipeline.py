@@ -6,11 +6,12 @@ from .alignment import align_sources
 from ..detectors.upscale import UpscaleDetector
 from ..detectors.interlace import CombingDetector
 from ..detectors.compression import BlockingDetector
-from ..detectors.artifacts import BandingDetector, RingingDetector
-from ..detectors.color import ChromaShiftDetector, RainbowingDetector
+from ..detectors.artifacts import BandingDetector, RingingDetector, DotCrawlDetector
+from ..detectors.color import ChromaShiftDetector, RainbowingDetector, ColorCastDetector
 from ..detectors.noise import DNRDetector, SharpeningDetector
 from ..detectors.audio import AudioDetector
 from ..detectors.telecine import GhostingDetector, CadenceDetector
+from ..detectors.geometry import AspectRatioDetector
 
 class ComparisonPipeline(QObject):
     """Orchestrates the entire A/B comparison process."""
@@ -29,10 +30,13 @@ class ComparisonPipeline(QObject):
             BlockingDetector(),
             BandingDetector(),
             RingingDetector(),
+            DotCrawlDetector(),
             ChromaShiftDetector(),
             RainbowingDetector(),
+            ColorCastDetector(),
             DNRDetector(),
             SharpeningDetector(),
+            AspectRatioDetector(),
             AudioDetector(),
         ]
 
@@ -52,25 +56,19 @@ class ComparisonPipeline(QObject):
         self.progress.emit("Aligning sources...", 40)
         frame_offset = align_sources(fp_a, fp_b)
 
-        # Estimate offset in seconds
         fps_a = 23.976
         if self.source_a.info and self.source_a.info.streams:
-            try:
-                fps_a = eval(self.source_a.info.streams[0].frame_rate)
-            except (SyntaxError, TypeError, ZeroDivisionError):
-                pass # Keep default
+            try: fps_a = eval(self.source_a.info.streams[0].frame_rate)
+            except Exception: pass
 
         time_offset_secs = frame_offset / fps_a if fps_a > 0 else 0.0
 
         # 3. Run Detectors
         results = {
-            "source_a": self.source_a.info,
-            "source_b": self.source_b.info,
-            "alignment_offset_secs": time_offset_secs,
-            "issues": {}
+            "source_a": self.source_a.info, "source_b": self.source_b.info,
+            "alignment_offset_secs": time_offset_secs, "issues": {}
         }
-        score_a, score_b = 0, 0
-        a_wins, b_wins = 0, 0
+        score_a, score_b, a_wins, b_wins = 0, 0, 0, 0
 
         total_steps = len(self.detectors) * 2
         step_idx = 0
@@ -88,9 +86,12 @@ class ComparisonPipeline(QObject):
             step_idx += 1
 
             results["issues"][detector.issue_name] = {"a": result_a, "b": result_b}
+            # FIX: Use 'result_a' and 'result_b' for comparison, not undefined 'a'
             if result_a.get('score', -1) > 0 and result_b.get('score', -1) > 0:
-                if result_a['score'] < result_b['score']: a_wins += 1
-                elif result_b['score'] < a['score']: b_wins += 1
+                if result_a['score'] < result_b['score']:
+                    a_wins += 1
+                elif result_b['score'] < result_a['score']:
+                    b_wins += 1
 
         # 4. Final Verdict
         num_scored_categories = sum(1 for d in self.detectors if d.issue_name != "Audio Analysis")
@@ -99,9 +100,13 @@ class ComparisonPipeline(QObject):
         elif b_wins > a_wins:
             results['verdict'] = f"Verdict: Source B is recommended, winning in {b_wins} of {num_scored_categories} categories."
         else:
-            if score_a < score_b: results['verdict'] = "Verdict: Source A is recommended due to a lower overall issue score."
-            elif score_b < score_a: results['verdict'] = "Verdict: Source B is recommended due to a lower overall issue score."
-            else: results['verdict'] = "Verdict: Both sources appear to be of very similar quality."
+            # FIX: Compare 'score_b' to 'score_a', not 'a_wins'
+            if score_a < score_b:
+                results['verdict'] = "Verdict: Source A is recommended due to a lower overall issue score."
+            elif score_b < score_a:
+                results['verdict'] = "Verdict: Source B is recommended due to a lower overall issue score."
+            else:
+                results['verdict'] = "Verdict: Both sources appear to be of very similar quality."
 
         self.progress.emit("Finalizing report...", 100)
         self.finished.emit(results)

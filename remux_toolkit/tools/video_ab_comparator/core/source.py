@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import imagehash
 from PIL import Image
+from typing import Optional, List # <-- FIX: Added Optional and List
 from .models import SourceInfo, StreamInfo
 
 class VideoSource:
@@ -35,15 +36,17 @@ class VideoSource:
             )
 
             for stream_data in data.get('streams', []):
-                if stream_data.get('codec_type') == 'video':
+                # --- FIX: Now processes both video and audio streams ---
+                codec_type = stream_data.get('codec_type')
+                if codec_type in ['video', 'audio']:
                     stream = StreamInfo(
                         index=stream_data.get('index'),
-                        codec_type='video',
+                        codec_type=codec_type,
                         codec_name=stream_data.get('codec_name'),
-                        resolution=f"{stream_data.get('width')}x{stream_data.get('height')}",
-                        dar=stream_data.get('display_aspect_ratio'),
-                        colorspace=stream_data.get('color_space'),
-                        frame_rate=stream_data.get('r_frame_rate'),
+                        resolution=f"{stream_data.get('width')}x{stream_data.get('height')}" if codec_type == 'video' else None,
+                        dar=stream_data.get('display_aspect_ratio') if codec_type == 'video' else None,
+                        colorspace=stream_data.get('color_space') if codec_type == 'video' else None,
+                        frame_rate=stream_data.get('r_frame_rate') if codec_type == 'video' else None,
                         bitrate=stream_data.get('bit_rate')
                     )
                     self.info.streams.append(stream)
