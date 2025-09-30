@@ -31,18 +31,21 @@ class AudioDetector(BaseDetector):
             cmd = [
                 "ffmpeg", "-nostats", "-i", str(source.path),
                 "-map", f"0:{audio_stream_info.index}",
-                "-filter:a", "ebur128", "-t", "120", # Analyze 2 mins
+                "-filter:a", "ebur128", "-t", "120",  # Analyze 2 mins
                 "-f", "null", "-"
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, stderr=subprocess.STDOUT)
-            output = result.stdout + result.stderr
+            # FIX: valid stdout/stderr capture
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            output = result.stdout
 
             # Find the Integrated loudness value in the output
             match = re.search(r"Integrated loudness:\s+I:\s+(-?\d+\.\d+)\s+LUFS", output)
             if match:
                 loudness = f"{float(match.group(1)):.1f} LUFS"
         except Exception:
-            pass # Loudness measurement fails silently
+            pass  # Loudness measurement fails silently
 
         summary_parts = [
             f"Codec: {audio_stream_info.codec_name}",
@@ -50,9 +53,8 @@ class AudioDetector(BaseDetector):
         ]
 
         # Note: This is a multi-part report, not a single score.
-        # The GUI will need to know how to parse this.
         return {
-            'score': 0, # Not a scored issue
+            'score': 0,  # Not a scored issue
             'summary': " | ".join(summary_parts),
             'data': {
                 'Codec': audio_stream_info.codec_name,

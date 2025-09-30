@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import imagehash
 from PIL import Image
-from typing import Optional, List # <-- FIX: Added Optional and List
+from typing import Optional, List
 from .models import SourceInfo, StreamInfo
 
 class VideoSource:
@@ -36,7 +36,6 @@ class VideoSource:
             )
 
             for stream_data in data.get('streams', []):
-                # --- FIX: Now processes both video and audio streams ---
                 codec_type = stream_data.get('codec_type')
                 if codec_type in ['video', 'audio']:
                     stream = StreamInfo(
@@ -55,36 +54,58 @@ class VideoSource:
             print(f"Error probing {self.path.name}: {e}")
             return False
 
-    def get_frame(self, timestamp: float) -> Optional[np.ndarray]:
-        """Extracts a single frame from a specific timestamp."""
+    def _read_raw_frame(self, cmd, width: int, height: int) -> Optional[np.ndarray]:
+        """Common runner/validator."""
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        expected = width * height * 3
+        if proc.returncode != 0 or len(proc.stdout) != expected:
+            return None
+        arr = np.frombuffer(proc.stdout, dtype='uint8')
+        if arr.size != expected:
+            return None
+        return arr.reshape((height, width, 3))
+
+    def get_frame(self, timestamp: float, *, accurate: bool = False) -> Optional[np.ndarray]:
+        """
+        Extract one frame at timestamp.
+        - accurate=False  -> FAST seek (-ss before -i), may be off ~1 frame (good for bulk sampling)
+        - accurate=True   -> EXACT seek (-ss after -i), slower (use for viewer/SSIM refinement)
+        """
         video_stream = next((s for s in self.info.streams if s.codec_type == 'video'), None)
         if not video_stream or not video_stream.resolution:
             return None
 
         width, height = map(int, video_stream.resolution.split('x'))
 
-        try:
+        if not accurate:
+            # FAST seek: -ss before -i (don’t decode from start)
             cmd = [
-                'ffmpeg', '-ss', str(timestamp), '-i', str(self.path),
-                '-vframes', '1', '-f', 'image2pipe', '-pix_fmt', 'bgr24',
-                '-vcodec', 'rawvideo', '-'
+                'ffmpeg', '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+                '-ss', str(timestamp), '-i', str(self.path),
+                '-vframes', '1', '-pix_fmt', 'bgr24',
+                '-f', 'image2pipe', '-vcodec', 'rawvideo', '-'
             ]
-            proc = subprocess.run(cmd, capture_output=True, check=True)
-            frame = np.frombuffer(proc.stdout, dtype='uint8').reshape((height, width, 3))
-            return frame
-        except Exception:
-            return None
+            return self._read_raw_frame(cmd, width, height)
+
+        # ACCURATE seek: -ss after -i (decode to ts)
+        cmd = [
+            'ffmpeg', '-nostdin', '-hide_banner', '-y', '-loglevel', 'error',
+            '-i', str(self.path),
+            '-ss', str(timestamp),
+            '-vframes', '1', '-pix_fmt', 'bgr24',
+            '-f', 'image2pipe', '-vcodec', 'rawvideo', '-'
+        ]
+        return self._read_raw_frame(cmd, width, height)
 
     def generate_fingerprints(self, num_frames: int = 100) -> List[imagehash.ImageHash]:
-        """Generates perceptual hashes for a sample of frames."""
-        fingerprints = []
+        """Generates perceptual hashes for a sample of frames (FAST seek)."""
+        fingerprints: List[imagehash.ImageHash] = []
         if not self.info or self.info.duration < 1:
             return []
-
         timestamps = np.linspace(self.info.duration * 0.1, self.info.duration * 0.9, num_frames)
         for ts in timestamps:
-            frame = self.get_frame(ts)
+            frame = self.get_frame(ts, accurate=False)  # fast path
             if frame is not None:
-                pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                fingerprints.append(imagehash.average_hash(pil_img))
+                pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                fingerprints.append(imagehash.average_hash(pil))
         return fingerprints
