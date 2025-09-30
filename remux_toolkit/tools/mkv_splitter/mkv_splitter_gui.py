@@ -107,7 +107,7 @@ class MKVSplitterWidget(QtWidgets.QWidget):
 
         self.params_stack = QtWidgets.QStackedWidget()
         self.target_duration_input = QtWidgets.QDoubleSpinBox(); self.target_duration_input.setSuffix(" min"); self.target_duration_input.setRange(1, 240)
-        self.min_duration_input = QtWidgets.QDoubleSpinBox(); self.min_duration_input.setSuffix(" min"); self.min_duration_input.setRange(1, 240)
+        self.min_duration_input = QtWidgets.QDoubleSpinBox(); self.min_duration_input.setSuffix(" min"); self.min_duration_input.setRange(0.1, 240)
         self.num_episodes_input = QtWidgets.QSpinBox(); self.num_episodes_input.setRange(2, 100)
 
         param_layout1 = QtWidgets.QFormLayout(); param_layout1.addRow("Target Episode Duration:", self.target_duration_input); w1 = QtWidgets.QWidget(); w1.setLayout(param_layout1)
