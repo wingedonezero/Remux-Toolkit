@@ -4,24 +4,23 @@ import subprocess
 import re
 from .base_detector import BaseDetector
 from ..core.source import VideoSource
+from typing import List
+import numpy as np
 
 _IDET_SUM = re.compile(
     r"TFF:(\d+)\s+BFF:(\d+)\s+Progressive:(\d+)\s+Undetermined:(\d+)", re.I
 )
 
 class CombingDetector(BaseDetector):
-    """Detects combing/interlace using ffmpeg's idet filter."""
-
     @property
     def issue_name(self) -> str:
         return "Interlace Combing"
 
-    def run(self, source: VideoSource) -> dict:
+    def run(self, source: VideoSource, frame_list: List[np.ndarray]) -> dict:
         dur = max(0.0, float(source.info.duration or 0.0))
         if dur < 2.0:
             return {'score': 0, 'summary': 'Video too short'}
 
-        # Look at a 60s window starting ~1/3 in (typical spot away from logos/credits)
         start = max(0.0, dur / 3.0)
         cmd = [
             "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "info",
@@ -30,7 +29,6 @@ class CombingDetector(BaseDetector):
             "-vf", "idet", "-an", "-f", "null", "-"
         ]
 
-        # Use stdout=PIPE and stderr=STDOUT so we can parse everything from result.stdout
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         out = p.stdout or ""
 
@@ -42,7 +40,6 @@ class CombingDetector(BaseDetector):
 
         total = max(1, tff + bff + prog + und)
         combed = tff + bff
-        # heuristic score: more combed frames => higher score
         score = min(100, int(100.0 * combed / total))
         if combed == 0 and prog > 0:
             summary = "Progressive"
@@ -51,5 +48,4 @@ class CombingDetector(BaseDetector):
         else:
             summary = f"Mixed/Undetermined (TFF:{tff} BFF:{bff} Prog:{prog})"
 
-        # Worst-frame timestamp (approximate: center of the analysis window)
         return {'score': score, 'summary': summary, 'worst_frame_timestamp': start + 30.0}

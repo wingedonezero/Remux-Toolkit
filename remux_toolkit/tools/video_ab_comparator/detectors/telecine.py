@@ -6,12 +6,13 @@ import subprocess
 import re
 from .base_detector import BaseDetector
 from ..core.source import VideoSource
+from typing import List
 
 class GhostingDetector(BaseDetector):
     @property
     def issue_name(self) -> str: return "Ghosting / Blending"
 
-    def run(self, source: VideoSource) -> dict:
+    def run(self, source: VideoSource, frame_list: List[np.ndarray]) -> dict:
         v_stream = source.info.video_stream
         if not v_stream: return {'score': -1}
 
@@ -19,18 +20,16 @@ class GhostingDetector(BaseDetector):
         threshold = 1.0
         prev_frame = None
 
-        with source as s:
-            if not s: return {'score': -1}
-            while (frame := s.read_frame()) is not None:
-                if prev_frame is not None:
-                    mean_diff = np.mean(cv2.absdiff(prev_frame, frame))
-                    score = 0
-                    if 5 < mean_diff < 20:
-                        score = (mean_diff - 5) * 6.0
-                    scores.append(score)
+        for frame in frame_list:
+            if prev_frame is not None:
+                mean_diff = np.mean(cv2.absdiff(prev_frame, frame))
+                score = 0
+                if 5 < mean_diff < 20:
+                    score = (mean_diff - 5) * 6.0
+                scores.append(score)
 
-                prev_frame = frame
-                frame_idx += 1
+            prev_frame = frame
+            frame_idx += 1
 
         if not scores: return {'score': 0, 'summary': 'Not detected'}
 
@@ -39,7 +38,6 @@ class GhostingDetector(BaseDetector):
         peak_score = np.max(scores_arr)
         occurrences = np.sum(scores_arr > threshold)
         occurrence_rate = (occurrences / len(scores_arr)) * 100
-        # Frame index for ghosting is between two frames, so we point to the second one
         worst_idx = np.argmax(scores_arr) + 1
         worst_ts = worst_idx / v_stream.fps
 
@@ -50,11 +48,10 @@ class GhostingDetector(BaseDetector):
         }
 
 class CadenceDetector(BaseDetector):
-    # This detector is unchanged as it already analyzes a duration
     @property
     def issue_name(self) -> str: return "Cadence Irregularity"
 
-    def run(self, source: VideoSource) -> dict:
+    def run(self, source: VideoSource, frame_list: List[np.ndarray]) -> dict:
         if not source.info or not source.info.duration:
              return {'score': -1, 'summary': 'No duration info'}
 

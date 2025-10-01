@@ -3,33 +3,31 @@ import cv2
 import numpy as np
 from .base_detector import BaseDetector
 from ..core.source import VideoSource
+from typing import List
 
 class BlockingDetector(BaseDetector):
     @property
     def issue_name(self) -> str: return "Compression Blocking"
 
-    def run(self, source: VideoSource) -> dict:
+    def run(self, source: VideoSource, frame_list: List[np.ndarray]) -> dict:
         v_stream = source.info.video_stream
         if not v_stream: return {'score': -1}
 
         scores, frame_idx = [], 0
         threshold = 1.0
 
-        with source as s:
-            if not s: return {'score': -1}
-            while (frame := s.read_frame()) is not None:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                height, width = gray.shape
-                grad_h = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
-                grad_v = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
-                h_strength = np.sum([grad_h[:, j] for j in range(0, width, 8)])
-                v_strength = np.sum([grad_v[j, :] for j in range(0, height, 8)])
+        for frame in frame_list:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            height, width = gray.shape
+            grad_h = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
+            grad_v = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+            h_strength = np.sum([grad_h[:, j] for j in range(0, width, 8)])
+            v_strength = np.sum([grad_v[j, :] for j in range(0, height, 8)])
 
-                strength = (h_strength + v_strength) / (height * width * 0.01)
-                # FORMULA RECALIBRATED: Less sensitive to blocking
-                score = min(100, max(0, (strength - 15.0) * 6.0))
-                scores.append(score)
-                frame_idx += 1
+            strength = (h_strength + v_strength) / (height * width * 0.01)
+            score = min(100, max(0, (strength - 15.0) * 6.0))
+            scores.append(score)
+            frame_idx += 1
 
         if not scores: return {'score': 0, 'summary': 'Not detected'}
 

@@ -2,6 +2,8 @@
 
 from abc import ABC, abstractmethod
 from ..core.models import SourceInfo
+from typing import List
+import numpy as np
 
 class BaseDetector(ABC):
     """Abstract base class for all issue detectors."""
@@ -13,9 +15,9 @@ class BaseDetector(ABC):
         pass
 
     @abstractmethod
-    def run(self, source: 'VideoSource') -> dict:
+    def run(self, source: 'VideoSource', frame_list: List[np.ndarray]) -> dict:
         """
-        Runs the detection logic on a given video source.
+        Runs the detection logic on a given video source using a list of frames.
 
         Returns: A dictionary with 'score' and 'summary'.
         """
