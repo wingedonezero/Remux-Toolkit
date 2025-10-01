@@ -50,8 +50,14 @@ class ComparisonPipeline(QObject):
         if self._stop_requested:
             return chunk_idx, {}
 
+        # Calculate timestamp for chunk in source A
         ts_a = duration * (chunk_idx + 0.5) / num_chunks
+
+        # Map to corresponding timestamp in source B
+        # offset convention: negative = B is behind, positive = B is ahead
+        # To sync: ts_b = ts_a - offset - drift*ts_a
         ts_b = ts_a - (align_offset + align_drift * ts_a)
+
         if ts_b < 0 or ts_b >= self.source_b.info.duration:
             return chunk_idx, {}
 
@@ -136,7 +142,15 @@ class ComparisonPipeline(QObject):
                     progress_callback=lambda msg, pc: self._emit(msg, pc)
                 )
 
-                self._emit(f"Alignment found: {align.offset_sec:.3f}s offset (confidence: {align.confidence:.2f})", 25)
+                # Better alignment reporting
+                if align.offset_sec < 0:
+                    direction = f"B is {abs(align.offset_sec):.3f}s behind A"
+                elif align.offset_sec > 0:
+                    direction = f"B is {align.offset_sec:.3f}s ahead of A"
+                else:
+                    direction = "Perfect sync"
+
+                self._emit(f"Alignment: {direction} (confidence: {align.confidence:.2f})", 25)
 
             except Exception as e:
                 print(f"Alignment failed: {e}, using zero offset")
@@ -221,8 +235,11 @@ class ComparisonPipeline(QObject):
                 verdict = f"⚖️ Sources are equivalent ({wins_a} categories each)"
 
             # Add alignment info to verdict
-            if abs(align.offset_sec) > 0.1:
-                verdict += f"\n📍 Alignment: B is {abs(align.offset_sec):.2f}s {'ahead of' if align.offset_sec > 0 else 'behind'} A"
+            if abs(align.offset_sec) > 0.02:  # More than ~half a frame at 24fps
+                if align.offset_sec < 0:
+                    verdict += f"\n📍 Alignment: B is {abs(align.offset_sec):.3f}s behind A"
+                else:
+                    verdict += f"\n📍 Alignment: B is {align.offset_sec:.3f}s ahead of A"
 
             self._emit("Complete!", 100)
 

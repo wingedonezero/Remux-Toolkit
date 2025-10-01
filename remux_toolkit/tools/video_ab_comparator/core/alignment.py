@@ -150,7 +150,7 @@ def quick_align_hybrid(source_a_path: str, source_b_path: str, duration: float,
     sample_duration = min(30.0, duration * 0.2)  # 30 seconds or 20% of video
 
     audio_a = extract_audio_fingerprint(source_a_path, sample_start, sample_duration)
-    audio_b = extract_audio_fingerprint(source_a_path, sample_start - 10, sample_duration + 20)  # Wider window
+    audio_b = extract_audio_fingerprint(source_b_path, sample_start - 10, sample_duration + 20)  # Wider window
 
     audio_offset = 0.0
     audio_confidence = 0.0
@@ -211,7 +211,8 @@ def precise_align_keyframes(source_a_path: str, source_b_path: str,
     best_score = -1
 
     # Search in a small window around rough offset
-    search_range = np.arange(rough_offset - 1.0, rough_offset + 1.0, 0.1)
+    # Search with finer granularity for frame-accurate results
+    search_range = np.arange(rough_offset - 0.5, rough_offset + 0.5, 0.04)  # ~1 frame at 24fps
 
     for i, offset in enumerate(search_range):
         try:
@@ -242,19 +243,21 @@ def precise_align_keyframes(source_a_path: str, source_b_path: str,
             result_b = subprocess.run(cmd_b, capture_output=True, timeout=5)
 
             if result_a.returncode == 0 and result_b.returncode == 0:
-                # Assume 1920x1080 for now (you should get this from probe)
-                frame_size = 1920 * 1080
+                # Estimate frame size (will auto-detect from data)
+                if len(result_a.stdout) > 0 and len(result_b.stdout) > 0:
+                    # Use the smaller of the two to avoid overflow
+                    min_size = min(len(result_a.stdout), len(result_b.stdout))
 
-                if len(result_a.stdout) >= frame_size and len(result_b.stdout) >= frame_size:
-                    frame_a = np.frombuffer(result_a.stdout[:frame_size], dtype=np.uint8)
-                    frame_b = np.frombuffer(result_b.stdout[:frame_size], dtype=np.uint8)
+                    frame_a = np.frombuffer(result_a.stdout[:min_size], dtype=np.uint8)
+                    frame_b = np.frombuffer(result_b.stdout[:min_size], dtype=np.uint8)
 
                     # Simple correlation score
-                    correlation = np.corrcoef(frame_a, frame_b)[0, 1]
+                    if len(frame_a) == len(frame_b):
+                        correlation = np.corrcoef(frame_a, frame_b)[0, 1]
 
-                    if correlation > best_score:
-                        best_score = correlation
-                        best_offset = offset
+                        if correlation > best_score:
+                            best_score = correlation
+                            best_offset = offset
 
             if progress_callback and i % 5 == 0:
                 progress = 18 + int(7 * (i + 1) / len(search_range))
@@ -270,6 +273,12 @@ def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
     """
     Main alignment function - now MUCH faster.
     Uses hybrid audio/visual approach instead of slow SSIM scanning.
+
+    CONVENTION: offset represents how much B is AHEAD of A.
+    - Negative offset means B is behind A (B needs to add time to catch up)
+    - Positive offset means B is ahead of A (B needs to subtract time to sync)
+
+    To find corresponding timestamp in B: ts_b = ts_a - offset
     """
     # Use the fast hybrid approach
     result = quick_align_hybrid(
@@ -301,7 +310,9 @@ def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
         drift_ratio = (fps_a - fps_b) / fps_a
         result.drift_ratio = drift_ratio
 
-    # Our convention: offset = ts_a - ts_b
+    # CRITICAL: Negate the offset to match our convention
+    # Audio correlation gives us "how far ahead is audio_b's window from audio_a's sample"
+    # We want "how far ahead is B from A", so we negate
     result.offset_sec = -result.offset_sec
 
     return result

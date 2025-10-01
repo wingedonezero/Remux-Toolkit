@@ -66,6 +66,19 @@ class ResultsWidget(QtWidgets.QWidget):
             self.scorecard_tree.addTopLevelItem(item)
 
     def map_ts_b(self, ts_a: float) -> float:
+        """
+        Map timestamp from source A to corresponding timestamp in source B.
+
+        Convention: offset represents how much B is ahead of A.
+        - Negative offset: B is behind A (needs to add time)
+        - Positive offset: B is ahead of A (needs to subtract time)
+
+        Formula: ts_b = ts_a - offset - drift*ts_a
+        """
         off = float(self.results.get("alignment_offset_secs", 0.0))
-        drift = float(self.results.get("alignment_drift_ratio", 0.0)) # Use corrected key
-        return max(0.0, ts_a - (off + drift * ts_a))
+        drift = float(self.results.get("alignment_drift_ratio", 0.0))
+
+        # Map timestamp: ts_b = ts_a - (offset + drift*ts_a)
+        ts_b = ts_a - (off + drift * ts_a)
+
+        return max(0.0, ts_b)
