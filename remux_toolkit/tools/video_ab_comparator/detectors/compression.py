@@ -25,44 +25,50 @@ class BlockingDetector(BaseDetector):
         }
 
         for frame_idx, frame in enumerate(frame_list):
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            height, width = gray.shape
+            try:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                height, width = gray.shape
 
-            # 1. Traditional blocking detection (8x8 and 16x16 blocks)
-            blocking_8 = self._detect_blocking(gray, 8)
-            blocking_16 = self._detect_blocking(gray, 16)
-            artifact_scores['blocking'].append(max(blocking_8, blocking_16))
+                # 1. Traditional blocking detection (8x8 and 16x16 blocks)
+                blocking_8 = self._detect_blocking(gray, 8)
+                blocking_16 = self._detect_blocking(gray, 16)
+                artifact_scores['blocking'].append(max(blocking_8, blocking_16))
 
-            # 2. Mosquito noise detection (around edges)
-            mosquito_score = self._detect_mosquito_noise(gray)
-            artifact_scores['mosquito'].append(mosquito_score)
+                # 2. Mosquito noise detection (around edges)
+                mosquito_score = self._detect_mosquito_noise(gray)
+                artifact_scores['mosquito'].append(mosquito_score)
 
-            # 3. DCT ringing detection
-            dct_score = self._detect_dct_ringing(gray)
-            artifact_scores['dct_ringing'].append(dct_score)
+                # 3. DCT ringing detection
+                dct_score = self._detect_dct_ringing(gray)
+                artifact_scores['dct_ringing'].append(dct_score)
 
-            # 4. MPEG-2 specific artifacts (softer blocks, color bleeding)
-            mpeg2_score = self._detect_mpeg2_artifacts(frame)
-            artifact_scores['mpeg2'].append(mpeg2_score)
+                # 4. MPEG-2 specific artifacts (softer blocks, color bleeding)
+                mpeg2_score = self._detect_mpeg2_artifacts(frame)
+                artifact_scores['mpeg2'].append(mpeg2_score)
 
-            # 5. H.264 specific artifacts (sharper blocks, deblocking filter artifacts)
-            h264_score = self._detect_h264_artifacts(frame)
-            artifact_scores['h264'].append(h264_score)
+                # 5. H.264 specific artifacts (sharper blocks, deblocking filter artifacts)
+                h264_score = self._detect_h264_artifacts(frame)
+                artifact_scores['h264'].append(h264_score)
+            except Exception:
+                # If analysis on a frame fails, append 0 to avoid crashing
+                for key in artifact_scores:
+                    artifact_scores[key].append(0)
+
 
         # Compile results
         if not artifact_scores['blocking']:
             return {'score': 0, 'summary': 'Not detected'}
 
         # Determine codec type based on artifact patterns
-        avg_mpeg2 = np.mean(artifact_scores['mpeg2'])
-        avg_h264 = np.mean(artifact_scores['h264'])
+        avg_mpeg2 = np.mean(artifact_scores['mpeg2']) if artifact_scores['mpeg2'] else 0
+        avg_h264 = np.mean(artifact_scores['h264']) if artifact_scores['h264'] else 0
 
         codec_type = "MPEG-2" if avg_mpeg2 > avg_h264 else "H.264/AVC"
 
         # Calculate overall score
-        blocking_avg = np.mean(artifact_scores['blocking'])
-        mosquito_avg = np.mean(artifact_scores['mosquito'])
-        dct_avg = np.mean(artifact_scores['dct_ringing'])
+        blocking_avg = np.mean(artifact_scores['blocking']) if artifact_scores['blocking'] else 0
+        mosquito_avg = np.mean(artifact_scores['mosquito']) if artifact_scores['mosquito'] else 0
+        dct_avg = np.mean(artifact_scores['dct_ringing']) if artifact_scores['dct_ringing'] else 0
 
         # Weighted combination
         overall_score = (blocking_avg * 0.4 + mosquito_avg * 0.3 + dct_avg * 0.3)

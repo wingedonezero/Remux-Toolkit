@@ -3,7 +3,6 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 import json
 import cv2
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
 
 from .core.pipeline import ComparisonPipeline
 from .gui.results_widget import ResultsWidget
@@ -20,46 +19,15 @@ class FrameLoader(QtCore.QObject):
 
     @QtCore.pyqtSlot(float, float)
     def load_frames(self, ts_a, ts_b):
+        """
+        A simplified and more robust method to load frames directly.
+        """
         frame_a = self.source_a.get_frame(ts_a, accurate=True)
-        if frame_a is None:
-            self.frames_ready.emit(None, None, ts_a, ts_b)
-            return
+        frame_b = self.source_b.get_frame(ts_b, accurate=True)
+        self.frames_ready.emit(frame_a, frame_b, ts_a, ts_b)
 
-        # --- NEW Micro-Correction Logic ---
-        best_frame_b = None
-        best_ssim = -1.0
 
-        # Get the framerate to calculate frame duration
-        fps_b = self.source_b.info.video_stream.fps if self.source_b.info.video_stream else 24.0
-        frame_duration = 1.0 / fps_b
-
-        # Check the target frame, the one before, and the one after
-        for offset in [0, -frame_duration, frame_duration]:
-            current_ts_b = ts_b + offset
-            if current_ts_b < 0: continue
-
-            frame_b_candidate = self.source_b.get_frame(current_ts_b, accurate=True)
-
-            if frame_b_candidate is not None:
-                # Resize for faster comparison
-                h, w, _ = frame_a.shape
-                frame_b_resized = cv2.resize(frame_b_candidate, (w, h))
-
-                # Compare grayscale versions
-                gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
-                gray_b = cv2.cvtColor(frame_b_resized, cv2.COLOR_BGR2GRAY)
-
-                current_ssim = ssim(gray_a, gray_b)
-
-                if current_ssim > best_ssim:
-                    best_ssim = current_ssim
-                    best_frame_b = frame_b_candidate
-
-        self.frames_ready.emit(frame_a, best_frame_b, ts_a, ts_b)
-
-# --- The rest of the VideoABComparatorWidget class is unchanged ---
 class VideoABComparatorWidget(QtWidgets.QWidget):
-    # ... (no changes from the last version)
     request_frames = QtCore.pyqtSignal(float, float)
 
     def __init__(self, app_manager, parent=None):
@@ -166,7 +134,9 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.export_button.setEnabled(False)
         self.log_tab.clear()
         self.results_widget.clear()
-        self.pipeline = ComparisonPipeline(path_a, path_b)
+
+        self.pipeline = ComparisonPipeline(path_a, path_b, self.settings)
+
         self.pipeline_thread = QtCore.QThread()
         self.pipeline.moveToThread(self.pipeline_thread)
         self.pipeline.progress.connect(self.update_progress)
@@ -202,16 +172,24 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.frame_loader_thread.start()
 
     def on_scorecard_item_clicked(self, item, column):
+        print("\n--- DEBUG: Scorecard item clicked ---")
         if not self.pipeline or not self.results_data or not self.frame_loader:
+            print("DEBUG: Pipeline or results data not ready. Aborting.")
             return
+
         issue_name = item.parent().text(0) if item.parent() else item.text(0)
         issue_results = self.results_data.get("issues", {}).get(issue_name, {})
+        print(f"DEBUG: Clicked on metric: {issue_name}")
+
         ts_a = issue_results.get('a', {}).get('worst_frame_timestamp')
         if ts_a is None:
+            print("DEBUG: No 'worst_frame_timestamp' found for this metric.")
             self.results_widget.frame_a_label.setText("No specific frame\nfor this metric")
             self.results_widget.frame_b_label.setText("No specific frame\nfor this metric")
             return
+
         ts_b = self.results_widget.map_ts_b(ts_a)
+        print(f"DEBUG: Requesting frames at ts_a={ts_a:.3f}s and ts_b={ts_b:.3f}s")
         self.display_frames(ts_a, ts_b)
 
     def display_frames(self, ts_a, ts_b):
@@ -221,6 +199,10 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot(object, object, float, float)
     def _update_frame_viewers(self, frame_a, frame_b, ts_a, ts_b):
+        print("--- DEBUG: Updating frame viewers ---")
+        print(f"DEBUG: Received frame_a: {'Valid Frame' if frame_a is not None else 'None'}")
+        print(f"DEBUG: Received frame_b: {'Valid Frame' if frame_b is not None else 'None'}")
+
         if frame_a is not None:
             h, w, ch = frame_a.shape
             q_img = QtGui.QImage(frame_a.data, w, h, ch * w, QtGui.QImage.Format.Format_BGR888)

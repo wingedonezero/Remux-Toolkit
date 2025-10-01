@@ -3,6 +3,9 @@
 DEFAULTS = {
     "source_a_path": "",
     "source_b_path": "",
-    # Detector-specific sensitivities can be added here later
-    "upscale_detector_threshold": 0.85,
+    "analysis_chunk_count": 8,
+    "analysis_chunk_duration": 2.0, # New setting
+    "enable_audio_analysis": True,
+    "enable_interlace_detection": True,
+    "enable_cadence_detection": True,
 }

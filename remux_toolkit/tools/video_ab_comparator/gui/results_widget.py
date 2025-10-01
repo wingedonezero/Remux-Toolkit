@@ -9,8 +9,6 @@ class ResultsWidget(QtWidgets.QWidget):
 
     def _init_ui(self):
         main_layout = QtWidgets.QVBoxLayout(self)
-
-        # --- Verdict (stays at the top) ---
         verdict_group = QtWidgets.QGroupBox("Verdict")
         verdict_layout = QtWidgets.QVBoxLayout(verdict_group)
         self.verdict_label = QtWidgets.QLabel("<i>Run a comparison to see the verdict.</i>")
@@ -19,10 +17,7 @@ class ResultsWidget(QtWidgets.QWidget):
         verdict_layout.addWidget(self.verdict_label)
         main_layout.addWidget(verdict_group)
 
-        # --- Main Splitter (NOW VERTICAL) ---
         main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-
-        # --- Frame viewer (NOW ON TOP) ---
         viewer_group = QtWidgets.QGroupBox("Frame Viewer")
         viewer_layout = QtWidgets.QHBoxLayout(viewer_group)
         self.frame_a_label = QtWidgets.QLabel("Source A Frame")
@@ -36,9 +31,8 @@ class ResultsWidget(QtWidgets.QWidget):
         sep.setFrameShape(QtWidgets.QFrame.Shape.VLine)
         viewer_layout.addWidget(sep)
         viewer_layout.addWidget(self.frame_b_label, 1)
-        main_splitter.addWidget(viewer_group) # Viewer is added FIRST
+        main_splitter.addWidget(viewer_group)
 
-        # --- Scorecard (NOW ON BOTTOM) ---
         scorecard_group = QtWidgets.QGroupBox("Scorecard")
         scorecard_layout = QtWidgets.QVBoxLayout(scorecard_group)
         self.scorecard_tree = QtWidgets.QTreeWidget()
@@ -48,11 +42,10 @@ class ResultsWidget(QtWidgets.QWidget):
         self.scorecard_tree.header().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.scorecard_tree.header().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         scorecard_layout.addWidget(self.scorecard_tree)
-        main_splitter.addWidget(scorecard_group) # Scorecard is added SECOND
+        main_splitter.addWidget(scorecard_group)
 
-        # Set some default sizes for a nice initial layout
         main_splitter.setSizes([600, 300])
-        main_layout.addWidget(main_splitter, 1) # The '1' makes the splitter stretch
+        main_layout.addWidget(main_splitter, 1)
 
     def clear(self):
         self.verdict_label.setText("<i>Run a comparison to see the verdict.</i>")
@@ -74,5 +67,5 @@ class ResultsWidget(QtWidgets.QWidget):
 
     def map_ts_b(self, ts_a: float) -> float:
         off = float(self.results.get("alignment_offset_secs", 0.0))
-        drift = float(self.results.get("alignment_drift_ppm", 0.0))
+        drift = float(self.results.get("alignment_drift_ratio", 0.0)) # Use corrected key
         return max(0.0, ts_a - (off + drift * ts_a))

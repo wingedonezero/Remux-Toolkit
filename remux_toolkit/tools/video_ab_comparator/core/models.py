@@ -13,8 +13,8 @@ class StreamInfo:
     dar: Optional[str] = None
     colorspace: Optional[str] = None
     frame_rate: Optional[str] = None
-    fps: float = 0.0  # NEW: For calculations
-    frame_count: int = 0  # NEW: For looping
+    fps: float = 0.0
+    frame_count: int = 0
     bitrate: Optional[str] = None
 
 @dataclass
@@ -25,7 +25,7 @@ class SourceInfo:
     duration: float
     bitrate: str
     streams: List[StreamInfo] = field(default_factory=list)
-    video_stream: Optional[StreamInfo] = None # NEW: Quick access to main video stream
+    video_stream: Optional[StreamInfo] = None
 
 @dataclass
 class DetectedIssue:
@@ -41,5 +41,6 @@ class ComparisonResult:
     source_a: SourceInfo
     source_b: SourceInfo
     alignment_offset_secs: float = 0.0
+    alignment_drift_ratio: float = 0.0 # Renamed from drift_ppm for clarity
     verdict: str = "Analysis not yet complete."
     issues: Dict[str, Dict[str, Any]] = field(default_factory=dict)
