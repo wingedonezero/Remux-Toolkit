@@ -229,23 +229,34 @@ class MakeMKVConGUIWidget(QWidget):
         if not codecs: return ""
         return Counter(codecs).most_common(1)[0][0]
 
-    def _on_probed(self, row: int, label: Optional[str], titles_total: Optional[int], titles_info: Optional[dict], err: str):
-        if not (0 <= row < len(self.jobs)): return
+    def _on_probed(self, row: int, label: Optional[str], titles_total: Optional[int],
+                   titles_info: Optional[dict], disc_info: Optional[dict], err: str):
+        """Handle probe results with enhanced information"""
+        if not (0 <= row < len(self.jobs)):
+            return
         job, item = self.jobs[row], self.tree.topLevelItem(row)
-        if not item: return
+        if not item:
+            return
 
-        if label: job.label_hint = label
+        if label:
+            job.label_hint = label
         job.titles_total = titles_total
         job.titles_info = titles_info
+        job.disc_info = disc_info  # Store disc info
 
         self._updating_checks = True
         try:
             item.takeChildren()
             minlen = int(self.settings.get("minlength", 0))
             any_child = False
+
             for t_idx in sorted(titles_info or {}):
                 info = titles_info[t_idx]
-                if (secs := duration_to_seconds(info.get("duration"))) and secs < minlen: continue
+
+                # Skip titles below minimum length
+                if info.get("duration"):
+                    if (secs := duration_to_seconds(info.get("duration"))) and secs < minlen:
+                        continue
 
                 streams = info.get("streams", [])
                 video_codec = self._get_dominant_codec(streams, "Video")
@@ -254,7 +265,16 @@ class MakeMKVConGUIWidget(QWidget):
                 chapters = str(info.get("chapters", 0))
                 duration = info.get("duration", "")
 
-                child = QTreeWidgetItem([f"#{t_idx}", video_codec, audio_count, sub_count, chapters, duration, "", ""])
+                child = QTreeWidgetItem([
+                    f"#{t_idx}",
+                    video_codec,
+                    audio_count,
+                    sub_count,
+                    chapters,
+                    duration,
+                    "",
+                    ""
+                ])
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Checked)
                 item.addChild(child)
@@ -267,7 +287,8 @@ class MakeMKVConGUIWidget(QWidget):
             self._updating_checks = False
 
         item.setText(6, "Ready" if not err else f"Probe error")
-        if err: self.console.append(f"ERROR for {job.child_name}: {err}")
+        if err:
+            self.console.append(f"ERROR for {job.child_name}: {err}")
 
     def _set_children_check(self, parent_item: QTreeWidgetItem, state: Qt.CheckState):
         for i in range(parent_item.childCount()):
@@ -327,6 +348,7 @@ class MakeMKVConGUIWidget(QWidget):
             self._updating_checks = False
 
     def _on_current_item_changed(self, cur, prev):
+        """Handle selection changes to update details panel"""
         if not cur:
             self.details.clear()
             return
@@ -341,7 +363,13 @@ class MakeMKVConGUIWidget(QWidget):
             return
 
         if not is_title:
-            self.details.show_disc(job.label_hint or job.child_name, job.source_path, str(job.titles_total or "?"))
+            # Show disc-level info with enhanced disc_info
+            self.details.show_disc(
+                job.label_hint or job.child_name,
+                job.source_path,
+                str(job.titles_total or "?"),
+                job.disc_info  # Pass disc info
+            )
             return
 
         try:
@@ -410,14 +438,33 @@ class MakeMKVConGUIWidget(QWidget):
     def on_line(self, row, line):
         self.console.append(line)
 
-    def on_done(self, row, ok):
+    def on_done(self, row, ok, error_message: str):
+        """Handle job completion with detailed error information"""
         self.completed_jobs[row] = ok
         if item := self.tree.topLevelItem(row):
-            item.setText(6, "Done" if ok else "Failed")
+            if ok:
+                item.setText(6, "Done")
+            else:
+                # Show error in status
+                status = "Failed"
+                if error_message:
+                    # Truncate long error messages for display
+                    status = f"Failed: {error_message[:50]}..." if len(error_message) > 50 else f"Failed: {error_message}"
+                item.setText(6, status)
+
+        # Log detailed error to console
+        if not ok and error_message:
+            self.console.append(f"Job {row} failed: {error_message}")
 
         is_last = (len(self.completed_jobs) >= len(self.worker.jobs_to_run))
         if self.worker._stop or is_last:
             self.console.append("=== Queue finished ===")
+
+            # Summary statistics
+            success_count = sum(1 for success in self.completed_jobs.values() if success)
+            total_count = len(self.completed_jobs)
+            self.console.append(f"Completed: {success_count}/{total_count} jobs successful")
+
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
             self.running = False

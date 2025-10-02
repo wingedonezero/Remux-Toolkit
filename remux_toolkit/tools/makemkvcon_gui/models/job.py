@@ -13,6 +13,7 @@ class Job:
     label_hint: str | None = None
     titles_total: int | None = None
     titles_info: dict | None = None
+    disc_info: dict | None = None  # NEW: Store disc-level information
     selected_titles: set[int] | None = None  # None => all
     status: str = "Queued"
     out_dir: Path | None = None
