@@ -4,13 +4,13 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QThread, QUrl
-from PyQt6.QtGui import QAction, QDesktopServices, QGuiApplication
+from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QHBoxLayout, QPushButton, QSplitter,
-    QTextEdit, QTreeWidgetItem, QProgressBar, QMenu, QFileDialog, QHeaderView, QDialog
+    QTreeWidgetItem, QProgressBar, QMenu, QFileDialog, QHeaderView, QDialog
 )
 
-# Local imports from the tool's own package structure
+# Local imports
 from .makemkvcon_gui_config import DEFAULTS
 from .utils.paths import find_disc_roots_with_structure, make_source_spec, is_iso
 from .models.job import Job
@@ -18,8 +18,9 @@ from .core.info_probe import InfoProbeWorker
 from .core.ripper import MakeMKVWorker
 from .gui.queue_tree import DropTree
 from .gui.details_panel import DetailsPanel
+from .gui.console_widget import FilterableConsole  # NEW
 from .gui.prefs_dialog import PrefsDialog
-from .utils.makemkv_parser import duration_to_seconds
+from .utils.makemkv_parser import duration_to_seconds, calculate_title_size_bytes, format_bytes_human
 
 class MakeMKVConGUIWidget(QWidget):
     def __init__(self, app_manager, parent=None):
@@ -38,9 +39,9 @@ class MakeMKVConGUIWidget(QWidget):
         self._setup_workers()
 
     def _init_ui(self):
-        # Main Layout for the QWidget
         layout = QVBoxLayout(self)
 
+        # === NEW: Enhanced queue label with size estimate ===
         self.queue_label = QLabel("Queue: 0 jobs loaded")
         self.queue_label.setStyleSheet("font-weight:600;")
 
@@ -55,9 +56,9 @@ class MakeMKVConGUIWidget(QWidget):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
 
         self.details = DetailsPanel()
-        self.console = QTextEdit()
-        self.console.setReadOnly(True)
-        self.console.setPlaceholderText("makemkvcon output will appear here…")
+
+        # === NEW: Use FilterableConsole instead of QTextEdit ===
+        self.console = FilterableConsole()
 
         # Splitters
         self.center_split = QSplitter(Qt.Orientation.Horizontal)
@@ -118,12 +119,10 @@ class MakeMKVConGUIWidget(QWidget):
         self.work_thread.started.connect(self.worker.run)
 
     def _load_settings(self):
-        # Set a sensible default output root if not present in the loaded config
         if not DEFAULTS.get("output_root"):
             DEFAULTS["output_root"] = str(Path.home() / "Remux-Toolkit-Output" / "MakeMKV")
 
         self.settings = self.app_manager.load_config(self.tool_name, DEFAULTS)
-
         Path(self.settings["output_root"]).mkdir(parents=True, exist_ok=True)
 
         if cw := self.settings.get("col_widths"):
@@ -133,14 +132,12 @@ class MakeMKVConGUIWidget(QWidget):
         if vs := self.settings.get("v_split_sizes"): self.v_split.setSizes([int(x) for x in vs])
 
     def save_settings(self):
-        """Called by the main window when the tab is closed."""
         self.settings["col_widths"] = [self.tree.columnWidth(i) for i in range(self.tree.columnCount())]
         self.settings["center_split_sizes"] = self.center_split.sizes()
         self.settings["v_split_sizes"] = self.v_split.sizes()
         self.app_manager.save_config(self.tool_name, self.settings)
 
     def shutdown(self):
-        """Called by the main window when the tab is closed."""
         if hasattr(self, 'worker') and self.worker: self.worker.stop()
         if hasattr(self, 'work_thread') and self.work_thread.isRunning():
             self.work_thread.quit()
@@ -153,8 +150,8 @@ class MakeMKVConGUIWidget(QWidget):
         dlg = PrefsDialog(self.settings, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.settings.update(dlg.get_values())
-            self.save_settings() # Save immediately
-            self.console.append("Saved preferences.")
+            self.save_settings()
+            self.console.append("Saved preferences.", "success")
             self.probe_worker.settings = self.settings
             self.worker.settings = self.settings
 
@@ -231,7 +228,6 @@ class MakeMKVConGUIWidget(QWidget):
 
     def _on_probed(self, row: int, label: Optional[str], titles_total: Optional[int],
                    titles_info: Optional[dict], disc_info: Optional[dict], err: str):
-        """Handle probe results with enhanced information"""
         if not (0 <= row < len(self.jobs)):
             return
         job, item = self.jobs[row], self.tree.topLevelItem(row)
@@ -242,7 +238,7 @@ class MakeMKVConGUIWidget(QWidget):
             job.label_hint = label
         job.titles_total = titles_total
         job.titles_info = titles_info
-        job.disc_info = disc_info  # Store disc info
+        job.disc_info = disc_info
 
         self._updating_checks = True
         try:
@@ -253,7 +249,6 @@ class MakeMKVConGUIWidget(QWidget):
             for t_idx in sorted(titles_info or {}):
                 info = titles_info[t_idx]
 
-                # Skip titles below minimum length
                 if info.get("duration"):
                     if (secs := duration_to_seconds(info.get("duration"))) and secs < minlen:
                         continue
@@ -288,7 +283,10 @@ class MakeMKVConGUIWidget(QWidget):
 
         item.setText(6, "Ready" if not err else f"Probe error")
         if err:
-            self.console.append(f"ERROR for {job.child_name}: {err}")
+            self.console.append(f"ERROR for {job.child_name}: {err}", "error")
+
+        # Update queue label with size estimate
+        self._refresh_queue_label()
 
     def _set_children_check(self, parent_item: QTreeWidgetItem, state: Qt.CheckState):
         for i in range(parent_item.childCount()):
@@ -318,12 +316,11 @@ class MakeMKVConGUIWidget(QWidget):
             job = top_item.data(0, Qt.ItemDataRole.UserRole)
             if not job: return
 
-            if not parent: # This is a top-level item
+            if not parent:
                 self._set_children_check(changed_item, changed_item.checkState(0))
-            else: # This is a child item
+            else:
                 self._set_parent_check_from_children(parent)
 
-            # Recalculate selected titles for the job
             selected_titles = set()
             all_titles_selected = True
             checkable_child_count = 0
@@ -340,15 +337,17 @@ class MakeMKVConGUIWidget(QWidget):
                         all_titles_selected = False
 
             if checkable_child_count > 0 and all_titles_selected:
-                 job.selected_titles = None # None means all
+                 job.selected_titles = None
             else:
                  job.selected_titles = selected_titles
 
         finally:
             self._updating_checks = False
 
+        # Update size estimate when selection changes
+        self._refresh_queue_label()
+
     def _on_current_item_changed(self, cur, prev):
-        """Handle selection changes to update details panel"""
         if not cur:
             self.details.clear()
             return
@@ -363,12 +362,11 @@ class MakeMKVConGUIWidget(QWidget):
             return
 
         if not is_title:
-            # Show disc-level info with enhanced disc_info
             self.details.show_disc(
                 job.label_hint or job.child_name,
                 job.source_path,
                 str(job.titles_total or "?"),
-                job.disc_info  # Pass disc info
+                job.disc_info
             )
             return
 
@@ -402,15 +400,14 @@ class MakeMKVConGUIWidget(QWidget):
     def start_queue(self):
         if self.running: return
 
-        # A job is runnable if its selected_titles is None (all) or a non-empty set
         jobs_to_run = [(i, job, job.selected_titles) for i, job in enumerate(self.jobs) if job.selected_titles is None or job.selected_titles]
 
         if not jobs_to_run:
-            self.console.append("=== No jobs or titles selected to run ===")
+            self.console.append("=== No jobs or titles selected to run ===", "warning")
             return
 
         self.console.clear()
-        self.console.append("=== Starting queue ===")
+        self.console.append("=== Starting queue ===", "info")
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.running = True
@@ -421,22 +418,59 @@ class MakeMKVConGUIWidget(QWidget):
     def stop_queue(self):
         if self.running:
             self.worker.stop()
-            self.console.append(">>> Stop requested…")
+            self.console.append(">>> Stop requested…", "warning")
+
+    def _calculate_estimated_size(self) -> int:
+        """
+        Calculate estimated total output size for selected titles
+        Returns size in bytes
+        """
+        total_bytes = 0
+        for job in self.jobs:
+            if not job.titles_info:
+                continue
+
+            # Get selected titles for this job
+            if job.selected_titles is None:
+                # All titles selected
+                titles_to_count = job.titles_info.keys()
+            elif job.selected_titles:
+                # Specific titles selected
+                titles_to_count = job.selected_titles
+            else:
+                # No titles selected
+                continue
+
+            for title_id in titles_to_count:
+                if title_id in job.titles_info:
+                    total_bytes += calculate_title_size_bytes(job.titles_info[title_id])
+
+        return total_bytes
 
     def _refresh_queue_label(self):
-        self.queue_label.setText(f"Queue: {len(self.jobs)} jobs loaded")
+        """Update queue label with job count and estimated size"""
+        job_count = len(self.jobs)
+
+        # Calculate estimated size
+        estimated_bytes = self._calculate_estimated_size()
+        size_str = format_bytes_human(estimated_bytes) if estimated_bytes > 0 else "Unknown"
+
+        self.queue_label.setText(f"Queue: {job_count} jobs loaded (Estimated: {size_str})")
 
     def on_progress(self, row, pct):
         if 0 <= row < self.tree.topLevelItemCount():
             if item := self.tree.topLevelItem(row):
-                if bar := self.tree.itemWidget(item, 7): bar.setValue(max(0, min(100, pct)))
+                if bar := self.tree.itemWidget(item, 7):
+                    bar.setValue(max(0, min(100, pct)))
 
     def on_status_text(self, row, text):
         if 0 <= row < self.tree.topLevelItemCount():
-            if item := self.tree.topLevelItem(row): item.setText(6, text)
+            if item := self.tree.topLevelItem(row):
+                item.setText(6, text)
 
-    def on_line(self, row, line):
-        self.console.append(line)
+    def on_line(self, row, line, severity="info"):
+        """Handle console output with severity for color coding"""
+        self.console.append(line, severity)
 
     def on_done(self, row, ok, error_message: str):
         """Handle job completion with detailed error information"""
@@ -445,25 +479,26 @@ class MakeMKVConGUIWidget(QWidget):
             if ok:
                 item.setText(6, "Done")
             else:
-                # Show error in status
                 status = "Failed"
                 if error_message:
-                    # Truncate long error messages for display
                     status = f"Failed: {error_message[:50]}..." if len(error_message) > 50 else f"Failed: {error_message}"
                 item.setText(6, status)
 
-        # Log detailed error to console
         if not ok and error_message:
-            self.console.append(f"Job {row} failed: {error_message}")
+            self.console.append(f"Job {row} failed: {error_message}", "error")
 
         is_last = (len(self.completed_jobs) >= len(self.worker.jobs_to_run))
         if self.worker._stop or is_last:
-            self.console.append("=== Queue finished ===")
+            self.console.append("=== Queue finished ===", "info")
 
             # Summary statistics
             success_count = sum(1 for success in self.completed_jobs.values() if success)
             total_count = len(self.completed_jobs)
-            self.console.append(f"Completed: {success_count}/{total_count} jobs successful")
+
+            if success_count == total_count:
+                self.console.append(f"Completed: {success_count}/{total_count} jobs successful", "success")
+            else:
+                self.console.append(f"Completed: {success_count}/{total_count} jobs successful", "warning")
 
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)

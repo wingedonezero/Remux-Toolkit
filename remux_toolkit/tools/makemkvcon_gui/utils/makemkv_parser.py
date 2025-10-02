@@ -29,6 +29,81 @@ def parse_disc_info(output: str) -> dict:
                 pass
     return disc_info
 
+def parse_disc_protection_flags(output: str) -> dict:
+    """
+    Parse disc protection information from CINFO messages
+    Returns dict with protection status flags
+    """
+    protection = {
+        "aacs": False,
+        "bdplus": False,
+        "bus_encryption": False,
+        "raw_flags": None
+    }
+
+    # Look for CINFO messages that contain protection flags
+    # CINFO format: CINFO:code,id,flags,"value"
+    for line in output.splitlines():
+        if line.startswith("CINFO:"):
+            try:
+                parts = line.split(",", 3)
+                if len(parts) >= 3:
+                    code = int(parts[0].split(":")[1])
+                    flags = int(parts[2])
+
+                    # Protection flags are typically in CINFO entries
+                    # Check for disc flags (from apdefs.h)
+                    if flags:
+                        protection["raw_flags"] = flags
+                        if flags & 4:  # AP_MMBD_MMBD_DISC_FLAG_AACS
+                            protection["aacs"] = True
+                        if flags & 8:  # AP_MMBD_MMBD_DISC_FLAG_BDPLUS
+                            protection["bdplus"] = True
+                        if flags & 2:  # AP_MMBD_DISC_FLAG_BUSENC
+                            protection["bus_encryption"] = True
+            except (ValueError, IndexError):
+                pass
+
+    # Also check for explicit protection messages in MSG output
+    for line in output.splitlines():
+        if "AACS" in line.upper():
+            protection["aacs"] = True
+        if "BD+" in line.upper() or "BDPLUS" in line.upper():
+            protection["bdplus"] = True
+
+    return protection
+
+def parse_disc_filesystem_info(output: str) -> dict:
+    """
+    Parse filesystem flags to determine disc type
+    Returns dict with filesystem information
+    """
+    fs_info = {
+        "has_dvd": False,
+        "has_hddvd": False,
+        "has_bluray": False,
+        "has_aacs_files": False,
+        "has_bdsvm_files": False,
+        "disc_type": "Unknown"
+    }
+
+    # Look for filesystem indicators in output
+    for line in output.splitlines():
+        line_upper = line.upper()
+        if "VIDEO_TS" in line_upper or "DVD" in line_upper:
+            fs_info["has_dvd"] = True
+            fs_info["disc_type"] = "DVD"
+        if "BDMV" in line_upper or "BLU-RAY" in line_upper or "BLURAY" in line_upper:
+            fs_info["has_bluray"] = True
+            fs_info["disc_type"] = "Blu-ray"
+        if "HDDVD" in line_upper or "HD-DVD" in line_upper:
+            fs_info["has_hddvd"] = True
+            fs_info["disc_type"] = "HD-DVD"
+        if "AACS" in line_upper:
+            fs_info["has_aacs_files"] = True
+
+    return fs_info
+
 def count_titles_from_info(output: str) -> int:
     """Count unique titles, preferring TCOUNT if available"""
     # First check for TCOUNT message
@@ -217,6 +292,8 @@ def parse_info_details(output: str) -> dict:
         title_info["tree_info"] = codes.get(30, "")  # ap_iaTreeInfo
         title_info["panel_title"] = codes.get(31, "")  # ap_iaPanelTitle
         title_info["order_weight"] = codes.get(33, "")  # ap_iaOrderWeight
+        title_info["output_format"] = codes.get(34, "")  # ap_iaOutputFormat
+        title_info["output_format_description"] = codes.get(35, "")  # ap_iaOutputFormatDescription
         title_info["seamless_info"] = codes.get(36, "")  # ap_iaSeamlessInfo
         title_info["panel_text"] = codes.get(37, "")  # ap_iaPanelText
         title_info["comment"] = codes.get(49, "")  # ap_iaComment
@@ -315,3 +392,92 @@ def parse_exit_code_message(returncode: int) -> str:
         return "Failed (invalid command line arguments)"
     else:
         return f"Failed (exit code {returncode})"
+
+def calculate_title_size_bytes(title_info: dict) -> int:
+    """
+    Calculate title size in bytes from size_bytes field
+    Returns 0 if unable to parse
+    """
+    if size_bytes := title_info.get("size_bytes"):
+        try:
+            return int(size_bytes)
+        except (ValueError, TypeError):
+            pass
+
+    # Fallback: try to parse from size field (e.g., "4.5 GB")
+    if size_str := title_info.get("size"):
+        try:
+            # Match patterns like "4.5 GB", "1234 MB", etc.
+            match = re.match(r'([\d.]+)\s*(GB|MB|KB)', size_str, re.IGNORECASE)
+            if match:
+                value = float(match.group(1))
+                unit = match.group(2).upper()
+                if unit == "GB":
+                    return int(value * 1024 * 1024 * 1024)
+                elif unit == "MB":
+                    return int(value * 1024 * 1024)
+                elif unit == "KB":
+                    return int(value * 1024)
+        except (ValueError, AttributeError):
+            pass
+
+    return 0
+
+def format_bytes_human(bytes_count: int) -> str:
+    """Format bytes into human-readable string"""
+    if bytes_count == 0:
+        return "0 B"
+
+    units = ['B', 'KB', 'MB', 'GB', 'TB']
+    unit_index = 0
+    size = float(bytes_count)
+
+    while size >= 1024.0 and unit_index < len(units) - 1:
+        size /= 1024.0
+        unit_index += 1
+
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    else:
+        return f"{size:.2f} {units[unit_index]}"
+
+def parse_message_severity(msg_line: str) -> tuple[str, str, str]:
+    """
+    Parse MSG line to extract code, message, and severity
+    MSG format: MSG:code,flags,count,"message",...
+    Returns: (severity_level, message_code, message_text)
+    """
+    if not msg_line.startswith("MSG:"):
+        return ("info", "", msg_line)
+
+    try:
+        # Extract code and message
+        parts = msg_line.split(",", 3)
+        if len(parts) < 4:
+            return ("info", "", msg_line)
+
+        code = int(parts[0].split(":")[1])
+        flags = int(parts[1])
+
+        # Extract quoted message
+        match = re.search(r'"((?:[^"\\]|\\.)*)"', parts[3])
+        message = match.group(1).replace(r'\"', '"').replace(r"\\", "\\") if match else ""
+
+        # Determine severity based on flags and code
+        # From apdefs.h:
+        # AP_UIMSG_BOXOK=260, AP_UIMSG_BOXERROR=516, AP_UIMSG_BOXWARNING=1028
+        severity = "info"
+
+        if flags & 512:  # Error flag bit
+            severity = "error"
+        elif flags & 1024:  # Warning flag bit
+            severity = "warning"
+        elif "error" in message.lower() or "fail" in message.lower():
+            severity = "error"
+        elif "warning" in message.lower() or "skip" in message.lower():
+            severity = "warning"
+
+        return (severity, str(code), message)
+
+    except (ValueError, IndexError, AttributeError):
+        return ("info", "", msg_line)

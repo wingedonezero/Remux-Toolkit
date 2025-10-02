@@ -6,6 +6,8 @@ from ..utils.makemkv_parser import (
     count_titles_from_info,
     parse_info_details,
     parse_disc_info,
+    parse_disc_protection_flags,
+    parse_disc_filesystem_info,
     parse_exit_code_message
 )
 
@@ -42,6 +44,10 @@ class InfoProbeWorker(QObject):
             tcount = count_titles_from_info(out)
             details = parse_info_details(out)
             disc_info = parse_disc_info(out)
+
+            # === NEW: Parse protection and filesystem info ===
+            disc_info["protection"] = parse_disc_protection_flags(out)
+            disc_info["filesystem"] = parse_disc_filesystem_info(out)
 
         except FileNotFoundError:
             err = "makemkvcon not found (check Preferences)."

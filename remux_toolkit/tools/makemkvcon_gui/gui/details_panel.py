@@ -1,6 +1,7 @@
 # remux_toolkit/tools/makemkvcon_gui/gui/details_panel.py
 from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem, QHeaderView
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
 
 class DetailsPanel(QTreeWidget):
     def __init__(self, parent=None):
@@ -12,7 +13,7 @@ class DetailsPanel(QTreeWidget):
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
 
     def show_disc(self, label: str, path: str, total_titles: str, disc_info: dict = None):
-        """Display disc-level information"""
+        """Display disc-level information with protection status"""
         self.clear()
         disc_node = QTreeWidgetItem(["Disc", label])
         self.addTopLevelItem(disc_node)
@@ -29,6 +30,39 @@ class DetailsPanel(QTreeWidget):
                 QTreeWidgetItem(disc_node, ["Language", disc_info["language_name"]])
             if disc_info.get("comment"):
                 QTreeWidgetItem(disc_node, ["Comment", disc_info["comment"]])
+
+            # === NEW: Protection Information ===
+            if protection := disc_info.get("protection"):
+                prot_node = QTreeWidgetItem(disc_node, ["Protection", ""])
+
+                # AACS
+                aacs_item = QTreeWidgetItem(prot_node, ["AACS", "Yes" if protection.get("aacs") else "No"])
+                if protection.get("aacs"):
+                    aacs_item.setForeground(1, QColor(255, 200, 100))  # Orange for protected
+                else:
+                    aacs_item.setForeground(1, QColor(100, 255, 100))  # Green for unprotected
+
+                # BD+
+                bdplus_item = QTreeWidgetItem(prot_node, ["BD+", "Yes" if protection.get("bdplus") else "No"])
+                if protection.get("bdplus"):
+                    bdplus_item.setForeground(1, QColor(255, 200, 100))
+                else:
+                    bdplus_item.setForeground(1, QColor(100, 255, 100))
+
+                # Bus Encryption
+                if protection.get("bus_encryption"):
+                    bus_item = QTreeWidgetItem(prot_node, ["Bus Encryption", "Yes"])
+                    bus_item.setForeground(1, QColor(255, 200, 100))
+
+            # === NEW: Filesystem Information ===
+            if fs_info := disc_info.get("filesystem"):
+                fs_node = QTreeWidgetItem(disc_node, ["Filesystem", ""])
+
+                if fs_info.get("disc_type") != "Unknown":
+                    QTreeWidgetItem(fs_node, ["Disc Type", fs_info["disc_type"]])
+
+                if fs_info.get("has_aacs_files"):
+                    QTreeWidgetItem(fs_node, ["AACS Files", "Present"])
 
         self.expandAll()
 
@@ -56,13 +90,24 @@ class DetailsPanel(QTreeWidget):
         if info.get("bitrate"):
             QTreeWidgetItem(title_node, ["Bitrate", info["bitrate"]])
 
+        # === NEW: Output Format Information ===
+        if info.get("output_format") or info.get("output_format_description"):
+            output_node = QTreeWidgetItem(title_node, ["Output Format", ""])
+            if info.get("output_format"):
+                QTreeWidgetItem(output_node, ["Format", info["output_format"]])
+            if info.get("output_format_description"):
+                QTreeWidgetItem(output_node, ["Description", info["output_format_description"]])
+
         # Source information
         if info.get("source"):
             QTreeWidgetItem(title_node, ["Source File", info["source"]])
         if info.get("original_title_id"):
             QTreeWidgetItem(title_node, ["Original Title ID", info["original_title_id"]])
         if info.get("segments_count") and info["segments_count"] != "0":
-            QTreeWidgetItem(title_node, ["Segments", info["segments_count"]])
+            seg_node = QTreeWidgetItem(title_node, ["Segments", info["segments_count"]])
+            # Show segment map if available
+            if info.get("segments_map"):
+                QTreeWidgetItem(seg_node, ["Map", info["segments_map"]])
 
         # Advanced information
         if info.get("angle_info"):

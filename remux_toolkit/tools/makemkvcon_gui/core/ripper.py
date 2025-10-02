@@ -1,4 +1,6 @@
 # remux_toolkit/tools/makemkvcon_gui/core/ripper.py
+# ADD these imports and update the MakeMKVWorker class
+
 import os
 import re
 import shlex
@@ -10,6 +12,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from ..utils.paths import DiscInfo, create_output_structure
 from ..models.job import Job
+from ..utils.makemkv_parser import parse_message_severity
 
 _QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
@@ -17,15 +20,102 @@ def _unescape(s: str) -> str:
     """Unescape quoted strings from makemkvcon output"""
     return s.replace(r'\"', '"').replace(r"\\", "\\")
 
-def _msg_to_human(line: str) -> str | None:
+def _msg_to_human(line: str) -> tuple[str, str] | None:
     """
-    Extract human-readable message from MSG: line
-    MSG format: MSG:code,flags,count,"message",...
+    Extract human-readable message from MSG: line with severity
+    Returns: (severity, message) or None
     """
     if not line.startswith("MSG:"):
         return None
-    m = list(_QUOTED.finditer(line))
-    return _unescape(m[0].group(1)) if m else None
+    severity, code, message = parse_message_severity(line)
+    return (severity, message) if message else None
+
+class SpeedTracker:
+    """Track ripping speed and calculate ETA"""
+    def __init__(self):
+        self.start_time = None
+        self.last_update_time = None
+        self.bytes_processed = 0
+        self.total_bytes = 0
+        self.speed_samples = []  # Last N speed samples for smoothing
+        self.max_samples = 10
+
+    def start(self, total_bytes: int = 0):
+        """Start tracking"""
+        self.start_time = time.time()
+        self.last_update_time = self.start_time
+        self.total_bytes = total_bytes
+        self.bytes_processed = 0
+        self.speed_samples.clear()
+
+    def update(self, current_progress: int, max_progress: int):
+        """Update with current progress values"""
+        now = time.time()
+        if self.last_update_time is None:
+            self.last_update_time = now
+            return
+
+        time_delta = now - self.last_update_time
+        if time_delta < 0.5:  # Update at most every 0.5 seconds
+            return
+
+        # Calculate bytes processed (estimate from progress)
+        if max_progress > 0 and self.total_bytes > 0:
+            current_bytes = int((current_progress / max_progress) * self.total_bytes)
+            bytes_delta = current_bytes - self.bytes_processed
+
+            if bytes_delta > 0 and time_delta > 0:
+                speed = bytes_delta / time_delta  # bytes per second
+                self.speed_samples.append(speed)
+                if len(self.speed_samples) > self.max_samples:
+                    self.speed_samples.pop(0)
+
+                self.bytes_processed = current_bytes
+
+        self.last_update_time = now
+
+    def get_average_speed(self) -> float:
+        """Get average speed in bytes/second"""
+        if not self.speed_samples:
+            return 0.0
+        return sum(self.speed_samples) / len(self.speed_samples)
+
+    def get_speed_string(self) -> str:
+        """Get formatted speed string (e.g., '5.2 MB/s')"""
+        speed = self.get_average_speed()
+        if speed == 0:
+            return "-- MB/s"
+
+        # Convert to MB/s
+        speed_mb = speed / (1024 * 1024)
+        return f"{speed_mb:.1f} MB/s"
+
+    def get_elapsed_string(self) -> str:
+        """Get formatted elapsed time string"""
+        if not self.start_time:
+            return "00:00:00"
+
+        elapsed = int(time.time() - self.start_time)
+        hours = elapsed // 3600
+        minutes = (elapsed % 3600) // 60
+        seconds = elapsed % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def get_eta_string(self) -> str:
+        """Get formatted ETA string based on current speed"""
+        speed = self.get_average_speed()
+        if speed == 0 or self.total_bytes == 0:
+            return "--:--:--"
+
+        bytes_remaining = self.total_bytes - self.bytes_processed
+        if bytes_remaining <= 0:
+            return "00:00:00"
+
+        eta_seconds = int(bytes_remaining / speed)
+        hours = eta_seconds // 3600
+        minutes = (eta_seconds % 3600) // 60
+        seconds = eta_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 class ProgressTracker:
     """
@@ -77,7 +167,7 @@ class ProgressTracker:
 class MakeMKVWorker(QObject):
     progress = pyqtSignal(int, int)
     status_text = pyqtSignal(int, str)
-    line_out = pyqtSignal(int, str)
+    line_out = pyqtSignal(int, str, str)  # row, text, severity
     job_done = pyqtSignal(int, bool, str)  # row, success, error_message
 
     def __init__(self, settings: dict):
@@ -147,7 +237,7 @@ class MakeMKVWorker(QObject):
                 debugf = bool(self.settings.get("enable_debugfile", False))
 
                 if isinstance(captured_selection, set) and not captured_selection:
-                    self.line_out.emit(original_row, "No titles selected - skipping job")
+                    self.line_out.emit(original_row, "No titles selected - skipping job", "info")
                     self.job_done.emit(original_row, True, "")
                     continue
 
@@ -160,10 +250,20 @@ class MakeMKVWorker(QObject):
                                      else (job.titles_total or 1))
 
                 self.line_out.emit(original_row,
-                                 f"Processing {total_titles_to_rip} title(s)")
+                                 f"Processing {total_titles_to_rip} title(s)", "info")
 
                 # Create progress tracker
                 progress_tracker = ProgressTracker(total_titles_to_rip)
+
+                # Create speed tracker with estimated total size
+                speed_tracker = SpeedTracker()
+                estimated_total_bytes = 0
+                if job.titles_info:
+                    for title_id in titles_to_rip:
+                        if title_id != "all" and title_id in job.titles_info:
+                            from ..utils.makemkv_parser import calculate_title_size_bytes
+                            estimated_total_bytes += calculate_title_size_bytes(job.titles_info[title_id])
+                speed_tracker.start(estimated_total_bytes)
 
                 for title_idx, title_id in enumerate(titles_to_rip):
                     if self._stop:
@@ -194,7 +294,7 @@ class MakeMKVWorker(QObject):
 
                     title_cmdline = " ".join(shlex.quote(c) for c in cmd)
                     self.line_out.emit(original_row,
-                                     f"Title {current_title_num}/{total_titles_to_rip}: $ {title_cmdline}")
+                                     f"Title {current_title_num}/{total_titles_to_rip}: $ {title_cmdline}", "info")
 
                     raw_tmp_path.touch(exist_ok=True)
 
@@ -226,8 +326,9 @@ class MakeMKVWorker(QObject):
                             for raw in chunk.splitlines():
                                 if not raw or raw.startswith("PRG"):
                                     continue
-                                if out := (_msg_to_human(raw) if human else raw):
-                                    self.line_out.emit(original_row, f"Title {title_id}: {out}")
+                                if result := (_msg_to_human(raw) if human else (None, raw)):
+                                    severity, out = result if human else ("info", result[1])
+                                    self.line_out.emit(original_row, f"Title {title_id}: {out}", severity)
                                     try:
                                         lf.write(f"Title {title_id}: {out}\n")
                                         lf.flush()
@@ -254,20 +355,26 @@ class MakeMKVWorker(QObject):
                                     x, y, z = int(mv.group(1)), int(mv.group(2)), int(mv.group(3))
                                     z = z or 65536
                                     progress_tracker.update_from_prgv(x, z)
+                                    speed_tracker.update(x, z)
 
                                     overall_pct = progress_tracker.get_overall_percent()
                                     title_pct = int(100 * x / z) if z > 0 else 0
 
                                     self.progress.emit(original_row, overall_pct)
-                                    self.status_text.emit(
-                                        original_row,
-                                        f"Title {current_title_num}/{total_titles_to_rip} (#{title_id}) • {title_pct}%"
-                                    )
+
+                                    # Enhanced status with speed and ETA
+                                    speed_str = speed_tracker.get_speed_string()
+                                    elapsed_str = speed_tracker.get_elapsed_string()
+                                    eta_str = speed_tracker.get_eta_string()
+
+                                    status = f"Title {current_title_num}/{total_titles_to_rip} (#{title_id}) • {title_pct}% • {speed_str} • {elapsed_str} / {eta_str}"
+                                    self.status_text.emit(original_row, status)
 
                                 # Parse PRGC: global progress (more accurate)
                                 elif mc := re.match(r"^PRGC:(\d+),(\d+),(\d+)\s*$", line):
                                     current, total, max_val = int(mc.group(1)), int(mc.group(2)), int(mc.group(3))
                                     progress_tracker.update_from_prgc(current, total)
+                                    speed_tracker.update(current, total)
                                     overall_pct = progress_tracker.get_overall_percent()
                                     self.progress.emit(original_row, overall_pct)
 
@@ -275,11 +382,17 @@ class MakeMKVWorker(QObject):
                                 elif mt := re.match(r'^PRGT:(\d+),\d+,\d+,"([^"]*)"', line):
                                     title_text = _unescape(mt.group(2))
                                     if title_text:
-                                        self.line_out.emit(original_row, f"Title {title_id}: {title_text}")
+                                        self.line_out.emit(original_row, f"Title {title_id}: {title_text}", "info")
 
                                 # Other output
                                 elif line and not line.startswith("PRGV") and not line.startswith("PRGC"):
-                                    self.line_out.emit(original_row, f"Title {title_id}: {line}")
+                                    # Try to determine severity from line content
+                                    severity = "info"
+                                    if "error" in line.lower() or "fail" in line.lower():
+                                        severity = "error"
+                                    elif "warning" in line.lower():
+                                        severity = "warning"
+                                    self.line_out.emit(original_row, f"Title {title_id}: {line}", severity)
 
                             if proc.poll() is not None:
                                 tail_messages()
@@ -299,7 +412,7 @@ class MakeMKVWorker(QObject):
                                 err_msg = f"Title {title_id} failed (exit code {returncode})"
 
                             error_message = err_msg if not error_message else f"{error_message}; {err_msg}"
-                            self.line_out.emit(original_row, f"ERROR: {err_msg}")
+                            self.line_out.emit(original_row, f"ERROR: {err_msg}", "error")
 
                     # Clean up or keep structured message file
                     try:
@@ -317,15 +430,15 @@ class MakeMKVWorker(QObject):
 
             except FileNotFoundError:
                 error_message = "makemkvcon not found. Check path in Preferences."
-                self.line_out.emit(original_row, f"ERROR: {error_message}")
+                self.line_out.emit(original_row, f"ERROR: {error_message}", "error")
                 overall_success = False
             except subprocess.TimeoutExpired:
                 error_message = "Operation timed out"
-                self.line_out.emit(original_row, f"ERROR: {error_message}")
+                self.line_out.emit(original_row, f"ERROR: {error_message}", "error")
                 overall_success = False
             except Exception as e:
                 error_message = str(e)
-                self.line_out.emit(original_row, f"CRITICAL ERROR: {error_message}")
+                self.line_out.emit(original_row, f"CRITICAL ERROR: {error_message}", "error")
                 overall_success = False
 
             self.job_done.emit(original_row, overall_success, error_message)
