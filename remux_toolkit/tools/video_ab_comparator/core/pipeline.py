@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import numpy as np
 import traceback
+import json
+import os
 from typing import Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -25,13 +27,15 @@ class ComparisonPipeline(QObject):
     progress = pyqtSignal(str, int)
     finished = pyqtSignal(dict)
 
-    def __init__(self, path_a: str, path_b: str, settings: dict):
+    def __init__(self, path_a: str, path_b: str, settings: dict, temp_dir: str = None):
         super().__init__()
         self.source_a = VideoSource(Path(path_a))
         self.source_b = VideoSource(Path(path_b))
         self.settings = settings
+        self.temp_dir = temp_dir
         self._lock = threading.Lock()
         self._stop_requested = False
+        self.chunk_metadata = []  # Store metadata for each chunk
 
     def _emit(self, msg: str, pc: int):
         try:
@@ -64,6 +68,16 @@ class ComparisonPipeline(QObject):
         chunk_duration = self.settings.get("analysis_chunk_duration", 2.0)
         chunk_results = {}
 
+        # Store chunk metadata with per-frame scores
+        chunk_meta = {
+            'chunk_index': chunk_idx,
+            'timestamp_a': float(ts_a),
+            'timestamp_b': float(ts_b),
+            'duration': float(chunk_duration),
+            'detector_scores': {},
+            'frame_scores': []  # NEW: Store per-frame detector scores
+        }
+
         try:
             frames_a = list(self.source_a.get_frame_iterator(ts_a, chunk_duration))
             frames_b = list(self.source_b.get_frame_iterator(ts_b, chunk_duration))
@@ -75,13 +89,51 @@ class ComparisonPipeline(QObject):
             min_frames = min(len(frames_a), len(frames_b))
             frames_a, frames_b = frames_a[:min_frames], frames_b[:min_frames]
 
+            # Initialize per-frame storage
+            for frame_idx in range(min_frames):
+                frame_ts_a = ts_a + (frame_idx * 0.1)  # 10fps = 0.1s per frame
+                frame_ts_b = ts_b + (frame_idx * 0.1)
+
+                chunk_meta['frame_scores'].append({
+                    'frame_index': frame_idx,
+                    'timestamp_a': float(frame_ts_a),
+                    'timestamp_b': float(frame_ts_b),
+                    'detectors': {}
+                })
+
+            # Run detectors - use BATCH mode to maintain compatibility
             for detector in detectors:
                 if self._stop_requested:
                     break
 
                 try:
+                    # Always run on full frame list for aggregate scores
                     a_res = detector.run(self.source_a, frames_a)
                     b_res = detector.run(self.source_b, frames_b)
+
+                    # For frame-based detectors, ALSO analyze each frame individually
+                    if self._is_frame_based_detector(detector):
+                        for frame_idx in range(min_frames):
+                            # Analyze single frame
+                            a_frame_res = detector.run(self.source_a, [frames_a[frame_idx]])
+                            b_frame_res = detector.run(self.source_b, [frames_b[frame_idx]])
+
+                            # Store in per-frame metadata
+                            chunk_meta['frame_scores'][frame_idx]['detectors'][detector.issue_name] = {
+                                'score_a': float(a_frame_res.get('score', -1)) if a_frame_res else -1,
+                                'score_b': float(b_frame_res.get('score', -1)) if b_frame_res else -1,
+                                'summary_a': a_frame_res.get('summary', '') if a_frame_res else '',
+                                'summary_b': b_frame_res.get('summary', '') if b_frame_res else ''
+                            }
+                    else:
+                        # For chunk-based detectors, store same score for all frames
+                        for frame_idx in range(min_frames):
+                            chunk_meta['frame_scores'][frame_idx]['detectors'][detector.issue_name] = {
+                                'score_a': float(a_res.get('score', -1)) if a_res else -1,
+                                'score_b': float(b_res.get('score', -1)) if b_res else -1,
+                                'summary_a': a_res.get('summary', '') if a_res else '',
+                                'summary_b': b_res.get('summary', '') if b_res else ''
+                            }
 
                     # Add timestamps
                     if a_res and 'worst_frame_timestamp' in a_res:
@@ -90,13 +142,58 @@ class ComparisonPipeline(QObject):
                         b_res['worst_frame_timestamp'] += ts_b
 
                     chunk_results[detector.issue_name] = {'a': a_res, 'b': b_res}
+
+                    # Store chunk-level aggregate scores
+                    chunk_meta['detector_scores'][detector.issue_name] = {
+                        'score_a': float(a_res.get('score', -1)) if a_res else -1,
+                        'score_b': float(b_res.get('score', -1)) if b_res else -1,
+                        'summary_a': a_res.get('summary', '') if a_res else '',
+                        'summary_b': b_res.get('summary', '') if b_res else ''
+                    }
+
                 except Exception as e:
                     print(f"Detector {detector.issue_name} failed on chunk {chunk_idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
 
         except Exception as e:
             print(f"Chunk {chunk_idx} analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # Save chunk metadata
+        with self._lock:
+            self.chunk_metadata.append(chunk_meta)
 
         return chunk_idx, chunk_results
+
+    def _is_frame_based_detector(self, detector) -> bool:
+        """Check if detector should analyze frames individually for per-frame scores."""
+        # These detectors can provide meaningful per-frame analysis
+        frame_based = [
+            'Color Banding', 'Ringing / Halos', 'Dot Crawl',
+            'Chroma Shift', 'Rainbowing / Cross-Color', 'Color Cast',
+            'Over-DNR / Waxiness', 'Excessive Sharpening',
+            'Ghosting / Blending', 'Compression Artifacts'
+        ]
+        return detector.issue_name in frame_based
+
+    def _save_chunk_metadata(self):
+        """Save chunk metadata to temp directory for later viewing."""
+        if not self.temp_dir:
+            return
+
+        try:
+            # Sort by chunk index
+            sorted_metadata = sorted(self.chunk_metadata, key=lambda x: x['chunk_index'])
+
+            metadata_path = os.path.join(self.temp_dir, 'chunk_metadata.json')
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(sorted_metadata, f, indent=2)
+
+            print(f"Saved chunk metadata with per-frame scores to {metadata_path}")
+        except Exception as e:
+            print(f"Failed to save chunk metadata: {e}")
 
     def run(self):
         try:
@@ -182,11 +279,14 @@ class ComparisonPipeline(QObject):
 
             # 5. Frame-based analysis
             num_chunks = self.settings.get('analysis_chunk_count', 8)
-            self._emit(f"Analyzing {num_chunks} chunks in parallel...", 35)
+            self._emit(f"Analyzing {num_chunks} chunks with per-frame detection...", 35)
 
             # Initialize issue storage
             for det in frame_detectors:
                 aggregated_issues[det.issue_name] = {'a': [], 'b': []}
+
+            # Clear chunk metadata for new run
+            self.chunk_metadata = []
 
             # Use ThreadPoolExecutor for parallel processing
             max_workers = min(4, num_chunks)  # Limit threads to avoid overwhelming system
@@ -219,8 +319,12 @@ class ComparisonPipeline(QObject):
                     progress = 35 + int(55 * (completed / num_chunks))
                     self._emit(f"Analyzed chunk {completed}/{num_chunks}", progress)
 
-            # 6. Compile results
-            self._emit("Finalizing report…", 90)
+            # 6. Save chunk metadata
+            self._emit("Saving per-frame metadata...", 92)
+            self._save_chunk_metadata()
+
+            # 7. Compile results
+            self._emit("Finalizing report…", 95)
             final_issues = self._compile_final_issues(aggregated_issues)
 
             # Calculate verdict
@@ -250,7 +354,8 @@ class ComparisonPipeline(QObject):
                 "alignment_drift_ratio": align.drift_ratio,
                 "alignment_confidence": align.confidence,
                 "verdict": verdict,
-                "issues": final_issues
+                "issues": final_issues,
+                "temp_dir": self.temp_dir
             })
 
         except Exception as e:

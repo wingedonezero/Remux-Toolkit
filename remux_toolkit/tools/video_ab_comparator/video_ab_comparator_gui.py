@@ -7,6 +7,7 @@ import numpy as np
 from .core.pipeline import ComparisonPipeline
 from .gui.results_widget import ResultsWidget
 from .gui.settings_dialog import SettingsDialog
+from .gui.detailed_comparison_widget import DetailedComparisonWidget
 from .video_ab_comparator_config import DEFAULTS
 
 class FrameLoader(QtCore.QObject):
@@ -19,12 +20,40 @@ class FrameLoader(QtCore.QObject):
 
     @QtCore.pyqtSlot(float, float)
     def load_frames(self, ts_a, ts_b):
-        """
-        A simplified and more robust method to load frames directly.
-        """
+        """Load frames for summary report (worst frames)."""
         frame_a = self.source_a.get_frame(ts_a, accurate=True)
         frame_b = self.source_b.get_frame(ts_b, accurate=True)
         self.frames_ready.emit(frame_a, frame_b, ts_a, ts_b)
+
+
+class ChunkFrameLoader(QtCore.QObject):
+    chunk_frames_ready = QtCore.pyqtSignal(int, int, object, object)
+
+    def __init__(self, source_a, source_b, chunk_data):
+        super().__init__()
+        self.source_a = source_a
+        self.source_b = source_b
+        self.chunk_data = chunk_data
+
+    @QtCore.pyqtSlot(int, int)
+    def load_chunk_frames(self, chunk_idx, frame_idx):
+        """Load specific frame from a chunk (frame-by-frame browsing)."""
+        if chunk_idx < 0 or chunk_idx >= len(self.chunk_data):
+            return
+
+        chunk = self.chunk_data[chunk_idx]
+        chunk_start_a = chunk['timestamp_a']
+        chunk_start_b = chunk['timestamp_b']
+
+        # Calculate timestamp for this specific frame (10fps = 0.1s per frame)
+        frame_offset = frame_idx * 0.1
+        ts_a = chunk_start_a + frame_offset
+        ts_b = chunk_start_b + frame_offset
+
+        frame_a = self.source_a.get_frame(ts_a, accurate=True)
+        frame_b = self.source_b.get_frame(ts_b, accurate=True)
+
+        self.chunk_frames_ready.emit(chunk_idx, frame_idx, frame_a, frame_b)
 
 
 class VideoABComparatorWidget(QtWidgets.QWidget):
@@ -38,6 +67,8 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.pipeline = None
         self.frame_loader_thread = None
         self.frame_loader = None
+        self.chunk_frame_loader_thread = None
+        self.chunk_frame_loader = None
         self.results_data = None
         self.settings = self.app_manager.load_config(self.tool_name, DEFAULTS)
         self._init_ui()
@@ -48,6 +79,11 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         input_layout = QtWidgets.QFormLayout(input_group)
         self.source_a_input = QtWidgets.QLineEdit()
         self.source_b_input = QtWidgets.QLineEdit()
+
+        # Load last used paths
+        self.source_a_input.setText(self.settings.get('source_a_path', ''))
+        self.source_b_input.setText(self.settings.get('source_b_path', ''))
+
         btn_a = QtWidgets.QPushButton("Browse...")
         btn_a.clicked.connect(lambda: self._select_file(self.source_a_input))
         btn_b = QtWidgets.QPushButton("Browse...")
@@ -57,6 +93,7 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         input_layout.addRow("Source A:", row_a)
         input_layout.addRow("Source B:", row_b)
         layout.addWidget(input_group)
+
         controls_layout = QtWidgets.QHBoxLayout()
         self.start_button = QtWidgets.QPushButton("Start Comparison")
         self.start_button.clicked.connect(self.start_comparison)
@@ -70,15 +107,22 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         controls_layout.addStretch()
         controls_layout.addWidget(self.export_button)
         layout.addLayout(controls_layout)
+
         self.results_tabs = QtWidgets.QTabWidget()
         self.results_widget = ResultsWidget()
+        self.detailed_comparison_widget = DetailedComparisonWidget()
         self.log_tab = QtWidgets.QTextEdit()
         self.log_tab.setReadOnly(True)
+
         self.results_tabs.addTab(self.results_widget, "Summary Report")
-        self.results_tabs.addTab(self.log_tab, "Detailed Log")
+        self.results_tabs.addTab(self.detailed_comparison_widget, "Frame-by-Frame")
+        self.results_tabs.addTab(self.log_tab, "Analysis Log")
         layout.addWidget(self.results_tabs, 1)
+
         self.progress_bar = QtWidgets.QProgressBar()
         layout.addWidget(self.progress_bar)
+
+        # Connect signals
         self.results_widget.scorecard_tree.itemClicked.connect(self.on_scorecard_item_clicked)
 
     def _select_file(self, line_edit):
@@ -130,12 +174,22 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         if not path_a or not path_b:
             self.log_tab.setText("Error: Please select both source files.")
             return
+
+        # Save paths to settings
+        self.settings['source_a_path'] = path_a
+        self.settings['source_b_path'] = path_b
+        self.app_manager.save_config(self.tool_name, self.settings)
+
         self.start_button.setEnabled(False)
         self.export_button.setEnabled(False)
         self.log_tab.clear()
         self.results_widget.clear()
+        self.detailed_comparison_widget.clear()
 
-        self.pipeline = ComparisonPipeline(path_a, path_b, self.settings)
+        # Get temp directory for this tool
+        temp_dir = self.app_manager.get_temp_dir(self.tool_name)
+
+        self.pipeline = ComparisonPipeline(path_a, path_b, self.settings, temp_dir)
 
         self.pipeline_thread = QtCore.QThread()
         self.pipeline.moveToThread(self.pipeline_thread)
@@ -152,7 +206,16 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.results_data = results
         self.log_tab.append("\n--- Analysis Complete ---")
         self.results_widget.populate(results)
+
+        # Setup frame loaders
         self._setup_frame_loader()
+
+        # Load detailed comparison data
+        temp_dir = results.get('temp_dir')
+        if temp_dir:
+            self.detailed_comparison_widget.load_chunk_data(temp_dir, results)
+            self._setup_chunk_frame_loader(temp_dir)
+
         self.results_tabs.setCurrentWidget(self.results_widget)
         self.progress_bar.setValue(100)
         self.start_button.setEnabled(True)
@@ -161,9 +224,11 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.pipeline_thread.wait()
 
     def _setup_frame_loader(self):
+        """Setup loader for summary report frames (worst frames)."""
         if self.frame_loader_thread and self.frame_loader_thread.isRunning():
             self.frame_loader_thread.quit()
             self.frame_loader_thread.wait()
+
         self.frame_loader = FrameLoader(self.pipeline.source_a, self.pipeline.source_b)
         self.frame_loader_thread = QtCore.QThread()
         self.frame_loader.moveToThread(self.frame_loader_thread)
@@ -171,25 +236,53 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.frame_loader.frames_ready.connect(self._update_frame_viewers)
         self.frame_loader_thread.start()
 
+    def _setup_chunk_frame_loader(self, temp_dir):
+        """Setup loader for detailed comparison frames (frame-by-frame browsing)."""
+        if self.chunk_frame_loader_thread and self.chunk_frame_loader_thread.isRunning():
+            self.chunk_frame_loader_thread.quit()
+            self.chunk_frame_loader_thread.wait()
+
+        # Load chunk data
+        import json
+        import os
+        chunk_metadata_path = os.path.join(temp_dir, "chunk_metadata.json")
+
+        if os.path.exists(chunk_metadata_path):
+            with open(chunk_metadata_path, 'r') as f:
+                chunk_data = json.load(f)
+
+            self.chunk_frame_loader = ChunkFrameLoader(
+                self.pipeline.source_a,
+                self.pipeline.source_b,
+                chunk_data
+            )
+            self.chunk_frame_loader_thread = QtCore.QThread()
+            self.chunk_frame_loader.moveToThread(self.chunk_frame_loader_thread)
+
+            # Connect signals
+            self.detailed_comparison_widget.request_chunk_frames.connect(
+                self.chunk_frame_loader.load_chunk_frames
+            )
+            self.chunk_frame_loader.chunk_frames_ready.connect(
+                self.detailed_comparison_widget.display_chunk_frames
+            )
+
+            self.chunk_frame_loader_thread.start()
+
     def on_scorecard_item_clicked(self, item, column):
-        print("\n--- DEBUG: Scorecard item clicked ---")
         if not self.pipeline or not self.results_data or not self.frame_loader:
-            print("DEBUG: Pipeline or results data not ready. Aborting.")
             return
 
         issue_name = item.parent().text(0) if item.parent() else item.text(0)
         issue_results = self.results_data.get("issues", {}).get(issue_name, {})
-        print(f"DEBUG: Clicked on metric: {issue_name}")
 
         ts_a = issue_results.get('a', {}).get('worst_frame_timestamp')
         if ts_a is None:
-            print("DEBUG: No 'worst_frame_timestamp' found for this metric.")
             self.results_widget.frame_a_label.setText("No specific frame\nfor this metric")
             self.results_widget.frame_b_label.setText("No specific frame\nfor this metric")
             return
 
         ts_b = self.results_widget.map_ts_b(ts_a)
-        print(f"DEBUG: Requesting frames at ts_a={ts_a:.3f}s and ts_b={ts_b:.3f}s")
         self.display_frames(ts_a, ts_b)
 
     def display_frames(self, ts_a, ts_b):
@@ -199,10 +292,6 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot(object, object, float, float)
     def _update_frame_viewers(self, frame_a, frame_b, ts_a, ts_b):
-        print("--- DEBUG: Updating frame viewers ---")
-        print(f"DEBUG: Received frame_a: {'Valid Frame' if frame_a is not None else 'None'}")
-        print(f"DEBUG: Received frame_b: {'Valid Frame' if frame_b is not None else 'None'}")
-
         if frame_a is not None:
             h, w, ch = frame_a.shape
             q_img = QtGui.QImage(frame_a.data, w, h, ch * w, QtGui.QImage.Format.Format_BGR888)
@@ -210,6 +299,7 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
             self.results_widget.frame_a_label.setPixmap(pixmap.scaled(self.results_widget.frame_a_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
         else:
             self.results_widget.frame_a_label.setText(f"Frame A\n(Could not load at {ts_a:.2f}s)")
+
         if frame_b is not None:
             h, w, ch = frame_b.shape
             q_img = QtGui.QImage(frame_b.data, w, h, ch * w, QtGui.QImage.Format.Format_BGR888)
@@ -220,8 +310,17 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
 
     def shutdown(self):
         if self.pipeline_thread and self.pipeline_thread.isRunning():
+            if self.pipeline:
+                self.pipeline.stop()
             self.pipeline_thread.quit()
             self.pipeline_thread.wait()
         if self.frame_loader_thread and self.frame_loader_thread.isRunning():
             self.frame_loader_thread.quit()
             self.frame_loader_thread.wait()
+        if self.chunk_frame_loader_thread and self.chunk_frame_loader_thread.isRunning():
+            self.chunk_frame_loader_thread.quit()
+            self.chunk_frame_loader_thread.wait()
+
+    def save_settings(self):
+        """Called when tab is closed to save settings."""
+        self.app_manager.save_config(self.tool_name, self.settings)
