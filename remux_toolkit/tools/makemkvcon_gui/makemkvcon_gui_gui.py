@@ -18,7 +18,7 @@ from .core.info_probe import InfoProbeWorker
 from .core.ripper import MakeMKVWorker
 from .gui.queue_tree import DropTree
 from .gui.details_panel import DetailsPanel
-from .gui.console_widget import FilterableConsole  # NEW
+from .gui.console_widget import FilterableConsole
 from .gui.prefs_dialog import PrefsDialog
 from .utils.makemkv_parser import duration_to_seconds, calculate_title_size_bytes, format_bytes_human
 
@@ -41,7 +41,6 @@ class MakeMKVConGUIWidget(QWidget):
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        # === NEW: Enhanced queue label with size estimate ===
         self.queue_label = QLabel("Queue: 0 jobs loaded")
         self.queue_label.setStyleSheet("font-weight:600;")
 
@@ -56,8 +55,6 @@ class MakeMKVConGUIWidget(QWidget):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
 
         self.details = DetailsPanel()
-
-        # === NEW: Use FilterableConsole instead of QTextEdit ===
         self.console = FilterableConsole()
 
         # Splitters
@@ -285,7 +282,6 @@ class MakeMKVConGUIWidget(QWidget):
         if err:
             self.console.append(f"ERROR for {job.child_name}: {err}", "error")
 
-        # Update queue label with size estimate
         self._refresh_queue_label()
 
     def _set_children_check(self, parent_item: QTreeWidgetItem, state: Qt.CheckState):
@@ -344,7 +340,6 @@ class MakeMKVConGUIWidget(QWidget):
         finally:
             self._updating_checks = False
 
-        # Update size estimate when selection changes
         self._refresh_queue_label()
 
     def _on_current_item_changed(self, cur, prev):
@@ -389,6 +384,18 @@ class MakeMKVConGUIWidget(QWidget):
             self.details.clear()
 
     def clear_all(self):
+        """Clear all jobs and reset state - FIXED to handle running queue"""
+        # Stop any running queue first
+        if self.running:
+            self.worker.stop()
+            if self.work_thread.isRunning():
+                self.work_thread.quit()
+                self.work_thread.wait(1000)
+            self.running = False
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+
+        # Clear everything
         self.tree.clear()
         self.jobs.clear()
         self.console.clear()
@@ -416,29 +423,28 @@ class MakeMKVConGUIWidget(QWidget):
         self.work_thread.start()
 
     def stop_queue(self):
+        """Stop the queue - FIXED to immediately reset state"""
         if self.running:
             self.worker.stop()
             self.console.append(">>> Stop requested…", "warning")
 
+            # Immediately reset state
+            self.running = False
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+
     def _calculate_estimated_size(self) -> int:
-        """
-        Calculate estimated total output size for selected titles
-        Returns size in bytes
-        """
+        """Calculate estimated total output size for selected titles"""
         total_bytes = 0
         for job in self.jobs:
             if not job.titles_info:
                 continue
 
-            # Get selected titles for this job
             if job.selected_titles is None:
-                # All titles selected
                 titles_to_count = job.titles_info.keys()
             elif job.selected_titles:
-                # Specific titles selected
                 titles_to_count = job.selected_titles
             else:
-                # No titles selected
                 continue
 
             for title_id in titles_to_count:
@@ -450,11 +456,8 @@ class MakeMKVConGUIWidget(QWidget):
     def _refresh_queue_label(self):
         """Update queue label with job count and estimated size"""
         job_count = len(self.jobs)
-
-        # Calculate estimated size
         estimated_bytes = self._calculate_estimated_size()
         size_str = format_bytes_human(estimated_bytes) if estimated_bytes > 0 else "Unknown"
-
         self.queue_label.setText(f"Queue: {job_count} jobs loaded (Estimated: {size_str})")
 
     def on_progress(self, row, pct):
@@ -491,7 +494,6 @@ class MakeMKVConGUIWidget(QWidget):
         if self.worker._stop or is_last:
             self.console.append("=== Queue finished ===", "info")
 
-            # Summary statistics
             success_count = sum(1 for success in self.completed_jobs.values() if success)
             total_count = len(self.completed_jobs)
 
