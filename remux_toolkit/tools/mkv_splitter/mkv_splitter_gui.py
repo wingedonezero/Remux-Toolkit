@@ -213,8 +213,16 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         )
         self.analysis_worker.result.connect(self._on_analysis_result)
         self.analysis_worker.error.connect(self._on_analysis_error)
-        self.analysis_worker.finished.connect(lambda: self._set_controls_enabled(True))
+        # --- FIX: Ensure the worker thread is cleaned up properly ---
+        self.analysis_worker.finished.connect(self._on_analysis_finished)
         self.analysis_worker.start()
+
+    def _on_analysis_finished(self):
+        """Safely cleans up the analysis worker thread."""
+        self._set_controls_enabled(True)
+        if self.analysis_worker:
+            self.analysis_worker.quit()
+            self.analysis_worker.wait()
 
     def _on_analysis_result(self, mkv_info, log, split_points):
         self.analysis_results = {'mkv_info': mkv_info, 'split_points': split_points}
@@ -282,7 +290,10 @@ class MKVSplitterWidget(QtWidgets.QWidget):
     def _on_execution_finished(self, return_code):
         self.log_output.appendPlainText(f"\n--- EXECUTION FINISHED (Exit Code: {return_code}) ---")
         self._set_controls_enabled(True)
-        self.execution_worker = None
+        # --- FIX: Properly quit and wait for the thread to terminate before it's garbage collected ---
+        if self.execution_worker:
+            self.execution_worker.quit()
+            self.execution_worker.wait()
 
     def _copy_command(self):
         if self.final_command_output.text():
@@ -307,10 +318,11 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.app_manager.save_config(self.tool_name, settings)
 
     def shutdown(self):
-        # Terminate any running workers on shutdown
+        # --- FIX: Use a graceful shutdown instead of terminate() ---
+        # Wait for any running workers to finish before shutting down.
         if self.analysis_worker and self.analysis_worker.isRunning():
-            self.analysis_worker.terminate()
+            self.analysis_worker.quit()
             self.analysis_worker.wait()
         if self.execution_worker and self.execution_worker.isRunning():
-            self.execution_worker.terminate()
+            self.execution_worker.quit()
             self.execution_worker.wait()
