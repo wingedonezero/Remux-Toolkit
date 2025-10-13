@@ -199,13 +199,33 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                             position,
                             current_chapter.get('title', '')
                         ):
-                            split_point = current_chapter['num'] + 1
+                            # Check if there's a preview/bumper chapter immediately after credits
+                            actual_split_index = j + 1
+                            episode_end_index = j
+
+                            # Look ahead for very short chapters (previews, bumpers) < 1 minute
+                            if j + 1 < len(chapter_durations):
+                                next_chapter = chapter_durations[j + 1]
+                                if next_chapter['duration_min'] < 1.0:
+                                    # Include the preview with this episode
+                                    actual_split_index = j + 2
+                                    episode_end_index = j + 1
+                                    analysis_log.append(f"  Found short preview/bumper at Chapter {next_chapter['num']} ({next_chapter['duration_min']:.2f} min). Including with episode.")
+
+                            split_point = actual_split_index + 1
                             if split_point > len(chapter_durations):
-                                continue
+                                # Last episode, no more splits needed
+                                episode_block_duration = sum(
+                                    c['duration_min']
+                                    for c in chapter_durations[start_chapter_index : episode_end_index + 1]
+                                )
+                                episode_durations.append(episode_block_duration)
+                                analysis_log.append(f"  Episode block [{start_chapter_index+1}-{chapter_durations[episode_end_index]['num']}] duration: {episode_block_duration:.2f} min.")
+                                break
 
                             episode_block_duration = sum(
                                 c['duration_min']
-                                for c in chapter_durations[start_chapter_index : j+1]
+                                for c in chapter_durations[start_chapter_index : episode_end_index + 1]
                             )
 
                             # Learn from first episode
@@ -223,13 +243,13 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                                 if variance > 3.0:
                                     analysis_log.append(f"  ⚙️ Adjusted tolerance to {adaptive_tolerance:.1f} min (variance: {variance:.1f})")
 
-                            analysis_log.append(f"  Episode block [{start_chapter_index+1}-{current_chapter['num']}] duration: {episode_block_duration:.2f} min.")
+                            analysis_log.append(f"  Episode block [{start_chapter_index+1}-{chapter_durations[episode_end_index]['num']}] duration: {episode_block_duration:.2f} min.")
 
                             title_hint = f" (detected via title: '{current_chapter.get('title', '')}')" if current_chapter.get('title') else ""
-                            analysis_log.append(f"  Found credits/ending at Chapter {current_chapter['num']}{title_hint}. Splitting after.")
+                            analysis_log.append(f"  Found credits/ending at Chapter {current_chapter['num']}{title_hint}. Splitting after Chapter {chapter_durations[episode_end_index]['num']}.")
 
                             split_points.append(split_point)
-                            start_chapter_index = j + 1
+                            start_chapter_index = episode_end_index + 1
                             current_sum = 0.0
                             found_episode_break = True
                             break
