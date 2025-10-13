@@ -54,8 +54,19 @@ def get_mkv_info(file_path):
             for atom in chapter_atoms:
                 start_time_element = atom.find('c:ChapterTimeStart', ns)
                 if start_time_element is None: start_time_element = atom.find('ChapterTimeStart')
+
+                # Also try to get chapter title
+                title_element = atom.find('c:ChapterDisplay/c:ChapterString', ns)
+                if title_element is None: title_element = atom.find('ChapterDisplay/ChapterString')
+                title = title_element.text if title_element is not None else ""
+
                 if start_time_element is not None:
-                    chapters.append({'properties': {'time_start': start_time_element.text}})
+                    chapters.append({
+                        'properties': {
+                            'time_start': start_time_element.text,
+                            'title': title
+                        }
+                    })
     except Exception as e:
         error_msg = f"An unexpected error occurred while parsing chapters: {e}"
     finally:
@@ -77,6 +88,55 @@ def parse_time(time_str):
         s, ms = s_ms_part, '0'
     return timedelta(hours=h, minutes=m, seconds=int(s), microseconds=int(ms))
 
+def is_likely_credits(duration_min, position, chapter_title=""):
+    """
+    Improved credits detection using duration, position, and title hints.
+
+    Args:
+        duration_min: Chapter duration in minutes
+        position: 'start', 'middle', or 'end' relative to main content
+        chapter_title: Optional chapter title for additional hints
+    """
+    title_lower = chapter_title.lower()
+
+    # Check title hints first
+    credit_keywords = ['credit', 'ending', 'ed', 'outro']
+    opening_keywords = ['opening', 'op', 'intro', 'preview']
+
+    if any(keyword in title_lower for keyword in credit_keywords):
+        return position == 'end' and 0.3 < duration_min < 3.0
+
+    if any(keyword in title_lower for keyword in opening_keywords):
+        return position == 'start' and 0.5 < duration_min < 4.0
+
+    # Duration-based detection
+    if position == 'end':
+        # Ending credits: typically 0.5-2.5 minutes
+        return 0.3 < duration_min < 2.5
+    elif position == 'start':
+        # Opening credits/recap: typically 0.5-4 minutes
+        return 0.5 < duration_min < 4.0
+    elif position == 'middle':
+        # Mid-roll credits (rare): very short
+        return duration_min < 0.5
+
+    return False
+
+def fuzzy_pattern_match(pattern1, pattern2, allowed_mismatches=1):
+    """
+    Compare two patterns allowing for minor variations.
+
+    Args:
+        pattern1: First pattern string
+        pattern2: Second pattern string
+        allowed_mismatches: Number of character differences allowed
+    """
+    if len(pattern1) != len(pattern2):
+        return False
+
+    mismatches = sum(c1 != c2 for c1, c2 in zip(pattern1, pattern2))
+    return mismatches <= allowed_mismatches
+
 def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target_duration):
     """Performs chapter analysis and returns the log and a list of split points."""
     analysis_log, split_points = [], []
@@ -90,6 +150,7 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
     chapter_durations = []
     for i, chapter in enumerate(chapters):
         start_time_str = chapter.get("properties", {}).get("time_start")
+        chapter_title = chapter.get("properties", {}).get("title", "")
         if not start_time_str: continue
         start_time = parse_time(start_time_str)
         end_time = container_duration
@@ -98,34 +159,174 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
             end_time_str = next_chapter.get("properties", {}).get("time_start")
             if end_time_str: end_time = parse_time(end_time_str)
         duration = end_time - start_time
-        chapter_durations.append({"num": i + 1, "duration_min": duration.total_seconds() / 60})
-        analysis_log.append(f"  Chapter {i+1:<3} | Duration: {duration.total_seconds() / 60:.2f} minutes")
+        chapter_durations.append({
+            "num": i + 1,
+            "duration_min": duration.total_seconds() / 60,
+            "title": chapter_title
+        })
+        title_display = f" ({chapter_title})" if chapter_title else ""
+        analysis_log.append(f"  Chapter {i+1:<3} | Duration: {duration.total_seconds() / 60:.2f} minutes{title_display}")
 
-    # (The rest of the analysis logic remains the same as before)
     if analysis_mode == "Time-based Grouping":
-        analysis_log.append(f"\n--- Step 2 (Time-based): Learning Episode Structure ---")
-        current_sum, start_chapter_index, learned_duration = 0.0, 0, target_duration
+        analysis_log.append(f"\n--- Step 2 (Time-based): Enhanced Episode Structure Learning ---")
+        current_sum = 0.0
+        start_chapter_index = 0
+        learned_duration = target_duration
+        episode_durations = []  # Track all episode durations for adaptive learning
+
+        # Adaptive tolerance based on learned variance
+        base_tolerance = 5.0
+        adaptive_tolerance = base_tolerance
+
         while start_chapter_index < len(chapter_durations):
             found_episode_break = False
+
             for i in range(start_chapter_index, len(chapter_durations)):
                 current_sum += chapter_durations[i]['duration_min']
-                if current_sum >= learned_duration - 5.0:
-                    for j in range(i, len(chapter_durations)):
-                        if chapter_durations[j]['duration_min'] < 1.0:
-                            split_point = chapter_durations[j]['num'] + 1
-                            if split_point > len(chapter_durations): continue
-                            episode_block_duration = sum(c['duration_min'] for c in chapter_durations[start_chapter_index : j+1])
+
+                # Check if we're near the expected episode length
+                if current_sum >= learned_duration - adaptive_tolerance:
+                    # Look ahead for credits/ending marker
+                    for j in range(i, min(len(chapter_durations), i + 5)):
+                        current_chapter = chapter_durations[j]
+
+                        # Determine position context
+                        position = 'end' if j > start_chapter_index else 'start'
+
+                        # Enhanced credits detection
+                        if is_likely_credits(
+                            current_chapter['duration_min'],
+                            position,
+                            current_chapter.get('title', '')
+                        ):
+                            split_point = current_chapter['num'] + 1
+                            if split_point > len(chapter_durations):
+                                continue
+
+                            episode_block_duration = sum(
+                                c['duration_min']
+                                for c in chapter_durations[start_chapter_index : j+1]
+                            )
+
+                            # Learn from first episode
                             if not split_points:
                                 learned_duration = episode_block_duration
                                 analysis_log.append(f"  ✅ Learned first episode duration: {learned_duration:.2f} min.")
-                            analysis_log.append(f"  Episode block [{start_chapter_index+1}-{chapter_durations[j]['num']}] duration: {episode_block_duration:.2f} min.")
-                            analysis_log.append(f"  Found credits at Chapter {chapter_durations[j]['num']}. Splitting after.")
+
+                            # Track episode durations for adaptive tolerance
+                            episode_durations.append(episode_block_duration)
+
+                            # Adjust tolerance based on variance
+                            if len(episode_durations) >= 2:
+                                variance = statistics.stdev(episode_durations)
+                                adaptive_tolerance = min(8.0, max(3.0, variance * 1.5))
+                                if variance > 3.0:
+                                    analysis_log.append(f"  ⚙️ Adjusted tolerance to {adaptive_tolerance:.1f} min (variance: {variance:.1f})")
+
+                            analysis_log.append(f"  Episode block [{start_chapter_index+1}-{current_chapter['num']}] duration: {episode_block_duration:.2f} min.")
+
+                            title_hint = f" (detected via title: '{current_chapter.get('title', '')}')" if current_chapter.get('title') else ""
+                            analysis_log.append(f"  Found credits/ending at Chapter {current_chapter['num']}{title_hint}. Splitting after.")
+
                             split_points.append(split_point)
-                            start_chapter_index, current_sum, found_episode_break = j + 1, 0.0, True
+                            start_chapter_index = j + 1
+                            current_sum = 0.0
+                            found_episode_break = True
                             break
-                    if found_episode_break: break
-            if not found_episode_break: break
-    else:
+
+                    if found_episode_break:
+                        break
+
+            if not found_episode_break:
+                break
+
+        # Summary of learned pattern
+        if episode_durations:
+            avg_duration = statistics.mean(episode_durations)
+            analysis_log.append(f"\n  📊 Episode Statistics:")
+            analysis_log.append(f"     Average Duration: {avg_duration:.2f} min")
+            if len(episode_durations) > 1:
+                analysis_log.append(f"     Standard Deviation: {statistics.stdev(episode_durations):.2f} min")
+
+    elif analysis_mode == "Pattern Recognition":
+        analysis_log.append(f"\n--- Step 2: Finding Main Content (Min Duration > {min_duration} min) ---")
+        long_chapters = [ch for ch in chapter_durations if ch["duration_min"] > min_duration]
+        if not long_chapters:
+            analysis_log.append(f"❌ No chapters found longer than {min_duration} minutes.")
+            return "\n".join(analysis_log), []
+        main_content_chapter_nums = {ch['num'] for ch in long_chapters}
+        analysis_log.append("Found potential main content chapters: " + ", ".join(str(n) for n in sorted(list(main_content_chapter_nums))))
+
+        analysis_log.append("\n--- Step 3 (Pattern Recognition): Enhanced Pattern Analysis ---")
+        signature = "".join(
+            "L" if ch['num'] in main_content_chapter_nums
+            else "S" if ch['duration_min'] < 2.5
+            else "M"
+            for ch in chapter_durations
+        )
+        analysis_log.append(f"  Generated Signature: {signature}")
+        analysis_log.append(f"  L = Long/Main content (>{min_duration} min)")
+        analysis_log.append(f"  M = Medium content (2.5-{min_duration} min)")
+        analysis_log.append(f"  S = Short content (<2.5 min)")
+
+        analysis_log.append("\n--- Step 4 (Pattern Recognition): Finding Repeating Pattern with Fuzzy Matching ---")
+        best_pattern = ""
+        best_coverage = 0
+        best_match_info = None
+
+        # Start from longer patterns first (more likely to be meaningful episodes)
+        # But not longer than half the signature
+        for p_len in range(min(len(signature) // 2, 10), 0, -1):
+            pattern = signature[:p_len]
+            num_consecutive_exact = 1
+            num_consecutive_fuzzy = 0
+
+            # Check for consecutive matches (with optional fuzzy matching)
+            for i in range(p_len, len(signature) - p_len + 1, p_len):
+                segment = signature[i:i+p_len]
+
+                if segment == pattern:
+                    num_consecutive_exact += 1
+                    if num_consecutive_fuzzy > 0:
+                        # Had fuzzy matches before, add them to exact count
+                        num_consecutive_exact += num_consecutive_fuzzy
+                        num_consecutive_fuzzy = 0
+                elif fuzzy_pattern_match(pattern, segment, allowed_mismatches=1):
+                    num_consecutive_fuzzy += 1
+                    analysis_log.append(f"  ~ Fuzzy match at position {i}: '{segment}' ≈ '{pattern}'")
+                else:
+                    # Pattern broken, stop looking
+                    break
+
+            # Total consecutive matches (exact + fuzzy before break)
+            total_consecutive = num_consecutive_exact + num_consecutive_fuzzy
+            coverage = (total_consecutive * p_len) / len(signature)
+
+            # Require at least 75% coverage AND at least 2 consecutive matches for confidence
+            if coverage >= 0.75 and total_consecutive >= 2:
+                # Prefer longer patterns over shorter ones if coverage is similar
+                if coverage > best_coverage or (coverage >= best_coverage * 0.95 and len(pattern) > len(best_pattern)):
+                    best_pattern = pattern
+                    best_coverage = coverage
+                    best_match_info = (total_consecutive, num_consecutive_exact, num_consecutive_fuzzy)
+                    analysis_log.append(f"  Candidate pattern: '{pattern}' (length: {len(best_pattern)}, consecutive matches: {total_consecutive}, coverage: {coverage*100:.1f}%)")
+                    # If we have excellent coverage with a good pattern length, accept it
+                    if coverage >= 0.90 and len(pattern) >= 3:
+                        break
+
+        if best_pattern:
+            analysis_log.append(f"  ✅ Found repeating pattern: '{best_pattern}' (length: {len(best_pattern)}, coverage: {best_coverage*100:.1f}%)")
+            if best_pattern.count('L') > 1:
+                analysis_log.append(f"  ℹ️ Pattern contains {best_pattern.count('L')} main content chapters. Treating as a single multi-part episode.")
+
+            # Generate split points based on pattern length
+            for i in range(len(best_pattern), len(signature), len(best_pattern)):
+                if i < len(signature):
+                    split_points.append(i + 1)
+        else:
+            analysis_log.append("  ❌ Could not determine a confident repeating pattern (even with fuzzy matching).")
+
+    elif analysis_mode == "Statistical Gap Analysis":
         analysis_log.append(f"\n--- Step 2: Finding Main Content (Min Duration > {min_duration} min) ---")
         long_chapters = [ch for ch in chapter_durations if ch["duration_min"] > min_duration]
         if not long_chapters:
@@ -135,61 +336,94 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         analysis_log.append("Found potential main content chapters: " + ", ".join(str(n) for n in sorted(list(main_content_chapter_nums))))
         sorted_main_nums = sorted(list(main_content_chapter_nums))
 
-        if analysis_mode == "Pattern Recognition":
-            analysis_log.append("\n--- Step 3 (Pattern Recognition): Creating Chapter Signature ---")
-            signature = "".join("L" if ch['num'] in main_content_chapter_nums else "S" if ch['duration_min'] < 2.5 else "M" for ch in chapter_durations)
-            analysis_log.append(f"  Generated Signature: {signature}")
-            analysis_log.append("\n--- Step 4 (Pattern Recognition): Finding Repeating Pattern ---")
-            best_pattern = ""
-            for p_len in range(1, len(signature) // 2 + 1):
-                pattern = signature[:p_len]; num_consecutive_matches = 1
-                for i in range(p_len, len(signature) - p_len + 1, p_len):
-                    if signature[i:i+p_len] == pattern: num_consecutive_matches += 1
-                    else: break
-                if (num_consecutive_matches * p_len) >= (len(signature) * 0.75): best_pattern = pattern; break
-            if best_pattern:
-                analysis_log.append(f"  ✅ Found repeating pattern: '{best_pattern}' (length: {len(best_pattern)})")
-                if best_pattern.count('L') > 1: analysis_log.append(f"  ℹ️ Pattern contains {best_pattern.count('L')} main content chapters. Treating as a single multi-part episode.")
-                for i in range(len(best_pattern), len(signature), len(best_pattern)):
-                    if i < len(signature): split_points.append(i + 1)
-            else: analysis_log.append("  ❌ Could not determine a confident repeating pattern.")
+        analysis_log.append("\n--- Step 3 (Statistical Gap): Finding Episode Gaps ---")
+        gaps = [
+            {
+                'duration': sum(ch['duration_min'] for ch in chapter_durations if ch['num'] >= sorted_main_nums[i]+1 and ch['num'] <= sorted_main_nums[i+1]-1),
+                'end_chapter': sorted_main_nums[i+1]-1
+            }
+            for i in range(len(sorted_main_nums)-1)
+            if sorted_main_nums[i+1] > sorted_main_nums[i]+1
+        ]
 
-        elif analysis_mode == "Statistical Gap Analysis":
-            analysis_log.append("\n--- Step 3 (Statistical Gap): Finding Episode Gaps ---")
-            gaps = [{'duration': sum(ch['duration_min'] for ch in chapter_durations if ch['num'] >= sorted_main_nums[i]+1 and ch['num'] <= sorted_main_nums[i+1]-1), 'end_chapter': sorted_main_nums[i+1]-1} for i in range(len(sorted_main_nums)-1) if sorted_main_nums[i+1] > sorted_main_nums[i]+1]
-            for gap in gaps: analysis_log.append(f"  Gap between main content {gap['end_chapter']-len(gap.get('chapters',[]))+1} & {gap['end_chapter']+2}. Duration: {gap['duration']:.2f} min.")
-            if len(gaps) > 1:
-                gap_durations = [g['duration'] for g in gaps]; mean_duration, stdev_duration = statistics.mean(gap_durations), statistics.stdev(gap_durations); threshold = mean_duration + (1.5 * stdev_duration)
-                analysis_log.append(f"\n  Gap stats: Avg={mean_duration:.2f}, StdDev={stdev_duration:.2f}"); analysis_log.append(f"  Identifying splits as gaps > threshold of {threshold:.2f} min.")
-                for gap in gaps:
-                    if gap['duration'] > threshold: split_points.append(gap['end_chapter'] + 1)
-            elif len(gaps) == 1: analysis_log.append("  Only one gap found, assuming it's the split point."); split_points.append(gaps[0]['end_chapter'] + 1)
+        for gap in gaps:
+            analysis_log.append(f"  Gap ending at chapter {gap['end_chapter']}. Duration: {gap['duration']:.2f} min.")
 
-        elif analysis_mode == "Shortest Chapter Analysis":
-            analysis_log.append("\n--- Step 3 (Shortest Chapter): Grouping and Finding Splits ---")
-            groups = []
-            if sorted_main_nums:
-                current_group = [sorted_main_nums[0]]
-                for i in range(1, len(sorted_main_nums)):
-                    if sorted_main_nums[i] == sorted_main_nums[i-1] + 1: current_group.append(sorted_main_nums[i])
-                    else: groups.append(current_group); current_group = [sorted_main_nums[i]]
-                groups.append(current_group)
-            analysis_log.append("Detected main content groups: " + str(groups))
-            if len(groups) > 1:
-                for i in range(len(groups) - 1):
-                    gap_chapters = [ch for ch in chapter_durations if ch['num'] in range(groups[i][-1] + 1, groups[i+1][0])]
-                    if not gap_chapters: continue
-                    min_duration_chapter = min(gap_chapters, key=lambda x: x['duration_min'])
-                    analysis_log.append(f"  Shortest chapter in gap is Chapter {min_duration_chapter['num']}"); split_points.append(min_duration_chapter['num'] + 1)
+        if len(gaps) > 1:
+            gap_durations = [g['duration'] for g in gaps]
+            mean_duration = statistics.mean(gap_durations)
+            stdev_duration = statistics.stdev(gap_durations)
+            threshold = mean_duration + (1.5 * stdev_duration)
 
-        elif analysis_mode == "Manual Episode Count":
-            analysis_log.append(f"\n--- Step 3 (Manual): Clustering into {num_episodes} Episodes ---")
-            gaps = [{'size': sorted_main_nums[i+1] - sorted_main_nums[i], 'start_chapter': sorted_main_nums[i+1]} for i in range(len(sorted_main_nums) - 1) if sorted_main_nums[i+1] - sorted_main_nums[i] > 1]
-            if len(gaps) < num_episodes - 1:
-                analysis_log.append(f"⚠️ Warning: Found {len(gaps)} gaps, but expected {num_episodes - 1}.")
-                split_points = [g['start_chapter'] for g in gaps]
-            else:
-                largest_gaps = sorted(gaps, key=lambda x: x['size'], reverse=True)[:num_episodes - 1]; split_points = sorted([g['start_chapter'] for g in largest_gaps])
+            analysis_log.append(f"\n  Gap stats: Avg={mean_duration:.2f}, StdDev={stdev_duration:.2f}")
+            analysis_log.append(f"  Identifying splits as gaps > threshold of {threshold:.2f} min.")
+
+            for gap in gaps:
+                if gap['duration'] > threshold:
+                    split_points.append(gap['end_chapter'] + 1)
+        elif len(gaps) == 1:
+            analysis_log.append("  Only one gap found, assuming it's the split point.")
+            split_points.append(gaps[0]['end_chapter'] + 1)
+
+    elif analysis_mode == "Shortest Chapter Analysis":
+        analysis_log.append(f"\n--- Step 2: Finding Main Content (Min Duration > {min_duration} min) ---")
+        long_chapters = [ch for ch in chapter_durations if ch["duration_min"] > min_duration]
+        if not long_chapters:
+            analysis_log.append(f"❌ No chapters found longer than {min_duration} minutes.")
+            return "\n".join(analysis_log), []
+        main_content_chapter_nums = {ch['num'] for ch in long_chapters}
+        analysis_log.append("Found potential main content chapters: " + ", ".join(str(n) for n in sorted(list(main_content_chapter_nums))))
+        sorted_main_nums = sorted(list(main_content_chapter_nums))
+
+        analysis_log.append("\n--- Step 3 (Shortest Chapter): Grouping and Finding Splits ---")
+        groups = []
+        if sorted_main_nums:
+            current_group = [sorted_main_nums[0]]
+            for i in range(1, len(sorted_main_nums)):
+                if sorted_main_nums[i] == sorted_main_nums[i-1] + 1:
+                    current_group.append(sorted_main_nums[i])
+                else:
+                    groups.append(current_group)
+                    current_group = [sorted_main_nums[i]]
+            groups.append(current_group)
+
+        analysis_log.append("Detected main content groups: " + str(groups))
+
+        if len(groups) > 1:
+            for i in range(len(groups) - 1):
+                gap_chapters = [ch for ch in chapter_durations if ch['num'] in range(groups[i][-1] + 1, groups[i+1][0])]
+                if not gap_chapters:
+                    continue
+                min_duration_chapter = min(gap_chapters, key=lambda x: x['duration_min'])
+                analysis_log.append(f"  Shortest chapter in gap is Chapter {min_duration_chapter['num']}")
+                split_points.append(min_duration_chapter['num'] + 1)
+
+    elif analysis_mode == "Manual Episode Count":
+        analysis_log.append(f"\n--- Step 2: Finding Main Content (Min Duration > {min_duration} min) ---")
+        long_chapters = [ch for ch in chapter_durations if ch["duration_min"] > min_duration]
+        if not long_chapters:
+            analysis_log.append(f"❌ No chapters found longer than {min_duration} minutes.")
+            return "\n".join(analysis_log), []
+        main_content_chapter_nums = {ch['num'] for ch in long_chapters}
+        analysis_log.append("Found potential main content chapters: " + ", ".join(str(n) for n in sorted(list(main_content_chapter_nums))))
+        sorted_main_nums = sorted(list(main_content_chapter_nums))
+
+        analysis_log.append(f"\n--- Step 3 (Manual): Clustering into {num_episodes} Episodes ---")
+        gaps = [
+            {
+                'size': sorted_main_nums[i+1] - sorted_main_nums[i],
+                'start_chapter': sorted_main_nums[i+1]
+            }
+            for i in range(len(sorted_main_nums) - 1)
+            if sorted_main_nums[i+1] - sorted_main_nums[i] > 1
+        ]
+
+        if len(gaps) < num_episodes - 1:
+            analysis_log.append(f"⚠️ Warning: Found {len(gaps)} gaps, but expected {num_episodes - 1}.")
+            split_points = [g['start_chapter'] for g in gaps]
+        else:
+            largest_gaps = sorted(gaps, key=lambda x: x['size'], reverse=True)[:num_episodes - 1]
+            split_points = sorted([g['start_chapter'] for g in largest_gaps])
 
     analysis_log.append("\n--- Final Step: Finalizing Split Points ---")
     analysis_log.append(f"Final split points (chapter numbers to split BEFORE): {split_points if split_points else 'None'}")
@@ -204,9 +438,12 @@ def generate_mkvmerge_command(input_file_path, split_points, track_mods):
 
     output_dir = os.path.dirname(input_file_path)
     base_name = os.path.splitext(os.path.basename(input_file_path))[0]
-    output_pattern = os.path.join(output_dir, f"{base_name} - S01E%%02d.mkv")
 
-    command_parts = ['mkvmerge', '-o', f'"{output_pattern}"']
+    # When splitting by chapters, mkvmerge automatically appends -001, -002, etc.
+    # Add a suffix to distinguish from the source file
+    output_path = os.path.join(output_dir, f"{base_name}-split.mkv")
+
+    command_parts = ['mkvmerge', '-o', f'"{output_path}"']
 
     # Add track language modifications
     for mod in track_mods:

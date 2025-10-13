@@ -11,8 +11,9 @@ from remux_toolkit.tools.ifo_reader.ifo_reader_gui import IfoReaderWidget
 from remux_toolkit.tools.video_ab_comparator.video_ab_comparator_gui import VideoABComparatorWidget
 from remux_toolkit.tools.delay_inspector.delay_inspector_gui import DelayInspectorWidget
 from remux_toolkit.tools.contact_sheet_maker.contact_sheet_maker_gui import ContactSheetMakerWidget
-# --- NEW IMPORT ---
 from remux_toolkit.tools.telecine_detector.telecine_detector_gui import TelecineDetectorWidget
+# --- NEW IMPORT ---
+from remux_toolkit.tools.media_info.media_info_gui import MediaInfoWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -57,9 +58,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_contact_sheet_maker_action = QtGui.QAction("Contact Sheet Maker", self)
         self.open_contact_sheet_maker_action.triggered.connect(self.open_contact_sheet_maker)
 
-        # --- NEW ACTION ---
         self.open_telecine_detector_action = QtGui.QAction("Telecine Detector", self)
         self.open_telecine_detector_action.triggered.connect(self.open_telecine_detector)
+
+        # --- NEW ACTION ---
+        self.open_media_info_action = QtGui.QAction("Media Info", self)
+        self.open_media_info_action.triggered.connect(self.open_media_info)
 
 
     def _create_menus(self):
@@ -74,8 +78,9 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_video_ab_comparator_action)
         tools_menu.addAction(self.open_delay_inspector_action)
         tools_menu.addAction(self.open_contact_sheet_maker_action)
-        # --- NEW MENU ITEM ---
         tools_menu.addAction(self.open_telecine_detector_action)
+        # --- NEW MENU ITEM ---
+        tools_menu.addAction(self.open_media_info_action)
 
 
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
@@ -87,8 +92,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_video_ab_comparator(self): self._open_tool("VideoABComparator", "Video A/B Comparator", VideoABComparatorWidget)
     def open_delay_inspector(self): self._open_tool("DelayInspector", "Delay Inspector", DelayInspectorWidget)
     def open_contact_sheet_maker(self): self._open_tool("ContactSheetMaker", "Contact Sheet Maker", ContactSheetMakerWidget)
-    # --- NEW METHOD ---
     def open_telecine_detector(self): self._open_tool("TelecineDetector", "Telecine Detector", TelecineDetectorWidget)
+    # --- NEW METHOD ---
+    def open_media_info(self): self._open_tool("MediaInfo", "Media Info", MediaInfoWidget)
 
 
     def _open_tool(self, tool_name, tab_title, widget_class):
