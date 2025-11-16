@@ -105,15 +105,15 @@ def is_likely_credits(duration_min, position, chapter_title=""):
     opening_keywords = ['opening', 'op', 'intro', 'preview', 'オープニング', 'ＯＰ']
 
     if any(keyword in title_lower for keyword in credit_keywords):
-        return position == 'end' and 0.3 < duration_min < 3.5
+        return position == 'end' and 0.3 < duration_min < 3.0
 
     if any(keyword in title_lower for keyword in opening_keywords):
         return position == 'start' and 0.5 < duration_min < 4.0
 
     # Duration-based detection (expanded ranges for longer credits)
     if position == 'end':
-        # Ending credits: expanded to 0.3-3.5 minutes for longer anime credits
-        return 0.3 < duration_min < 3.5
+        # Ending credits: expanded to 0.3-3.0 minutes for longer anime credits
+        return 0.3 < duration_min < 3.0
     elif position == 'start':
         # Opening credits/recap: typically 0.5-4 minutes
         return 0.5 < duration_min < 4.0
@@ -176,7 +176,7 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         episode_durations = []  # Track all episode durations for adaptive learning
 
         # Adaptive tolerance based on learned variance (increased range)
-        base_tolerance = 8.0  # Increased from 5.0 for better initial search
+        base_tolerance = 6.0  # Moderate increase from 5.0 for better initial search
         adaptive_tolerance = base_tolerance
         max_episode_length = target_duration * 2.0  # Safety limit to prevent runaway
 
@@ -209,8 +209,8 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
 
                 # Check if we're near the expected episode length (lower bound)
                 if current_sum >= learned_duration - adaptive_tolerance:
-                    # Increased lookahead from 5 to 10 chapters for better credits detection
-                    lookahead_window = min(10, len(chapter_durations) - i)
+                    # Increased lookahead from 5 to 8 chapters for better credits detection
+                    lookahead_window = min(8, len(chapter_durations) - i)
 
                     # Look ahead for credits/ending marker
                     for j in range(i, min(len(chapter_durations), i + lookahead_window)):
@@ -228,10 +228,10 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                             # Check for multiple short chapters after credits (previews, bumpers, etc.)
                             episode_end_index = j
 
-                            # Look ahead for ALL consecutive short chapters (< 2 min) after credits
+                            # Look ahead for ALL consecutive short chapters (< 1.5 min) after credits
                             # This handles double chapters at the end (credits + preview + bumper, etc.)
                             k = j + 1
-                            while k < len(chapter_durations) and chapter_durations[k]['duration_min'] < 2.0:
+                            while k < len(chapter_durations) and chapter_durations[k]['duration_min'] < 1.5:
                                 # Include short chapters with current episode
                                 episode_end_index = k
                                 chapter_type = "preview/bumper" if chapter_durations[k]['duration_min'] < 1.0 else "short chapter"
