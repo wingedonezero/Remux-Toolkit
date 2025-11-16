@@ -91,6 +91,7 @@ def parse_time(time_str):
 def is_likely_credits(duration_min, position, chapter_title=""):
     """
     Improved credits detection using duration, position, and title hints.
+    Supports English and Japanese keywords for anime/international content.
 
     Args:
         duration_min: Chapter duration in minutes
@@ -99,20 +100,20 @@ def is_likely_credits(duration_min, position, chapter_title=""):
     """
     title_lower = chapter_title.lower()
 
-    # Check title hints first
-    credit_keywords = ['credit', 'ending', 'ed', 'outro']
-    opening_keywords = ['opening', 'op', 'intro', 'preview']
+    # Check title hints first - English and Japanese keywords
+    credit_keywords = ['credit', 'ending', 'ed', 'outro', 'エンディング', 'ＥＤ']
+    opening_keywords = ['opening', 'op', 'intro', 'preview', 'オープニング', 'ＯＰ']
 
     if any(keyword in title_lower for keyword in credit_keywords):
-        return position == 'end' and 0.3 < duration_min < 3.0
+        return position == 'end' and 0.3 < duration_min < 3.5
 
     if any(keyword in title_lower for keyword in opening_keywords):
         return position == 'start' and 0.5 < duration_min < 4.0
 
-    # Duration-based detection
+    # Duration-based detection (expanded ranges for longer credits)
     if position == 'end':
-        # Ending credits: typically 0.5-2.5 minutes
-        return 0.3 < duration_min < 2.5
+        # Ending credits: expanded to 0.3-3.5 minutes for longer anime credits
+        return 0.3 < duration_min < 3.5
     elif position == 'start':
         # Opening credits/recap: typically 0.5-4 minutes
         return 0.5 < duration_min < 4.0
@@ -174,9 +175,10 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         learned_duration = target_duration
         episode_durations = []  # Track all episode durations for adaptive learning
 
-        # Adaptive tolerance based on learned variance
-        base_tolerance = 5.0
+        # Adaptive tolerance based on learned variance (increased range)
+        base_tolerance = 8.0  # Increased from 5.0 for better initial search
         adaptive_tolerance = base_tolerance
+        max_episode_length = target_duration * 2.0  # Safety limit to prevent runaway
 
         while start_chapter_index < len(chapter_durations):
             found_episode_break = False
@@ -184,10 +186,34 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
             for i in range(start_chapter_index, len(chapter_durations)):
                 current_sum += chapter_durations[i]['duration_min']
 
-                # Check if we're near the expected episode length
+                # Upper bound check: if we've gone way past target, force a split
+                if current_sum > max_episode_length:
+                    analysis_log.append(f"  ⚠️ Episode exceeded maximum length ({max_episode_length:.1f} min). Forcing split.")
+                    # Backtrack to find best split point (prefer credits/short chapters)
+                    best_split_idx = i
+                    for k in range(max(start_chapter_index, i - 5), i):
+                        if chapter_durations[k]['duration_min'] < 3.0:  # Short chapter (likely credits)
+                            best_split_idx = k
+                            break
+
+                    episode_block_duration = sum(
+                        c['duration_min']
+                        for c in chapter_durations[start_chapter_index : best_split_idx + 1]
+                    )
+                    episode_durations.append(episode_block_duration)
+                    split_points.append(best_split_idx + 2)  # Split after the short chapter
+                    start_chapter_index = best_split_idx + 1
+                    current_sum = 0.0
+                    found_episode_break = True
+                    break
+
+                # Check if we're near the expected episode length (lower bound)
                 if current_sum >= learned_duration - adaptive_tolerance:
+                    # Increased lookahead from 5 to 10 chapters for better credits detection
+                    lookahead_window = min(10, len(chapter_durations) - i)
+
                     # Look ahead for credits/ending marker
-                    for j in range(i, min(len(chapter_durations), i + 5)):
+                    for j in range(i, min(len(chapter_durations), i + lookahead_window)):
                         current_chapter = chapter_durations[j]
 
                         # Determine position context
@@ -199,20 +225,21 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                             position,
                             current_chapter.get('title', '')
                         ):
-                            # Check if there's a preview/bumper chapter immediately after credits
-                            actual_split_index = j + 1
+                            # Check for multiple short chapters after credits (previews, bumpers, etc.)
                             episode_end_index = j
 
-                            # Look ahead for very short chapters (previews, bumpers) < 1 minute
-                            if j + 1 < len(chapter_durations):
-                                next_chapter = chapter_durations[j + 1]
-                                if next_chapter['duration_min'] < 1.0:
-                                    # Include the preview with this episode
-                                    actual_split_index = j + 2
-                                    episode_end_index = j + 1
-                                    analysis_log.append(f"  Found short preview/bumper at Chapter {next_chapter['num']} ({next_chapter['duration_min']:.2f} min). Including with episode.")
+                            # Look ahead for ALL consecutive short chapters (< 2 min) after credits
+                            # This handles double chapters at the end (credits + preview + bumper, etc.)
+                            k = j + 1
+                            while k < len(chapter_durations) and chapter_durations[k]['duration_min'] < 2.0:
+                                # Include short chapters with current episode
+                                episode_end_index = k
+                                chapter_type = "preview/bumper" if chapter_durations[k]['duration_min'] < 1.0 else "short chapter"
+                                analysis_log.append(f"  Found {chapter_type} at Chapter {chapter_durations[k]['num']} ({chapter_durations[k]['duration_min']:.2f} min). Including with episode.")
+                                k += 1
 
-                            split_point = actual_split_index + 1
+                            # Split point is AFTER all the short chapters
+                            split_point = episode_end_index + 2  # +1 for index, +1 to split BEFORE next chapter
                             if split_point > len(chapter_durations):
                                 # Last episode, no more splits needed
                                 episode_block_duration = sum(
@@ -236,10 +263,10 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                             # Track episode durations for adaptive tolerance
                             episode_durations.append(episode_block_duration)
 
-                            # Adjust tolerance based on variance
+                            # Adjust tolerance based on variance (increased max to 12.0 for variable content)
                             if len(episode_durations) >= 2:
                                 variance = statistics.stdev(episode_durations)
-                                adaptive_tolerance = min(8.0, max(3.0, variance * 1.5))
+                                adaptive_tolerance = min(12.0, max(3.0, variance * 1.5))
                                 if variance > 3.0:
                                     analysis_log.append(f"  ⚙️ Adjusted tolerance to {adaptive_tolerance:.1f} min (variance: {variance:.1f})")
 
@@ -248,8 +275,12 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                             title_hint = f" (detected via title: '{current_chapter.get('title', '')}')" if current_chapter.get('title') else ""
                             analysis_log.append(f"  Found credits/ending at Chapter {current_chapter['num']}{title_hint}. Splitting after Chapter {chapter_durations[episode_end_index]['num']}.")
 
+                            # Validate episode length is reasonable (not too short)
+                            if episode_block_duration < target_duration * 0.5:
+                                analysis_log.append(f"  ⚠️ Warning: Episode duration ({episode_block_duration:.2f} min) is less than 50% of target ({target_duration:.2f} min).")
+
                             split_points.append(split_point)
-                            start_chapter_index = episode_end_index + 1
+                            start_chapter_index = episode_end_index + 1  # Next episode starts after all short chapters
                             current_sum = 0.0
                             found_episode_break = True
                             break
