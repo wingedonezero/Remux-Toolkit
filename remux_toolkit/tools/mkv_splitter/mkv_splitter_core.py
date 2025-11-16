@@ -200,7 +200,6 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                             current_chapter.get('title', '')
                         ):
                             # Check if there's a preview/bumper chapter immediately after credits
-                            actual_split_index = j + 1
                             episode_end_index = j
 
                             # Look ahead for very short chapters (previews, bumpers) < 1 minute
@@ -208,11 +207,11 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                                 next_chapter = chapter_durations[j + 1]
                                 if next_chapter['duration_min'] < 1.0:
                                     # Include the preview with this episode
-                                    actual_split_index = j + 2
                                     episode_end_index = j + 1
                                     analysis_log.append(f"  Found short preview/bumper at Chapter {next_chapter['num']} ({next_chapter['duration_min']:.2f} min). Including with episode.")
 
-                            split_point = actual_split_index + 1
+                            # Use actual chapter number, not array index
+                            split_point = chapter_durations[episode_end_index]['num'] + 1
                             if split_point > len(chapter_durations):
                                 # Last episode, no more splits needed
                                 episode_block_duration = sum(
