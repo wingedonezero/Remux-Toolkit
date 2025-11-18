@@ -591,16 +591,25 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
             start_time = _ms_to_timestamp(trimmed_start_ms)
             end_time = _ms_to_timestamp(trimmed_end_ms)
 
-            # mkvmerge command to extract this segment
-            # The parts: syntax extracts the specified range at keyframe boundaries
+            # Use --split timestamps: which respects exact keyframe positions
+            # This creates multiple files: original name + "-001", "-002", etc.
+            # We want the SECOND file (after first split, before second split)
+            temp_split_base = f"temp_split_f{file_idx}_s{seg_idx}"
+
+            # Split at start_time and end_time
+            # This creates: temp_split_...-001.mkv (before start), -002.mkv (our segment), -003.mkv (after end)
             cmd = [
                 'mkvmerge',
-                '-o', f'"{temp_file}"',
-                '--split', f'parts:{start_time}-{end_time}',
+                '-o', f'"{temp_split_base}.mkv"',
+                '--split', f'timestamps:{start_time},{end_time}',
                 f'"{target_path}"'
             ]
-
             commands.append(' '.join(cmd))
+
+            # After splitting, rename the middle piece to our target temp file
+            # The -002 file is what we want (between the two timestamps)
+            rename_cmd = f'mv "{temp_split_base}-002.mkv" "{temp_file}" && rm -f "{temp_split_base}"-*.mkv'
+            commands.append(rename_cmd)
 
     # Generate final merge command
     if temp_files:
