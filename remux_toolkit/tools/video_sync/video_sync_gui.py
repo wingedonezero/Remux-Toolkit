@@ -568,7 +568,8 @@ class VideoSyncWidget(QtWidgets.QWidget):
             target_paths,
             output_path,
             trim_end_buffer_ms=int(trim_end_buffer_sec * 1000),
-            trim_start_buffer_ms=int(trim_start_buffer_sec * 1000)
+            trim_start_buffer_ms=int(trim_start_buffer_sec * 1000),
+            use_keyframe_detection=True  # Use exact keyframe positions
         )
 
         self._clear_log()
