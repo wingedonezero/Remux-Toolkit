@@ -559,8 +559,18 @@ class VideoSyncWidget(QtWidgets.QWidget):
             item = self.target_list.item(i)
             target_paths.append(item.data(QtCore.Qt.ItemDataRole.UserRole))
 
-        # Generate commands
-        commands, temp_files = core.generate_alignment_commands(self.segment_map, target_paths, output_path)
+        # Generate commands with trim buffers
+        trim_end_buffer_sec = config.DEFAULTS.get('trim_end_buffer_sec', 5.0)
+        trim_start_buffer_sec = config.DEFAULTS.get('trim_start_buffer_sec', 0.0)
+
+        commands, temp_files = core.generate_alignment_commands(
+            self.segment_map,
+            target_paths,
+            output_path,
+            trim_end_buffer_ms=int(trim_end_buffer_sec * 1000),
+            trim_start_buffer_ms=int(trim_start_buffer_sec * 1000),
+            use_keyframe_detection=True  # Use exact keyframe positions
+        )
 
         self._clear_log()
         self._log("Starting alignment operation...")

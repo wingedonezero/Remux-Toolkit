@@ -468,10 +468,88 @@ def _analyze_target_sequential(ref_audio, target_audio, sample_rate, ref_start_m
     return segments, best_offset, ""
 
 
-def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str], output_path: str):
+def find_nearest_keyframe(file_path, timestamp_ms, search_window_ms=5000):
+    """
+    Find the nearest keyframe to a given timestamp using ffprobe.
+
+    Args:
+        file_path: Path to video file
+        timestamp_ms: Target timestamp in milliseconds
+        search_window_ms: How far to search before/after (default 5000ms = 5s)
+
+    Returns: (keyframe_timestamp_ms, error_message)
+    """
+    try:
+        timestamp_sec = timestamp_ms / 1000.0
+
+        # Use ffprobe to get keyframes around the target timestamp
+        # Read from a window around the target
+        start_time = max(0, timestamp_sec - search_window_ms / 1000.0)
+        duration = search_window_ms * 2 / 1000.0
+
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-ss', str(start_time),
+            '-t', str(duration),
+            '-select_streams', 'v:0',
+            '-show_entries', 'frame=pts_time,key_frame',
+            '-of', 'csv=p=0',
+            file_path
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            return timestamp_ms, f"ffprobe error: {result.stderr}"
+
+        # Parse output to find keyframes
+        keyframes = []
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            parts = line.split(',')
+            if len(parts) == 2:
+                pts_time_str, key_frame = parts
+                if key_frame == '1':  # Is a keyframe
+                    try:
+                        pts_time = float(pts_time_str)
+                        keyframes.append(pts_time * 1000)  # Convert to ms
+                    except ValueError:
+                        continue
+
+        if not keyframes:
+            return timestamp_ms, "No keyframes found in search window"
+
+        # Find the keyframe closest to our target
+        closest_keyframe = min(keyframes, key=lambda kf: abs(kf - timestamp_ms))
+
+        return int(closest_keyframe), ""
+
+    except subprocess.TimeoutExpired:
+        return timestamp_ms, "ffprobe timed out"
+    except Exception as e:
+        return timestamp_ms, f"Error finding keyframe: {e}"
+
+
+def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str], output_path: str,
+                               trim_end_buffer_ms=5000, trim_start_buffer_ms=0, use_keyframe_detection=True):
     """
     Generate mkvmerge commands to create the aligned video.
-    Returns: List of command strings
+
+    Args:
+        segment_map: The segment mapping from analysis
+        target_paths: List of target file paths
+        output_path: Output file path
+        trim_end_buffer_ms: Milliseconds to trim from end of segments (default 5000ms = 5s)
+        trim_start_buffer_ms: Milliseconds to trim from start of segments (default 0ms)
+
+    Returns: List of command strings, List of temp files
     """
     commands = []
     temp_files = []
@@ -493,11 +571,28 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
             temp_file = f"temp_f{file_idx}_s{seg_idx}.mkv"
             temp_files.append(temp_file)
 
-            # Convert ms to timestamps
-            start_time = _ms_to_timestamp(segment.target_start_ms)
-            end_time = _ms_to_timestamp(segment.target_end_ms)
+            # Apply trim buffers to get approximate boundaries
+            trimmed_start_ms = max(0, segment.target_start_ms - trim_start_buffer_ms)
+            trimmed_end_ms = max(trimmed_start_ms + 1000, segment.target_end_ms - trim_end_buffer_ms)
+
+            # If keyframe detection is enabled, find the exact nearest keyframes
+            if use_keyframe_detection:
+                exact_start_ms, start_error = find_nearest_keyframe(target_path, trimmed_start_ms)
+                exact_end_ms, end_error = find_nearest_keyframe(target_path, trimmed_end_ms)
+
+                if not start_error and not end_error:
+                    # Use exact keyframe positions
+                    trimmed_start_ms = exact_start_ms
+                    trimmed_end_ms = exact_end_ms
+                # If keyframe detection fails, fall back to approximate times
+
+            # Convert ms to timestamps with FULL precision (not rounded)
+            # This ensures frame-accurate cuts
+            start_time = _ms_to_timestamp(trimmed_start_ms)
+            end_time = _ms_to_timestamp(trimmed_end_ms)
 
             # mkvmerge command to extract this segment
+            # The parts: syntax extracts the specified range at keyframe boundaries
             cmd = [
                 'mkvmerge',
                 '-o', f'"{temp_file}"',
@@ -515,16 +610,10 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
         merge_cmd.append(f'"{temp_files[0]}"')
 
         # Subsequent files with + operator
+        # When using exact keyframe cuts, no audio sync correction is needed
+        # The segments should join seamlessly at keyframe boundaries
         for temp_file in temp_files[1:]:
-            # Apply offset correction if needed
-            avg_offset = segment_map.global_offset_ms
-            if abs(avg_offset) > 10:  # Only apply if offset > 10ms
-                # The --sync flag must come BEFORE the file it applies to
-                merge_cmd.append('--sync')
-                merge_cmd.append(f'0:{-avg_offset}')
-                merge_cmd.append(f'+"{temp_file}"')
-            else:
-                merge_cmd.append(f'+"{temp_file}"')
+            merge_cmd.append(f'+"{temp_file}"')
 
         commands.append(' '.join(merge_cmd))
 
