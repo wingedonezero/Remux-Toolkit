@@ -519,7 +519,10 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
             # Apply offset correction if needed
             avg_offset = segment_map.global_offset_ms
             if abs(avg_offset) > 10:  # Only apply if offset > 10ms
-                merge_cmd.append(f'[ --sync 0:{-avg_offset} +"{temp_file}" ]')
+                # The --sync flag must come BEFORE the file it applies to
+                merge_cmd.append('--sync')
+                merge_cmd.append(f'0:{-avg_offset}')
+                merge_cmd.append(f'+"{temp_file}"')
             else:
                 merge_cmd.append(f'+"{temp_file}"')
 
