@@ -15,6 +15,7 @@ from remux_toolkit.tools.telecine_detector.telecine_detector_gui import Telecine
 # --- NEW IMPORT ---
 from remux_toolkit.tools.media_info.media_info_gui import MediaInfoWidget
 from remux_toolkit.tools.mkv_combiner.mkv_combiner_gui import MKVCombinerWidget
+from remux_toolkit.tools.video_sync.video_sync_gui import VideoSyncWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -69,6 +70,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_mkv_combiner_action = QtGui.QAction("MKV Combiner", self)
         self.open_mkv_combiner_action.triggered.connect(self.open_mkv_combiner)
 
+        self.open_video_sync_action = QtGui.QAction("Video Sync (Audio Alignment)", self)
+        self.open_video_sync_action.triggered.connect(self.open_video_sync)
+
 
     def _create_menus(self):
         menu_bar = self.menuBar()
@@ -86,6 +90,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- NEW MENU ITEM ---
         tools_menu.addAction(self.open_media_info_action)
         tools_menu.addAction(self.open_mkv_combiner_action)
+        tools_menu.addAction(self.open_video_sync_action)
 
 
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
@@ -101,6 +106,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # --- NEW METHOD ---
     def open_media_info(self): self._open_tool("MediaInfo", "Media Info", MediaInfoWidget)
     def open_mkv_combiner(self): self._open_tool("MKVCombiner", "MKV Combiner", MKVCombinerWidget)
+    def open_video_sync(self): self._open_tool("VideoSync", "Video Sync", VideoSyncWidget)
 
 
     def _open_tool(self, tool_name, tab_title, widget_class):

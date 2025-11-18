@@ -1,0 +1,16 @@
+"""
+Configuration for Video Sync Tool
+"""
+
+DEFAULTS = {
+    'reference_file': '',
+    'target_files': [],
+    'output_directory': '',
+    'output_filename': 'aligned_output.mkv',
+    'audio_language': 'jpn',  # Default to Japanese
+    'correlation_threshold': 0.7,  # Minimum confidence for segment match
+    'chunk_duration_sec': 5.0,  # Chunk size for coarse analysis
+    'fine_precision_ms': 100,  # Precision for fine alignment at boundaries
+    'min_segment_duration_sec': 10.0,  # Minimum segment length to keep
+    'max_offset_ms': 500,  # Maximum expected timing offset between parts
+}
