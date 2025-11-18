@@ -750,20 +750,47 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
                     trimmed_end_ms = exact_end_ms
                     # Visual match found - use this exact timestamp
 
-            # Step 2: Find keyframe AFTER the matching frame
-            # This replicates the manual process: find matching frame, then cut at next keyframe
+            # Step 2: Find keyframe at or after the matching frame, then go back one frame
+            # This replicates the manual process:
+            # - Find the keyframe where you want to cut
+            # - Go back one frame from that keyframe
+            # - Use that timestamp in --split timestamps:
+            # - mkvmerge cuts AFTER that timestamp, which is exactly at the keyframe
             if use_keyframe_detection:
-                exact_start_ms, start_error = find_nearest_keyframe(
-                    target_path, trimmed_start_ms, search_direction='after'
-                )
-                exact_end_ms, end_error = find_nearest_keyframe(
-                    target_path, trimmed_end_ms, search_direction='after'
-                )
+                # Get frame rate to calculate frame duration
+                cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-select_streams', 'v:0',
+                    '-show_entries', 'stream=r_frame_rate',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    target_path
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
 
-                if not start_error and not end_error:
-                    # Use exact keyframe positions
-                    trimmed_start_ms = exact_start_ms
-                    trimmed_end_ms = exact_end_ms
+                if result.returncode == 0:
+                    fps_str = result.stdout.strip()
+                    if '/' in fps_str:
+                        num, den = fps_str.split('/')
+                        fps = float(num) / float(den)
+                    else:
+                        fps = float(fps_str)
+
+                    frame_duration_ms = 1000.0 / fps
+
+                    # Find keyframe at or after the matching frame
+                    keyframe_start_ms, start_error = find_nearest_keyframe(
+                        target_path, trimmed_start_ms, search_direction='after'
+                    )
+                    keyframe_end_ms, end_error = find_nearest_keyframe(
+                        target_path, trimmed_end_ms, search_direction='after'
+                    )
+
+                    if not start_error and not end_error:
+                        # Go back one frame from the keyframe
+                        # mkvmerge --split timestamps: cuts AFTER the specified time
+                        # So to cut AT the keyframe, specify one frame before it
+                        trimmed_start_ms = int(keyframe_start_ms - frame_duration_ms)
+                        trimmed_end_ms = int(keyframe_end_ms - frame_duration_ms)
                 # If keyframe detection fails, fall back to approximate times
 
             # Convert ms to timestamps with FULL precision (not rounded)
