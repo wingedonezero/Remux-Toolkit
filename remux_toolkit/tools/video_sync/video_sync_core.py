@@ -504,7 +504,9 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
 
             # Apply trim buffers to be conservative about boundaries
             # This helps avoid including credits/intros that audio correlation might miss
-            trimmed_start_ms = max(0, segment.target_start_ms + trim_start_buffer_ms)
+            # Start buffer: SUBTRACT to skip intros (e.g., detected 01:35, want 01:34 = subtract 1s)
+            # End buffer: SUBTRACT to skip credits (e.g., detected 17:40, want 17:37 = subtract 3s)
+            trimmed_start_ms = max(0, segment.target_start_ms - trim_start_buffer_ms)
             trimmed_end_ms = max(trimmed_start_ms + 1000, segment.target_end_ms - trim_end_buffer_ms)
 
             # Convert ms to timestamps
