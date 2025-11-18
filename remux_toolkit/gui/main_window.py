@@ -14,6 +14,7 @@ from remux_toolkit.tools.contact_sheet_maker.contact_sheet_maker_gui import Cont
 from remux_toolkit.tools.telecine_detector.telecine_detector_gui import TelecineDetectorWidget
 # --- NEW IMPORT ---
 from remux_toolkit.tools.media_info.media_info_gui import MediaInfoWidget
+from remux_toolkit.tools.mkv_combiner.mkv_combiner_gui import MKVCombinerWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -65,6 +66,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_media_info_action = QtGui.QAction("Media Info", self)
         self.open_media_info_action.triggered.connect(self.open_media_info)
 
+        self.open_mkv_combiner_action = QtGui.QAction("MKV Combiner", self)
+        self.open_mkv_combiner_action.triggered.connect(self.open_mkv_combiner)
+
 
     def _create_menus(self):
         menu_bar = self.menuBar()
@@ -81,6 +85,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_telecine_detector_action)
         # --- NEW MENU ITEM ---
         tools_menu.addAction(self.open_media_info_action)
+        tools_menu.addAction(self.open_mkv_combiner_action)
 
 
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
@@ -95,6 +100,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_telecine_detector(self): self._open_tool("TelecineDetector", "Telecine Detector", TelecineDetectorWidget)
     # --- NEW METHOD ---
     def open_media_info(self): self._open_tool("MediaInfo", "Media Info", MediaInfoWidget)
+    def open_mkv_combiner(self): self._open_tool("MKVCombiner", "MKV Combiner", MKVCombinerWidget)
 
 
     def _open_tool(self, tool_name, tab_title, widget_class):
