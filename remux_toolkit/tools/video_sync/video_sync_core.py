@@ -468,10 +468,19 @@ def _analyze_target_sequential(ref_audio, target_audio, sample_rate, ref_start_m
     return segments, best_offset, ""
 
 
-def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str], output_path: str):
+def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str], output_path: str,
+                               trim_end_buffer_ms=5000, trim_start_buffer_ms=0):
     """
     Generate mkvmerge commands to create the aligned video.
-    Returns: List of command strings
+
+    Args:
+        segment_map: The segment mapping from analysis
+        target_paths: List of target file paths
+        output_path: Output file path
+        trim_end_buffer_ms: Milliseconds to trim from end of segments (default 5000ms = 5s)
+        trim_start_buffer_ms: Milliseconds to trim from start of segments (default 0ms)
+
+    Returns: List of command strings, List of temp files
     """
     commands = []
     temp_files = []
@@ -493,11 +502,19 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
             temp_file = f"temp_f{file_idx}_s{seg_idx}.mkv"
             temp_files.append(temp_file)
 
+            # Apply trim buffers to be conservative about boundaries
+            # This helps avoid including credits/intros that audio correlation might miss
+            trimmed_start_ms = max(0, segment.target_start_ms + trim_start_buffer_ms)
+            trimmed_end_ms = max(trimmed_start_ms + 1000, segment.target_end_ms - trim_end_buffer_ms)
+
             # Convert ms to timestamps
-            start_time = _ms_to_timestamp(segment.target_start_ms)
-            end_time = _ms_to_timestamp(segment.target_end_ms)
+            # Note: mkvmerge --split parts: will automatically snap to keyframes
+            # This is lossless and necessary for proper video cuts
+            start_time = _ms_to_timestamp(trimmed_start_ms)
+            end_time = _ms_to_timestamp(trimmed_end_ms)
 
             # mkvmerge command to extract this segment
+            # The parts: syntax extracts the specified range at keyframe boundaries
             cmd = [
                 'mkvmerge',
                 '-o', f'"{temp_file}"',
