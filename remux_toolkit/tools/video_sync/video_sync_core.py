@@ -300,157 +300,170 @@ def find_matching_segments(reference_path, target_paths, audio_language, chunk_d
 def _analyze_target_sequential(ref_audio, target_audio, sample_rate, ref_start_ms, ref_duration_ms,
                               target_duration_ms, chunk_duration_sec, threshold, target_idx, progress_callback):
     """
-    Analyze target file using sequential scanning approach:
-    1. Find initial offset using correlation
-    2. Scan through target sequentially
-    3. Build list of matching segments
+    NEW APPROACH: Scan through REFERENCE timeline and find where each part exists in target.
+
+    1. Take chunks from reference sequentially
+    2. Search for each chunk in the target file
+    3. When found, note the offset and continue
+    4. When not found, there's a gap (extra content in target to skip)
+    5. Build segments showing: ref_time -> target_time mappings
 
     Returns: (list of SegmentMatch, offset_ms, error_message)
     """
     chunk_samples = int(chunk_duration_sec * sample_rate)
     ref_start_sample = int((ref_start_ms / 1000.0) * sample_rate)
+    ref_samples = len(ref_audio)
+    target_samples = len(target_audio)
 
     if progress_callback:
-        progress_callback("  Step 1: Finding initial offset...")
+        progress_callback("  Step 1: Finding initial match point...")
 
-    # Find offset using correlation on a good chunk from the middle of content
-    # Try multiple positions to find the best match
-    test_duration_sec = 15.0  # Use 15 seconds for offset detection
+    # Find initial match: where does reference start position exist in target?
+    test_duration_sec = 10.0  # Use 10 seconds for initial detection
     test_samples = int(test_duration_sec * sample_rate)
 
-    best_offset = 0
+    # Start from where we expect to find content in reference
+    ref_test_sample = ref_start_sample
+    if ref_test_sample + test_samples > ref_samples:
+        return None, 0, "Reference section too short for analysis"
+
+    ref_test_chunk = ref_audio[ref_test_sample:ref_test_sample + test_samples]
+
+    # Search through the target file to find where this reference chunk exists
+    best_target_pos = 0
     best_confidence = 0.0
-    best_target_start = 0
+    best_offset = 0
 
-    # Test positions: beginning, and a few points throughout the file
-    test_positions_pct = [0.05, 0.15, 0.25, 0.5]  # Skip very beginning in case of intro
+    # Scan through target in larger steps
+    search_step = chunk_samples
+    for target_search_sample in range(0, target_samples - test_samples, search_step):
+        target_chunk = target_audio[target_search_sample:target_search_sample + test_samples]
+        offset_ms, confidence = cross_correlate_audio(ref_test_chunk, target_chunk, sample_rate)
 
-    for pct in test_positions_pct:
-        target_test_sample = int(pct * len(target_audio))
-
-        if target_test_sample + test_samples > len(target_audio):
-            continue
-
-        target_chunk = target_audio[target_test_sample:target_test_sample + test_samples]
-
-        # Search for this chunk in the reference, starting from where we expect it
-        # Scan a window in the reference
-        search_window_ms = 300000  # Search within a 5-minute window
-        search_start = max(0, ref_start_sample)
-        search_end = min(len(ref_audio) - test_samples,
-                        ref_start_sample + int((search_window_ms / 1000.0) * sample_rate))
-
-        for ref_test_sample in range(search_start, search_end, chunk_samples):
-            if ref_test_sample + test_samples > len(ref_audio):
-                break
-
-            ref_chunk = ref_audio[ref_test_sample:ref_test_sample + test_samples]
-            offset_ms, confidence = cross_correlate_audio(ref_chunk, target_chunk, sample_rate)
-
-            if confidence > best_confidence:
-                best_confidence = confidence
-                # Calculate the offset: where target aligns with reference
-                target_time_ms = int((target_test_sample / sample_rate) * 1000)
-                ref_time_ms = int((ref_test_sample / sample_rate) * 1000)
-                best_offset = offset_ms
-                best_target_start = target_time_ms
-
-                # Record where in ref timeline this target content starts
-                ref_match_point = ref_time_ms
-
-        if best_confidence >= threshold:
-            break
+        if confidence > best_confidence:
+            best_confidence = confidence
+            best_target_pos = target_search_sample
+            best_offset = offset_ms
 
     if best_confidence < threshold:
-        return None, 0, f"Could not find initial alignment (best confidence: {best_confidence:.2f}, threshold: {threshold})"
+        return None, 0, f"Could not find reference content in target (best confidence: {best_confidence:.2f}, threshold: {threshold})"
+
+    # Calculate the time offset
+    ref_test_ms = int((ref_test_sample / sample_rate) * 1000)
+    target_match_ms = int((best_target_pos / sample_rate) * 1000)
+    time_offset = target_match_ms - ref_test_ms  # How much the target is offset from reference
 
     if progress_callback:
-        progress_callback(f"  Found offset: {best_offset}ms, confidence: {best_confidence:.3f}")
-        progress_callback(f"  Step 2: Scanning through file to find all matching segments...")
+        progress_callback(f"  Initial match: ref {ref_test_ms}ms found at target {target_match_ms}ms")
+        progress_callback(f"  Time offset: {time_offset}ms, Audio offset: {best_offset}ms, Confidence: {best_confidence:.3f}")
+        progress_callback(f"  Step 2: Scanning reference timeline to map all segments...")
 
-    # Now scan through the target file sequentially to find matching regions
+    # Now scan through the REFERENCE timeline and find where each chunk is in target
     segments = []
-    current_target_sample = 0
-    target_samples = len(target_audio)
-    ref_samples = len(ref_audio)
+    scan_chunk_samples = chunk_samples
+    scan_step = scan_chunk_samples // 2  # 50% overlap
 
-    # We'll scan in chunks and build continuous segments
-    scan_chunk_samples = chunk_samples  # Scan in 5-second chunks
+    current_ref_sample = ref_start_sample
     in_matching_segment = False
-    segment_start_target = 0
-    segment_start_ref = 0
+    segment_start_ref_ms = 0
+    segment_start_target_ms = 0
+    last_target_pos = best_target_pos  # Track where we last found content in target
 
-    scan_step = scan_chunk_samples // 2  # 50% overlap for better detection
+    chunks_scanned = 0
+    chunks_matched = 0
 
-    while current_target_sample + scan_chunk_samples <= target_samples:
-        target_chunk = target_audio[current_target_sample:current_target_sample + scan_chunk_samples]
+    while current_ref_sample + scan_chunk_samples <= ref_samples:
+        chunks_scanned += 1
+        ref_chunk = ref_audio[current_ref_sample:current_ref_sample + scan_chunk_samples]
+        current_ref_ms = int((current_ref_sample / sample_rate) * 1000)
 
-        # Calculate where this should be in the reference timeline
-        # Based on the offset we found
-        current_target_ms = int((current_target_sample / sample_rate) * 1000)
+        # Calculate where we expect this reference chunk to be in the target
+        # Based on the time offset we found
+        expected_target_ms = current_ref_ms + time_offset
+        expected_target_sample = int((expected_target_ms / 1000.0) * sample_rate)
 
-        # Find corresponding position in reference
-        # The target at position X should match reference at position that's offset by the initial alignment
-        expected_ref_ms = ref_start_ms + (current_target_ms - best_target_start)
-        expected_ref_sample = int((expected_ref_ms / 1000.0) * sample_rate)
+        # Search in a window around the expected position
+        # (to handle small variations and find gaps)
+        search_window_samples = int(30 * sample_rate)  # 30-second search window
+        search_start = max(0, expected_target_sample - search_window_samples // 2)
+        search_end = min(target_samples - scan_chunk_samples, expected_target_sample + search_window_samples // 2)
 
-        # Check if this chunk matches
-        matches = False
-        if 0 <= expected_ref_sample <= ref_samples - scan_chunk_samples:
-            ref_chunk = ref_audio[expected_ref_sample:expected_ref_sample + scan_chunk_samples]
+        # Find best match in this window
+        best_local_confidence = 0.0
+        best_local_target_pos = expected_target_sample
+        found_match = False
+
+        for target_search_sample in range(search_start, search_end, scan_chunk_samples // 4):
+            if target_search_sample + scan_chunk_samples > target_samples:
+                break
+
+            target_chunk = target_audio[target_search_sample:target_search_sample + scan_chunk_samples]
             _, confidence = cross_correlate_audio(ref_chunk, target_chunk, sample_rate)
 
-            if confidence >= threshold * 0.8:  # Slightly lower threshold for continuation
-                matches = True
+            if confidence > best_local_confidence:
+                best_local_confidence = confidence
+                best_local_target_pos = target_search_sample
 
-        if matches and not in_matching_segment:
-            # Start of a new matching segment
-            in_matching_segment = True
-            segment_start_target = current_target_ms
-            segment_start_ref = expected_ref_ms
-            if progress_callback:
-                progress_callback(f"    Match found at target {segment_start_target}ms -> ref {segment_start_ref}ms")
+        # Check if we found a good match
+        if best_local_confidence >= threshold * 0.75:  # Slightly lower threshold for continuation
+            found_match = True
+            chunks_matched += 1
+            current_target_ms = int((best_local_target_pos / sample_rate) * 1000)
 
-        elif not matches and in_matching_segment:
-            # End of matching segment
-            in_matching_segment = False
-            segment_end_target = current_target_ms
-            segment_end_ref = expected_ref_ms
+            if not in_matching_segment:
+                # Start new segment
+                in_matching_segment = True
+                segment_start_ref_ms = current_ref_ms
+                segment_start_target_ms = current_target_ms
+                if progress_callback and chunks_scanned % 20 == 0:  # Report every 20 chunks
+                    progress_callback(f"    Mapping: ref {current_ref_ms}ms -> target {current_target_ms}ms")
 
-            # Create segment
-            segments.append(SegmentMatch(
-                reference_start_ms=segment_start_ref,
-                reference_end_ms=segment_end_ref,
-                target_start_ms=segment_start_target,
-                target_end_ms=segment_end_target,
-                confidence=best_confidence,
-                offset_ms=best_offset,
-                target_file_index=target_idx
-            ))
+            last_target_pos = best_local_target_pos
 
-            if progress_callback:
-                duration = (segment_end_target - segment_start_target) / 1000.0
-                progress_callback(f"    Segment complete: {duration:.1f}s of matching content")
+        else:
+            # No match found - there's a gap
+            if in_matching_segment:
+                # End the current segment
+                in_matching_segment = False
+                segment_end_ref_ms = current_ref_ms
+                segment_end_target_ms = int((last_target_pos / sample_rate) * 1000) + int((scan_chunk_samples / sample_rate) * 1000)
 
-        current_target_sample += scan_step
+                segment = SegmentMatch(
+                    reference_start_ms=segment_start_ref_ms,
+                    reference_end_ms=segment_end_ref_ms,
+                    target_start_ms=segment_start_target_ms,
+                    target_end_ms=segment_end_target_ms,
+                    confidence=best_confidence,
+                    offset_ms=best_offset,
+                    target_file_index=target_idx
+                )
+                segments.append(segment)
 
-    # If we're still in a matching segment at the end, close it
+                duration = (segment_end_ref_ms - segment_start_ref_ms) / 1000.0
+                if progress_callback:
+                    progress_callback(f"    Segment: ref {segment_start_ref_ms}-{segment_end_ref_ms}ms ({duration:.1f}s) = target {segment_start_target_ms}-{segment_end_target_ms}ms")
+
+        current_ref_sample += scan_step
+
+    # Close final segment if still matching
     if in_matching_segment:
-        segment_end_target = target_duration_ms
-        segment_end_ref = min(ref_start_ms + (segment_end_target - best_target_start), ref_duration_ms)
+        segment_end_ref_ms = ref_duration_ms
+        segment_end_target_ms = int((last_target_pos / sample_rate) * 1000) + int((scan_chunk_samples / sample_rate) * 1000)
 
-        segments.append(SegmentMatch(
-            reference_start_ms=segment_start_ref,
-            reference_end_ms=segment_end_ref,
-            target_start_ms=segment_start_target,
-            target_end_ms=segment_end_target,
+        segment = SegmentMatch(
+            reference_start_ms=segment_start_ref_ms,
+            reference_end_ms=segment_end_ref_ms,
+            target_start_ms=segment_start_target_ms,
+            target_end_ms=min(segment_end_target_ms, target_duration_ms),
             confidence=best_confidence,
             offset_ms=best_offset,
             target_file_index=target_idx
-        ))
+        )
+        segments.append(segment)
 
     if progress_callback:
-        progress_callback(f"  Found {len(segments)} matching segment(s) in this file")
+        match_pct = (chunks_matched / chunks_scanned * 100) if chunks_scanned > 0 else 0
+        progress_callback(f"  Analysis complete: {len(segments)} segment(s), {match_pct:.1f}% of reference matched")
 
     return segments, best_offset, ""
 
