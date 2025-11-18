@@ -468,6 +468,50 @@ def _analyze_target_sequential(ref_audio, target_audio, sample_rate, ref_start_m
     return segments, best_offset, ""
 
 
+def extract_frame_hash(file_path, timestamp_ms):
+    """
+    Extract perceptual hash of a frame at given timestamp using ffmpeg.
+
+    Args:
+        file_path: Path to video file
+        timestamp_ms: Timestamp in milliseconds
+
+    Returns: (hash_value, error_message)
+    """
+    try:
+        import hashlib
+        timestamp_sec = timestamp_ms / 1000.0
+
+        # Extract single frame as raw pixels
+        cmd = [
+            'ffmpeg',
+            '-v', 'error',
+            '-ss', str(timestamp_sec),
+            '-i', file_path,
+            '-vframes', '1',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'gray',
+            '-s', '8x8',  # Resize to 8x8 for perceptual hash
+            '-'
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            return None, "ffmpeg frame extraction failed"
+
+        # Simple perceptual hash: MD5 of downscaled grayscale frame
+        frame_hash = hashlib.md5(result.stdout).hexdigest()
+        return frame_hash, ""
+
+    except Exception as e:
+        return None, f"Error extracting frame hash: {e}"
+
+
 def find_nearest_keyframe(file_path, timestamp_ms, search_window_ms=5000):
     """
     Find the nearest keyframe to a given timestamp using ffprobe.
@@ -526,8 +570,15 @@ def find_nearest_keyframe(file_path, timestamp_ms, search_window_ms=5000):
         if not keyframes:
             return timestamp_ms, "No keyframes found in search window"
 
-        # Find the keyframe closest to our target
-        closest_keyframe = min(keyframes, key=lambda kf: abs(kf - timestamp_ms))
+        # Find the keyframe AFTER our target (for cutting)
+        # User's method: find matching frame, then use the keyframe AFTER it
+        keyframes_after = [kf for kf in keyframes if kf >= timestamp_ms]
+
+        if keyframes_after:
+            closest_keyframe = min(keyframes_after)  # First keyframe at or after target
+        else:
+            # Fallback: closest keyframe
+            closest_keyframe = min(keyframes, key=lambda kf: abs(kf - timestamp_ms))
 
         return int(closest_keyframe), ""
 
