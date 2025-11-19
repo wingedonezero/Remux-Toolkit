@@ -468,7 +468,132 @@ def _analyze_target_sequential(ref_audio, target_audio, sample_rate, ref_start_m
     return segments, best_offset, ""
 
 
-def find_nearest_keyframe(file_path, timestamp_ms, search_window_ms=5000):
+def extract_frame_hash(file_path, timestamp_ms):
+    """
+    Extract perceptual hash of a frame at given timestamp using ffmpeg.
+
+    Args:
+        file_path: Path to video file
+        timestamp_ms: Timestamp in milliseconds
+
+    Returns: (hash_value, error_message)
+    """
+    try:
+        import hashlib
+        timestamp_sec = timestamp_ms / 1000.0
+
+        # Extract single frame as raw pixels
+        cmd = [
+            'ffmpeg',
+            '-v', 'error',
+            '-ss', str(timestamp_sec),
+            '-i', file_path,
+            '-vframes', '1',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'gray',
+            '-s', '8x8',  # Resize to 8x8 for perceptual hash
+            '-'
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            return None, "ffmpeg frame extraction failed"
+
+        # Simple perceptual hash: MD5 of downscaled grayscale frame
+        frame_hash = hashlib.md5(result.stdout).hexdigest()
+        return frame_hash, ""
+
+    except Exception as e:
+        return None, f"Error extracting frame hash: {e}"
+
+
+def find_matching_frame_visual(ref_path, ref_time_ms, target_path, target_time_ms, search_window_ms=3000, step_frames=1):
+    """
+    Find the exact matching frame between reference and target using visual comparison.
+
+    This replicates the manual process:
+    1. Search around the approximate time for visually matching frames
+    2. Find the exact frame where content matches
+
+    Args:
+        ref_path: Reference video file
+        ref_time_ms: Approximate timestamp in reference
+        target_path: Target video file
+        target_time_ms: Approximate timestamp in target
+        search_window_ms: How far to search around the approximate time (default 3000ms)
+        step_frames: How many frames to skip per comparison (1 = check every frame)
+
+    Returns: (ref_exact_ms, target_exact_ms, match_found, error_message)
+    """
+    try:
+        # Get frame rate to calculate frame step
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=r_frame_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            target_path
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return ref_time_ms, target_time_ms, False, "Could not get frame rate"
+
+        # Parse frame rate (e.g., "24000/1001" or "24")
+        fps_str = result.stdout.strip()
+        if '/' in fps_str:
+            num, den = fps_str.split('/')
+            fps = float(num) / float(den)
+        else:
+            fps = float(fps_str)
+
+        frame_duration_ms = 1000.0 / fps
+        step_ms = int(frame_duration_ms * step_frames)
+
+        # Extract hash from reference at the approximate time
+        ref_hash, error = extract_frame_hash(ref_path, ref_time_ms)
+        if error:
+            return ref_time_ms, target_time_ms, False, f"Ref frame extraction failed: {error}"
+
+        # Search around the target approximate time for matching frame
+        start_search = max(0, target_time_ms - search_window_ms)
+        end_search = target_time_ms + search_window_ms
+
+        # Search forward and backward from center
+        search_points = []
+        center = target_time_ms
+        offset = 0
+
+        while center + offset <= end_search or center - offset >= start_search:
+            if center + offset <= end_search:
+                search_points.append(center + offset)
+            if offset > 0 and center - offset >= start_search:
+                search_points.append(center - offset)
+            offset += step_ms
+
+        for search_time in search_points:
+            target_hash, error = extract_frame_hash(target_path, int(search_time))
+            if error:
+                continue
+
+            # Check for exact match
+            if target_hash == ref_hash:
+                # Exact match found!
+                return ref_time_ms, int(search_time), True, ""
+
+        # No exact match found - return original times
+        return ref_time_ms, target_time_ms, False, "No exact visual match found"
+
+    except Exception as e:
+        return ref_time_ms, target_time_ms, False, f"Error in visual matching: {e}"
+
+
+def find_nearest_keyframe(file_path, timestamp_ms, search_window_ms=5000, search_direction='after'):
     """
     Find the nearest keyframe to a given timestamp using ffprobe.
 
@@ -476,6 +601,7 @@ def find_nearest_keyframe(file_path, timestamp_ms, search_window_ms=5000):
         file_path: Path to video file
         timestamp_ms: Target timestamp in milliseconds
         search_window_ms: How far to search before/after (default 5000ms = 5s)
+        search_direction: 'after' to find keyframe after timestamp, 'nearest' for closest, 'before' for before
 
     Returns: (keyframe_timestamp_ms, error_message)
     """
@@ -526,8 +652,26 @@ def find_nearest_keyframe(file_path, timestamp_ms, search_window_ms=5000):
         if not keyframes:
             return timestamp_ms, "No keyframes found in search window"
 
-        # Find the keyframe closest to our target
-        closest_keyframe = min(keyframes, key=lambda kf: abs(kf - timestamp_ms))
+        # Find keyframe based on search direction
+        if search_direction == 'after':
+            # Find the first keyframe AFTER the timestamp
+            keyframes_after = [kf for kf in keyframes if kf >= timestamp_ms]
+            if keyframes_after:
+                closest_keyframe = min(keyframes_after)
+            else:
+                # No keyframe after, use the closest one
+                closest_keyframe = min(keyframes, key=lambda kf: abs(kf - timestamp_ms))
+        elif search_direction == 'before':
+            # Find the last keyframe BEFORE the timestamp
+            keyframes_before = [kf for kf in keyframes if kf <= timestamp_ms]
+            if keyframes_before:
+                closest_keyframe = max(keyframes_before)
+            else:
+                # No keyframe before, use the closest one
+                closest_keyframe = min(keyframes, key=lambda kf: abs(kf - timestamp_ms))
+        else:  # 'nearest'
+            # Find the closest keyframe to our target
+            closest_keyframe = min(keyframes, key=lambda kf: abs(kf - timestamp_ms))
 
         return int(closest_keyframe), ""
 
@@ -538,7 +682,9 @@ def find_nearest_keyframe(file_path, timestamp_ms, search_window_ms=5000):
 
 
 def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str], output_path: str,
-                               trim_end_buffer_ms=5000, trim_start_buffer_ms=0, use_keyframe_detection=True):
+                               reference_path: str = None,
+                               trim_end_buffer_ms=5000, trim_start_buffer_ms=0,
+                               use_keyframe_detection=True, use_visual_matching=True):
     """
     Generate mkvmerge commands to create the aligned video.
 
@@ -546,8 +692,11 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
         segment_map: The segment mapping from analysis
         target_paths: List of target file paths
         output_path: Output file path
+        reference_path: Reference video path (required for visual matching)
         trim_end_buffer_ms: Milliseconds to trim from end of segments (default 5000ms = 5s)
         trim_start_buffer_ms: Milliseconds to trim from start of segments (default 0ms)
+        use_keyframe_detection: Whether to detect exact keyframes
+        use_visual_matching: Whether to use visual frame matching before keyframe detection
 
     Returns: List of command strings, List of temp files
     """
@@ -575,15 +724,73 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
             trimmed_start_ms = max(0, segment.target_start_ms - trim_start_buffer_ms)
             trimmed_end_ms = max(trimmed_start_ms + 1000, segment.target_end_ms - trim_end_buffer_ms)
 
-            # If keyframe detection is enabled, find the exact nearest keyframes
-            if use_keyframe_detection:
-                exact_start_ms, start_error = find_nearest_keyframe(target_path, trimmed_start_ms)
-                exact_end_ms, end_error = find_nearest_keyframe(target_path, trimmed_end_ms)
+            # Step 1: Visual frame matching to find exact transition frames
+            if use_visual_matching and reference_path:
+                # For the start boundary: find where reference content starts matching target
+                ref_start_approx = segment.reference_start_ms
+                _, exact_start_ms, start_matched, start_error = find_matching_frame_visual(
+                    reference_path, ref_start_approx,
+                    target_path, trimmed_start_ms,
+                    search_window_ms=3000, step_frames=1
+                )
 
-                if not start_error and not end_error:
-                    # Use exact keyframe positions
+                if start_matched:
                     trimmed_start_ms = exact_start_ms
+                    # Visual match found - use this exact timestamp
+
+                # For the end boundary: find where reference content stops matching target
+                ref_end_approx = segment.reference_end_ms
+                _, exact_end_ms, end_matched, end_error = find_matching_frame_visual(
+                    reference_path, ref_end_approx,
+                    target_path, trimmed_end_ms,
+                    search_window_ms=3000, step_frames=1
+                )
+
+                if end_matched:
                     trimmed_end_ms = exact_end_ms
+                    # Visual match found - use this exact timestamp
+
+            # Step 2: Find keyframe at or after the matching frame, then go back one frame
+            # This replicates the manual process:
+            # - Find the keyframe where you want to cut
+            # - Go back one frame from that keyframe
+            # - Use that timestamp in --split timestamps:
+            # - mkvmerge cuts AFTER that timestamp, which is exactly at the keyframe
+            if use_keyframe_detection:
+                # Get frame rate to calculate frame duration
+                cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-select_streams', 'v:0',
+                    '-show_entries', 'stream=r_frame_rate',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    target_path
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+                if result.returncode == 0:
+                    fps_str = result.stdout.strip()
+                    if '/' in fps_str:
+                        num, den = fps_str.split('/')
+                        fps = float(num) / float(den)
+                    else:
+                        fps = float(fps_str)
+
+                    frame_duration_ms = 1000.0 / fps
+
+                    # Find keyframe at or after the matching frame
+                    keyframe_start_ms, start_error = find_nearest_keyframe(
+                        target_path, trimmed_start_ms, search_direction='after'
+                    )
+                    keyframe_end_ms, end_error = find_nearest_keyframe(
+                        target_path, trimmed_end_ms, search_direction='after'
+                    )
+
+                    if not start_error and not end_error:
+                        # Go back one frame from the keyframe
+                        # mkvmerge --split timestamps: cuts AFTER the specified time
+                        # So to cut AT the keyframe, specify one frame before it
+                        trimmed_start_ms = int(keyframe_start_ms - frame_duration_ms)
+                        trimmed_end_ms = int(keyframe_end_ms - frame_duration_ms)
                 # If keyframe detection fails, fall back to approximate times
 
             # Convert ms to timestamps with FULL precision (not rounded)
@@ -591,16 +798,25 @@ def generate_alignment_commands(segment_map: SegmentMap, target_paths: List[str]
             start_time = _ms_to_timestamp(trimmed_start_ms)
             end_time = _ms_to_timestamp(trimmed_end_ms)
 
-            # mkvmerge command to extract this segment
-            # The parts: syntax extracts the specified range at keyframe boundaries
+            # Use --split timestamps: which respects exact keyframe positions
+            # This creates multiple files: original name + "-001", "-002", etc.
+            # We want the SECOND file (after first split, before second split)
+            temp_split_base = f"temp_split_f{file_idx}_s{seg_idx}"
+
+            # Split at start_time and end_time
+            # This creates: temp_split_...-001.mkv (before start), -002.mkv (our segment), -003.mkv (after end)
             cmd = [
                 'mkvmerge',
-                '-o', f'"{temp_file}"',
-                '--split', f'parts:{start_time}-{end_time}',
+                '-o', f'"{temp_split_base}.mkv"',
+                '--split', f'timestamps:{start_time},{end_time}',
                 f'"{target_path}"'
             ]
-
             commands.append(' '.join(cmd))
+
+            # After splitting, rename the middle piece to our target temp file
+            # The -002 file is what we want (between the two timestamps)
+            rename_cmd = f'mv "{temp_split_base}-002.mkv" "{temp_file}" && rm -f "{temp_split_base}"-*.mkv'
+            commands.append(rename_cmd)
 
     # Generate final merge command
     if temp_files:
