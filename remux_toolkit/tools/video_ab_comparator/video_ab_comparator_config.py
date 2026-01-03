@@ -22,4 +22,7 @@ DEFAULTS = {
     "align_peak_fit": True,  # Enable sub-sample peak fitting
     "align_delay_selection": "first",  # Delay selection strategy: first/median/mean
     "align_audio_lang": "jpn",  # Audio language to use for alignment (None = first track)
+
+    # Frame Mapping Settings
+    "use_frame_mapper": True,  # Use VideoTimestamps for frame-perfect mapping
 }
