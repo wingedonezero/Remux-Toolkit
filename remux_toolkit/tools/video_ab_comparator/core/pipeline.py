@@ -13,6 +13,7 @@ import threading
 
 from .source import VideoSource
 from .alignment import robust_align
+from .frame_mapper import FrameMapper
 from ..detectors.upscale import UpscaleDetector
 from ..detectors.interlace import CombingDetector
 from ..detectors.compression import BlockingDetector
@@ -36,6 +37,7 @@ class ComparisonPipeline(QObject):
         self._lock = threading.Lock()
         self._stop_requested = False
         self.chunk_metadata = []  # Store metadata for each chunk
+        self.frame_mapper = None  # VideoTimestamps-based frame mapper (optional)
 
     def _emit(self, msg: str, pc: int):
         try:
@@ -58,9 +60,19 @@ class ComparisonPipeline(QObject):
         ts_a = duration * (chunk_idx + 0.5) / num_chunks
 
         # Map to corresponding timestamp in source B
-        # offset convention: negative = B is behind, positive = B is ahead
-        # To sync: ts_b = ts_a - offset - drift*ts_a
-        ts_b = ts_a - (align_offset + align_drift * ts_a)
+        # Use frame mapper for precise mapping if available
+        if self.frame_mapper and self.frame_mapper.is_available():
+            mapping = self.frame_mapper.map_timestamp_a_to_frame_b(ts_a)
+            if mapping:
+                ts_b = mapping.timestamp_b
+            else:
+                # Fallback to formula if mapping fails
+                ts_b = ts_a - (align_offset + align_drift * ts_a)
+        else:
+            # Standard formula (time-based)
+            # offset convention: negative = B is behind, positive = B is ahead
+            # To sync: ts_b = ts_a - offset - drift*ts_a
+            ts_b = ts_a - (align_offset + align_drift * ts_a)
 
         if ts_b < 0 or ts_b >= self.source_b.info.duration:
             return chunk_idx, {}
@@ -283,6 +295,32 @@ class ComparisonPipeline(QObject):
             if self._stop_requested:
                 self.finished.emit({"error": "Analysis cancelled"})
                 return
+
+            # 3b. Initialize VideoTimestamps-based frame mapper (optional)
+            use_frame_mapper = self.settings.get("use_frame_mapper", True)
+            if use_frame_mapper:
+                try:
+                    self._emit("Loading frame timestamps for precise mapping...", 27)
+                    self.frame_mapper = FrameMapper(
+                        str(self.source_a.path),
+                        str(self.source_b.path),
+                        align.offset_sec,
+                        align.drift_ratio
+                    )
+
+                    if self.frame_mapper.is_available():
+                        # Generate sync quality report
+                        quality = self.frame_mapper.get_sync_quality_report(sample_points=10)
+                        print(f"Frame mapping quality: {quality['exact_match_rate']:.1%} exact matches, "
+                              f"avg drift {quality['avg_drift_ms']:.2f}ms, max drift {quality['max_drift_ms']:.2f}ms")
+                    else:
+                        print("VideoTimestamps not available, using time-based seeking")
+                        self.frame_mapper = None
+
+                except Exception as e:
+                    print(f"Failed to initialize frame mapper: {e}")
+                    print("Falling back to time-based seeking")
+                    self.frame_mapper = None
 
             # 4. Global analysis
             aggregated_issues = {}

@@ -50,6 +50,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.controls['align_scan_end_pct'] = self._add_spinbox("Scan End %", "align_scan_end_pct", 50.0, 100.0, 5.0)
         self.controls['align_use_soxr'] = self._add_checkbox("Use High-Quality SOXR Resampling", "align_use_soxr")
         self.controls['align_peak_fit'] = self._add_checkbox("Use Sub-Sample Peak Fitting", "align_peak_fit")
+        self.controls['use_frame_mapper'] = self._add_checkbox("Use VideoTimestamps for Frame-Perfect Mapping", "use_frame_mapper")
 
         # Delay selection strategy
         delay_label = QtWidgets.QLabel("Delay Selection:")
