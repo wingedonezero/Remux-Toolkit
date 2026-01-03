@@ -228,15 +228,38 @@ class ComparisonPipeline(QObject):
             frame_detectors = [cls() for cls in frame_detector_classes]
 
             # 3. Compute alignment (now much faster!)
-            self._emit("Computing alignment (fast hybrid method)…", 10)
+            # Check if advanced alignment is requested
+            use_advanced = self.settings.get("use_advanced_alignment", False)
+
+            if use_advanced:
+                self._emit("Computing alignment (advanced SCC method)…", 10)
+            else:
+                self._emit("Computing alignment (fast hybrid method)…", 10)
 
             try:
+                # Prepare alignment configuration
+                align_config = {
+                    'chunk_count': self.settings.get('align_chunk_count', 30),
+                    'chunk_duration': self.settings.get('align_chunk_duration', 30.0),
+                    'scan_start_pct': self.settings.get('align_scan_start_pct', 5.0),
+                    'scan_end_pct': self.settings.get('align_scan_end_pct', 95.0),
+                    'min_match_pct': self.settings.get('align_min_match_pct', 20.0),
+                    'target_confidence_pct': self.settings.get('align_target_confidence_pct', 70.0),
+                    'sample_rate': self.settings.get('align_sample_rate', 48000),
+                    'use_soxr': self.settings.get('align_use_soxr', True),
+                    'peak_fit': self.settings.get('align_peak_fit', True),
+                    'delay_selection': self.settings.get('align_delay_selection', 'first'),
+                    'audio_lang': self.settings.get('align_audio_lang', None)
+                }
+
                 align = robust_align(
                     self.source_a, self.source_b,
                     duration=duration,
                     fps_a=self.source_a.info.video_stream.fps,
                     fps_b=self.source_b.info.video_stream.fps,
-                    progress_callback=lambda msg, pc: self._emit(msg, pc)
+                    progress_callback=lambda msg, pc: self._emit(msg, pc),
+                    use_advanced=use_advanced,
+                    align_config=align_config if use_advanced else None
                 )
 
                 # Better alignment reporting
