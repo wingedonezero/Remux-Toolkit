@@ -206,6 +206,59 @@ class FrameMapper:
 
         return frame_a, frame_b
 
+    def get_exact_frame_timestamps(self, vts: VideoTimestamps, start_time: float,
+                                   duration: float, target_fps: float = 10.0) -> list:
+        """
+        Get exact timestamps for frames in a time range using VideoTimestamps.
+
+        This ensures frame-accurate extraction by using the actual frame timestamps
+        from the video file instead of calculated values.
+
+        Args:
+            vts: VideoTimestamps instance
+            start_time: Start time in seconds
+            duration: Duration to extract in seconds
+            target_fps: Target frame rate for extraction (default 10fps)
+
+        Returns:
+            List of exact timestamps (in seconds) from VideoTimestamps
+        """
+        if not vts:
+            return []
+
+        try:
+            # Calculate time range
+            end_time = start_time + duration
+
+            # Find frame numbers for this range
+            start_frame = self.get_frame_at_time(vts, start_time)
+            end_frame = self.get_frame_at_time(vts, end_time)
+
+            if start_frame is None or end_frame is None:
+                return []
+
+            # Calculate frame step to achieve target fps
+            total_frames_in_range = end_frame - start_frame + 1
+            native_fps = total_frames_in_range / duration if duration > 0 else 24.0
+
+            # Calculate step size to get approximately target_fps
+            frame_step = max(1, int(native_fps / target_fps))
+
+            # Get exact timestamps for sampled frames
+            timestamps = []
+            for frame_num in range(start_frame, end_frame + 1, frame_step):
+                if frame_num < len(vts):
+                    # Get exact timestamp from VideoTimestamps (in milliseconds)
+                    exact_ts_ms = vts[frame_num]
+                    exact_ts_sec = exact_ts_ms / 1000.0
+                    timestamps.append(exact_ts_sec)
+
+            return timestamps
+
+        except Exception as e:
+            print(f"Error getting exact frame timestamps: {e}")
+            return []
+
     def get_sync_quality_report(self, sample_points: int = 10) -> Dict:
         """
         Generate a report on sync quality across the video.

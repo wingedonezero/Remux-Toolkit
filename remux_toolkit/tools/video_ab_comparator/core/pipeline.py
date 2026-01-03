@@ -91,8 +91,28 @@ class ComparisonPipeline(QObject):
         }
 
         try:
-            frames_a = list(self.source_a.get_frame_iterator(ts_a, chunk_duration))
-            frames_b = list(self.source_b.get_frame_iterator(ts_b, chunk_duration))
+            # Use exact timestamps from VideoTimestamps when available
+            if self.frame_mapper and self.frame_mapper.is_available():
+                # Get exact frame timestamps for this chunk
+                timestamps_a = self.frame_mapper.get_exact_frame_timestamps(
+                    self.frame_mapper.vts_a, ts_a, chunk_duration, target_fps=10.0
+                )
+                timestamps_b = self.frame_mapper.get_exact_frame_timestamps(
+                    self.frame_mapper.vts_b, ts_b, chunk_duration, target_fps=10.0
+                )
+
+                # Extract frames using exact timestamps
+                if timestamps_a and timestamps_b:
+                    frames_a = self.source_a.get_frames_at_exact_timestamps(timestamps_a)
+                    frames_b = self.source_b.get_frames_at_exact_timestamps(timestamps_b)
+                else:
+                    # Fallback to regular extraction
+                    frames_a = list(self.source_a.get_frame_iterator(ts_a, chunk_duration))
+                    frames_b = list(self.source_b.get_frame_iterator(ts_b, chunk_duration))
+            else:
+                # Use regular frame iterator when VideoTimestamps not available
+                frames_a = list(self.source_a.get_frame_iterator(ts_a, chunk_duration))
+                frames_b = list(self.source_b.get_frame_iterator(ts_b, chunk_duration))
 
             if not frames_a or not frames_b:
                 return chunk_idx, {}

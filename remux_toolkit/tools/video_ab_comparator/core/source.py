@@ -88,6 +88,32 @@ class VideoSource:
         except Exception as e:
             print(f"FFmpeg frame iterator failed: {e}")
 
+    def get_frames_at_exact_timestamps(self, timestamps: List[float]) -> List[np.ndarray]:
+        """
+        Extract frames at exact timestamps using frame-accurate seeking.
+
+        Uses VideoTimestamps-provided exact timestamps for frame-perfect extraction.
+        Each frame is extracted individually with accurate seeking to ensure precision.
+
+        Args:
+            timestamps: List of exact timestamps (in seconds) from VideoTimestamps
+
+        Returns:
+            List of frames as numpy arrays
+        """
+        if not isinstance(self.source, Path) or not self.info or not self.info.video_stream:
+            return []
+
+        frames = []
+        for ts in timestamps:
+            # Use accurate seeking for each frame
+            # Format timestamp with high precision (microseconds)
+            frame = self.get_frame(ts, accurate=True)
+            if frame is not None:
+                frames.append(frame)
+
+        return frames
+
     def initialize_pyav(self) -> bool:
         """
         Initialize PyAV extractor for frame-accurate seeking.
