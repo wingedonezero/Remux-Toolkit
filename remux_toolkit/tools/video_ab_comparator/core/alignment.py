@@ -6,9 +6,16 @@ import subprocess
 import json
 import re
 import cv2
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import tempfile
 import os
+
+# Import advanced alignment
+try:
+    from .alignment_advanced import advanced_align, AlignmentConfig, AlignResult as AdvancedAlignResult
+    HAS_ADVANCED_ALIGNMENT = True
+except ImportError:
+    HAS_ADVANCED_ALIGNMENT = False
 
 @dataclass
 class AlignResult:
@@ -269,7 +276,9 @@ def precise_align_keyframes(source_a_path: str, source_b_path: str,
     return best_offset
 
 def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
-                duration: float, progress_callback=None) -> AlignResult:
+                duration: float, progress_callback=None,
+                use_advanced: bool = False,
+                align_config: Optional[Dict] = None) -> AlignResult:
     """
     Main alignment function - now MUCH faster.
     Uses hybrid audio/visual approach instead of slow SSIM scanning.
@@ -279,8 +288,62 @@ def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
     - Positive offset means B is ahead of A (B needs to subtract time to sync)
 
     To find corresponding timestamp in B: ts_b = ts_a - offset
+
+    Args:
+        source_a: Source A object with path attribute
+        source_b: Source B object with path attribute
+        fps_a: Frame rate of source A
+        fps_b: Frame rate of source B
+        duration: Video duration in seconds
+        progress_callback: Optional callback for progress updates
+        use_advanced: Use advanced SCC-based alignment (more accurate)
+        align_config: Configuration dict for advanced alignment
     """
-    # Use the fast hybrid approach
+    # Use advanced alignment if requested and available
+    if use_advanced and HAS_ADVANCED_ALIGNMENT:
+        if progress_callback:
+            progress_callback("Using advanced SCC alignment...", 5)
+
+        # Create configuration
+        if align_config is None:
+            align_config = {}
+
+        config = AlignmentConfig(
+            chunk_count=align_config.get('chunk_count', 30),
+            chunk_duration=align_config.get('chunk_duration', 30.0),
+            scan_start_pct=align_config.get('scan_start_pct', 5.0),
+            scan_end_pct=align_config.get('scan_end_pct', 95.0),
+            min_match_pct=align_config.get('min_match_pct', 20.0),
+            target_confidence_pct=align_config.get('target_confidence_pct', 70.0),
+            sample_rate=align_config.get('sample_rate', 48000),
+            use_soxr=align_config.get('use_soxr', True),
+            peak_fit=align_config.get('peak_fit', True),
+            delay_selection=align_config.get('delay_selection', 'first'),
+            audio_lang=align_config.get('audio_lang', None)
+        )
+
+        advanced_result = advanced_align(
+            str(source_a.path),
+            str(source_b.path),
+            config,
+            progress_callback
+        )
+
+        # Calculate drift ratio
+        drift_ratio = 0.0
+        if abs(fps_a - fps_b) > 0.01:
+            drift_ratio = (fps_a - fps_b) / fps_a
+
+        # Convert to standard AlignResult
+        result = AlignResult(
+            offset_sec=-advanced_result.offset_sec,  # Negate for convention
+            drift_ratio=drift_ratio,
+            confidence=advanced_result.confidence
+        )
+
+        return result
+
+    # Use the fast hybrid approach (legacy)
     result = quick_align_hybrid(
         str(source_a.path),
         str(source_b.path),

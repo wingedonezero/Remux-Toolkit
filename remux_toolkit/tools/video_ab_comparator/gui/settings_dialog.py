@@ -19,6 +19,52 @@ class SettingsDialog(QtWidgets.QDialog):
         self.controls['enable_interlace_detection'] = self._add_checkbox("Enable Interlace Detection", "enable_interlace_detection")
         self.controls['enable_cadence_detection'] = self._add_checkbox("Enable Cadence Detection", "enable_cadence_detection")
 
+        # --- Advanced Audio Alignment Settings ---
+        self.layout.addRow(QtWidgets.QLabel("<b>Advanced Audio Alignment</b>"))
+        self.controls['use_advanced_alignment'] = self._add_checkbox("Use Advanced SCC Alignment (more accurate)", "use_advanced_alignment")
+
+        # Audio language selection
+        lang_label = QtWidgets.QLabel("Audio Language:")
+        lang_combo = QtWidgets.QComboBox()
+        lang_combo.addItems(["Auto (first track)", "jpn (Japanese)", "eng (English)", "ger (German)", "fra (French)", "spa (Spanish)"])
+        current_lang = self.settings.get('align_audio_lang', 'jpn')
+        if current_lang is None or current_lang == '':
+            lang_combo.setCurrentIndex(0)
+        elif current_lang == 'jpn':
+            lang_combo.setCurrentIndex(1)
+        elif current_lang == 'eng':
+            lang_combo.setCurrentIndex(2)
+        elif current_lang == 'ger':
+            lang_combo.setCurrentIndex(3)
+        elif current_lang == 'fra':
+            lang_combo.setCurrentIndex(4)
+        elif current_lang == 'spa':
+            lang_combo.setCurrentIndex(5)
+        self.layout.addRow(lang_label, lang_combo)
+        self.controls['align_audio_lang_combo'] = lang_combo
+
+        self.controls['align_chunk_count'] = self._add_spinbox("Align Chunk Count", "align_chunk_count", 5, 50, 1)
+        self.controls['align_chunk_duration'] = self._add_spinbox("Align Chunk Duration (s)", "align_chunk_duration", 10.0, 60.0, 5.0)
+        self.controls['align_min_match_pct'] = self._add_spinbox("Min Match % to Accept", "align_min_match_pct", 5.0, 50.0, 5.0)
+        self.controls['align_scan_start_pct'] = self._add_spinbox("Scan Start %", "align_scan_start_pct", 0.0, 50.0, 5.0)
+        self.controls['align_scan_end_pct'] = self._add_spinbox("Scan End %", "align_scan_end_pct", 50.0, 100.0, 5.0)
+        self.controls['align_use_soxr'] = self._add_checkbox("Use High-Quality SOXR Resampling", "align_use_soxr")
+        self.controls['align_peak_fit'] = self._add_checkbox("Use Sub-Sample Peak Fitting", "align_peak_fit")
+
+        # Delay selection strategy
+        delay_label = QtWidgets.QLabel("Delay Selection:")
+        delay_combo = QtWidgets.QComboBox()
+        delay_combo.addItems(["first (First accepted chunk)", "median (Median of chunks)", "mean (Average of chunks)"])
+        current_delay = self.settings.get('align_delay_selection', 'first')
+        if current_delay == 'first':
+            delay_combo.setCurrentIndex(0)
+        elif current_delay == 'median':
+            delay_combo.setCurrentIndex(1)
+        elif current_delay == 'mean':
+            delay_combo.setCurrentIndex(2)
+        self.layout.addRow(delay_label, delay_combo)
+        self.controls['align_delay_selection_combo'] = delay_combo
+
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -63,4 +109,14 @@ class SettingsDialog(QtWidgets.QDialog):
                 self.settings[key] = control.isChecked()
             elif isinstance(control, QtWidgets.QDoubleSpinBox):
                 self.settings[key] = control.value()
+            elif isinstance(control, QtWidgets.QComboBox):
+                # Handle combo boxes
+                if key == 'align_audio_lang_combo':
+                    idx = control.currentIndex()
+                    lang_map = {0: None, 1: 'jpn', 2: 'eng', 3: 'ger', 4: 'fra', 5: 'spa'}
+                    self.settings['align_audio_lang'] = lang_map.get(idx, None)
+                elif key == 'align_delay_selection_combo':
+                    idx = control.currentIndex()
+                    delay_map = {0: 'first', 1: 'median', 2: 'mean'}
+                    self.settings['align_delay_selection'] = delay_map.get(idx, 'first')
         return self.settings
