@@ -261,7 +261,9 @@ class ComparisonPipeline(QObject):
                     'use_soxr': self.settings.get('align_use_soxr', True),
                     'peak_fit': self.settings.get('align_peak_fit', True),
                     'delay_selection': self.settings.get('align_delay_selection', 'first'),
-                    'audio_lang': self.settings.get('align_audio_lang', None)
+                    'audio_lang': self.settings.get('align_audio_lang', None),
+                    'visual_verification': self.settings.get('align_visual_verification', True),
+                    'visual_search_range_frames': self.settings.get('align_visual_search_frames', 20)
                 }
 
                 align = robust_align(

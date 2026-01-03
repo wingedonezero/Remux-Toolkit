@@ -319,13 +319,17 @@ def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
             use_soxr=align_config.get('use_soxr', True),
             peak_fit=align_config.get('peak_fit', True),
             delay_selection=align_config.get('delay_selection', 'first'),
-            audio_lang=align_config.get('audio_lang', None)
+            audio_lang=align_config.get('audio_lang', None),
+            visual_verification=align_config.get('visual_verification', True),
+            visual_search_range_frames=align_config.get('visual_search_range_frames', 20)
         )
 
         advanced_result = advanced_align(
             str(source_a.path),
             str(source_b.path),
             config,
+            fps_a,
+            fps_b,
             progress_callback
         )
 
