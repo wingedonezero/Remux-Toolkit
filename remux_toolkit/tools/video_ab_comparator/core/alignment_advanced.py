@@ -12,6 +12,9 @@ import json
 from typing import Optional, List, Tuple, Dict
 from scipy.signal import correlate
 from pathlib import Path
+import imagehash
+from PIL import Image
+import io
 
 # Language normalization mapping (2-letter to 3-letter ISO codes)
 _LANG2TO3 = {
@@ -48,6 +51,10 @@ class AlignmentConfig:
 
     # Language selection (None = use first audio track)
     audio_lang: Optional[str] = None
+
+    # Visual verification
+    visual_verification: bool = True  # Fine-tune with visual frame matching
+    visual_search_range_frames: int = 20  # Search ±N frames around audio offset
 
 
 @dataclass
@@ -194,8 +201,214 @@ def find_delay_scc(ref_chunk: np.ndarray, tgt_chunk: np.ndarray,
     return delay_ms, match_pct
 
 
+def extract_frame_at_time(file_path: str, timestamp: float, accurate: bool = True) -> Optional[np.ndarray]:
+    """
+    Extract a single frame at specific timestamp.
+
+    Args:
+        file_path: Path to video file
+        timestamp: Timestamp in seconds
+        accurate: Use accurate seeking (slower but frame-perfect)
+
+    Returns:
+        Frame as numpy array (RGB) or None
+    """
+    try:
+        cmd = ['ffmpeg', '-v', 'error']
+
+        if accurate:
+            # Accurate seeking: decode from previous keyframe
+            cmd.extend(['-ss', str(timestamp)])
+        else:
+            # Fast seeking: jump to nearest keyframe (less accurate)
+            cmd.extend(['-ss', str(timestamp)])
+
+        cmd.extend([
+            '-i', str(file_path),
+            '-vframes', '1',
+            '-f', 'image2pipe',
+            '-pix_fmt', 'rgb24',
+            '-vcodec', 'rawvideo',
+            '-'
+        ])
+
+        result = subprocess.run(cmd, capture_output=True, timeout=10)
+
+        if result.returncode != 0 or not result.stdout:
+            return None
+
+        # Convert to numpy array
+        # Need to know frame dimensions - try to get from a test extraction
+        # For now, return raw bytes and let caller handle it
+        return np.frombuffer(result.stdout, dtype=np.uint8)
+
+    except Exception as e:
+        print(f"Failed to extract frame at {timestamp}s: {e}")
+        return None
+
+
+def compute_frame_hash(frame_data: np.ndarray, size: int = 16) -> Optional[imagehash.ImageHash]:
+    """
+    Compute perceptual hash of frame.
+
+    Args:
+        frame_data: Raw frame data as numpy array
+        size: Hash size (default 16x16 = 256 bits)
+
+    Returns:
+        ImageHash or None
+    """
+    try:
+        # Try to interpret as image
+        # Frame data should be RGB, but we need dimensions
+        # Use a rough estimate based on common resolutions
+        possible_heights = [1080, 720, 480, 2160, 576]
+
+        for height in possible_heights:
+            total_pixels = len(frame_data) // 3  # RGB = 3 bytes per pixel
+            width = total_pixels // height
+
+            if width * height * 3 == len(frame_data):
+                # Found valid dimensions
+                frame_rgb = frame_data.reshape((height, width, 3))
+                img = Image.fromarray(frame_rgb, 'RGB')
+                return imagehash.average_hash(img, hash_size=size)
+
+        # If no valid dimensions found, just use raw comparison
+        return None
+
+    except Exception as e:
+        return None
+
+
+def compare_frames_correlation(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
+    """
+    Compare two frames using normalized cross-correlation.
+
+    Returns:
+        Correlation coefficient (0-1, higher is better)
+    """
+    try:
+        # Ensure same size
+        min_size = min(len(frame_a), len(frame_b))
+        a = frame_a[:min_size].astype(np.float32)
+        b = frame_b[:min_size].astype(np.float32)
+
+        # Normalize
+        a_norm = (a - np.mean(a)) / (np.std(a) + 1e-9)
+        b_norm = (b - np.mean(b)) / (np.std(b) + 1e-9)
+
+        # Correlation
+        corr = np.mean(a_norm * b_norm)
+        return float(max(0.0, min(1.0, corr)))
+
+    except Exception:
+        return 0.0
+
+
+def visual_frame_verification(source_a_path: str, source_b_path: str,
+                              audio_offset_sec: float, fps_a: float, fps_b: float,
+                              search_range_frames: int = 20,
+                              progress_callback=None) -> Tuple[float, float]:
+    """
+    Fine-tune audio offset using visual frame matching.
+
+    Extracts frames around the audio offset and finds the best visual match
+    to achieve frame-perfect alignment.
+
+    Args:
+        source_a_path: Path to source A
+        source_b_path: Path to source B
+        audio_offset_sec: Rough offset from audio correlation
+        fps_a: Frame rate of source A
+        fps_b: Frame rate of source B
+        search_range_frames: Search ±N frames around audio offset
+        progress_callback: Optional progress callback
+
+    Returns:
+        (refined_offset_sec, confidence): Refined offset and match confidence
+    """
+    # Get video duration from source A
+    try:
+        probe_cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'format=duration',
+            '-of', 'json',
+            source_a_path
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=5)
+        duration_a = float(json.loads(result.stdout)['format']['duration'])
+    except Exception:
+        print("Failed to get duration, using 600s default")
+        duration_a = 600.0
+
+    # Test at 50% into video
+    test_time_a = duration_a * 0.5
+    test_time_b_center = test_time_a - audio_offset_sec
+
+    if progress_callback:
+        progress_callback("Visual frame verification...", 92)
+
+    print(f"\nVisual verification: testing at {test_time_a:.2f}s in source A")
+
+    # Extract reference frame from source A
+    frame_a = extract_frame_at_time(source_a_path, test_time_a, accurate=True)
+    if frame_a is None:
+        print("Failed to extract reference frame, skipping visual verification")
+        return audio_offset_sec, 0.5
+
+    # Search for best match in source B
+    # Convert frame range to time range
+    frame_period_b = 1.0 / fps_b
+    search_range_sec = search_range_frames * frame_period_b
+
+    best_offset = audio_offset_sec
+    best_score = 0.0
+    best_frame_offset = 0
+
+    # Search from -range to +range frames
+    search_points = []
+    for frame_offset in range(-search_range_frames, search_range_frames + 1):
+        time_offset = frame_offset * frame_period_b
+        test_time_b = test_time_b_center + time_offset
+        search_points.append((frame_offset, test_time_b))
+
+    print(f"Searching {len(search_points)} frames (±{search_range_frames} frames = ±{search_range_sec:.3f}s)")
+
+    for i, (frame_offset, test_time_b) in enumerate(search_points):
+        if test_time_b < 0:
+            continue
+
+        frame_b = extract_frame_at_time(source_b_path, test_time_b, accurate=True)
+        if frame_b is None:
+            continue
+
+        # Compare frames
+        score = compare_frames_correlation(frame_a, frame_b)
+
+        if score > best_score:
+            best_score = score
+            best_frame_offset = frame_offset
+            best_offset = audio_offset_sec - (frame_offset * frame_period_b)
+
+        # Progress update every 5 frames
+        if progress_callback and i % 5 == 0:
+            pct = 92 + int(6 * (i + 1) / len(search_points))
+            progress_callback(f"Verifying frames ({i+1}/{len(search_points)})...", pct)
+
+    frame_adjustment_ms = best_frame_offset * frame_period_b * 1000
+    print(f"Visual match: best at frame offset {best_frame_offset:+d} ({frame_adjustment_ms:+.1f}ms), "
+          f"correlation={best_score:.3f}")
+    print(f"Refined offset: {best_offset:.6f}s (was {audio_offset_sec:.6f}s)")
+
+    return best_offset, best_score
+
+
 def advanced_align(source_a_path: str, source_b_path: str,
                    config: AlignmentConfig,
+                   fps_a: float = 23.976,
+                   fps_b: float = 23.976,
                    progress_callback=None) -> AlignResult:
     """
     Advanced audio alignment using SCC correlation with configurable parameters.
@@ -342,11 +555,31 @@ def advanced_align(source_a_path: str, source_b_path: str,
         avg_match = np.mean([c['match_pct'] for c in accepted_chunks])
         final_confidence = min(1.0, avg_match / 100.0)
 
-    print(f"\nAlignment result: offset={final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms), "
+    print(f"\nAudio alignment: offset={final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms), "
           f"confidence={final_confidence:.2%}, accepted={len(accepted_chunks)}/{config.chunk_count}")
 
+    # Visual frame verification for frame-perfect accuracy
+    if config.visual_verification and final_offset_sec != 0.0:
+        if progress_callback:
+            progress_callback("Visual frame verification...", 92)
+
+        refined_offset, visual_confidence = visual_frame_verification(
+            source_a_path, source_b_path,
+            final_offset_sec, fps_a, fps_b,
+            config.visual_search_range_frames,
+            progress_callback
+        )
+
+        # Update offset and confidence
+        if visual_confidence > 0.7:  # Trust visual if good match
+            final_offset_sec = refined_offset
+            final_confidence = (final_confidence + visual_confidence) / 2.0
+            print(f"Final offset after visual verification: {final_offset_sec:.6f}s")
+        else:
+            print(f"Visual verification weak (confidence={visual_confidence:.2f}), keeping audio offset")
+
     if progress_callback:
-        progress_callback("Alignment complete", 90)
+        progress_callback("Alignment complete", 98)
 
     return AlignResult(
         offset_sec=final_offset_sec,
@@ -354,5 +587,5 @@ def advanced_align(source_a_path: str, source_b_path: str,
         confidence=final_confidence,
         chunk_results=chunk_results,
         accepted_count=len(accepted_chunks),
-        method="SCC"
+        method="SCC+Visual" if config.visual_verification else "SCC"
     )
