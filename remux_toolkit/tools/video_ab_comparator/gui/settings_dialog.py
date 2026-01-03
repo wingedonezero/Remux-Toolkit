@@ -53,6 +53,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.controls['align_visual_verification'] = self._add_checkbox("Visual Frame Verification (frame-perfect)", "align_visual_verification")
         self.controls['align_visual_search_frames'] = self._add_spinbox("Visual Search Range (frames)", "align_visual_search_frames", 5, 50, 5)
         self.controls['use_frame_mapper'] = self._add_checkbox("Use VideoTimestamps for Frame Mapping", "use_frame_mapper")
+        self.controls['use_pyav_seeking'] = self._add_checkbox("Use PyAV for Frame-Accurate Seeking", "use_pyav_seeking")
 
         # Delay selection strategy
         delay_label = QtWidgets.QLabel("Delay Selection:")

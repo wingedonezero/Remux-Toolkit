@@ -12,6 +12,13 @@ from .models import SourceInfo, StreamInfo
 import tempfile
 import os
 
+# Optional PyAV support for frame-accurate seeking
+try:
+    from .pyav_source import PyAVFrameExtractor, HAS_PYAV
+except ImportError:
+    HAS_PYAV = False
+    PyAVFrameExtractor = None
+
 def _safe_fraction_to_fps(r_frame_rate: Optional[str]) -> float:
     if not r_frame_rate or "/" not in str(r_frame_rate):
         try: return float(r_frame_rate) if r_frame_rate else 24.0
@@ -23,11 +30,15 @@ def _safe_fraction_to_fps(r_frame_rate: Optional[str]) -> float:
         return 24.0
 
 class VideoSource:
-    def __init__(self, source: Union[Path, bytes]):
+    def __init__(self, source: Union[Path, bytes], use_pyav: bool = True):
         self.source = source
         self.path_name = str(source) if isinstance(source, Path) else "in-memory-chunk"
         self.info: Optional[SourceInfo] = None
         self.path = str(source) if isinstance(source, Path) else None
+
+        # PyAV extractor (optional, for frame-accurate seeking)
+        self.pyav_extractor: Optional[PyAVFrameExtractor] = None
+        self._use_pyav = use_pyav and HAS_PYAV and isinstance(source, Path)
 
     def probe(self) -> bool:
         try:
@@ -77,9 +88,48 @@ class VideoSource:
         except Exception as e:
             print(f"FFmpeg frame iterator failed: {e}")
 
+    def initialize_pyav(self) -> bool:
+        """
+        Initialize PyAV extractor for frame-accurate seeking.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self._use_pyav or self.pyav_extractor:
+            return False
+
+        try:
+            self.pyav_extractor = PyAVFrameExtractor(str(self.source))
+            success = self.pyav_extractor.open()
+            if success:
+                print(f"PyAV extractor initialized for {self.path_name}")
+            return success
+        except Exception as e:
+            print(f"PyAV initialization failed: {e}")
+            self.pyav_extractor = None
+            return False
+
+    def close_pyav(self):
+        """Close PyAV extractor if open."""
+        if self.pyav_extractor:
+            self.pyav_extractor.close()
+            self.pyav_extractor = None
+
     def get_frame(self, timestamp: float, *, accurate: bool = False) -> Optional[np.ndarray]:
         if not isinstance(self.source, Path) or not self.info or not self.info.video_stream:
             return None
+
+        # Try PyAV first if available and accurate seeking requested
+        if accurate and self.pyav_extractor:
+            try:
+                frame_rgb = self.pyav_extractor.get_frame_at_timestamp(timestamp)
+                if frame_rgb is not None:
+                    # Convert RGB to BGR for consistency with FFmpeg output
+                    return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                print(f"PyAV extraction failed, falling back to FFmpeg: {e}")
+
+        # FFmpeg fallback (original implementation)
         try:
             w, h = map(int, self.info.video_stream.resolution.split('x'))
             cmd = ['ffmpeg']
