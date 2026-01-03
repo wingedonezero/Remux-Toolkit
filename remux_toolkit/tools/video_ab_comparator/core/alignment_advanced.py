@@ -477,9 +477,10 @@ def advanced_align(source_a_path: str, source_b_path: str,
     scan_range = max(0.0, (scan_end_s - scan_start_s) - config.chunk_duration)
 
     # Generate chunk start times
+    chunk_count_int = int(config.chunk_count)  # Ensure integer for range()
     chunk_starts = [
-        scan_start_s + (scan_range / max(1, config.chunk_count - 1) * i)
-        for i in range(config.chunk_count)
+        scan_start_s + (scan_range / max(1, chunk_count_int - 1) * i)
+        for i in range(chunk_count_int)
     ]
 
     chunk_samples = int(round(config.chunk_duration * config.sample_rate))
@@ -518,13 +519,13 @@ def advanced_align(source_a_path: str, source_b_path: str,
             accepted_chunks.append(result)
 
         status = "ACCEPTED" if accepted else f"REJECTED (< {config.min_match_pct:.1f}%)"
-        print(f"  Chunk {i+1}/{config.chunk_count} @{start_time:.1f}s: "
+        print(f"  Chunk {i+1}/{chunk_count_int} @{start_time:.1f}s: "
               f"delay={int(round(delay_ms)):+d}ms (raw={delay_ms:+.3f}ms), "
               f"match={match_pct:.2f}% — {status}")
 
         if progress_callback and i % 5 == 0:
-            progress = 30 + int(60 * (i + 1) / config.chunk_count)
-            progress_callback(f"Analyzing chunks ({i+1}/{config.chunk_count})...", progress)
+            progress = 30 + int(60 * (i + 1) / chunk_count_int)
+            progress_callback(f"Analyzing chunks ({i+1}/{chunk_count_int})...", progress)
 
     # Select final offset based on strategy
     if not accepted_chunks:
@@ -556,7 +557,7 @@ def advanced_align(source_a_path: str, source_b_path: str,
         final_confidence = min(1.0, avg_match / 100.0)
 
     print(f"\nAudio alignment: offset={final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms), "
-          f"confidence={final_confidence:.2%}, accepted={len(accepted_chunks)}/{config.chunk_count}")
+          f"confidence={final_confidence:.2%}, accepted={len(accepted_chunks)}/{chunk_count_int}")
 
     # Visual frame verification for frame-perfect accuracy
     if config.visual_verification and final_offset_sec != 0.0:
@@ -566,7 +567,7 @@ def advanced_align(source_a_path: str, source_b_path: str,
         refined_offset, visual_confidence = visual_frame_verification(
             source_a_path, source_b_path,
             final_offset_sec, fps_a, fps_b,
-            config.visual_search_range_frames,
+            int(config.visual_search_range_frames),  # Ensure integer
             progress_callback
         )
 
