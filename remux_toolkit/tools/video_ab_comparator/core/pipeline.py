@@ -220,6 +220,13 @@ class ComparisonPipeline(QObject):
                 self.finished.emit({"error": "Video duration is too short (< 10 seconds)."})
                 return
 
+            # 1b. Initialize PyAV extractors for frame-accurate seeking (optional)
+            use_pyav = self.settings.get("use_pyav_seeking", True)
+            if use_pyav:
+                self._emit("Initializing frame-accurate seeking...", 7)
+                self.source_a.initialize_pyav()
+                self.source_b.initialize_pyav()
+
             # 2. Initialize detectors
             global_detector_classes = []
             if self.settings.get("enable_audio_analysis", True):

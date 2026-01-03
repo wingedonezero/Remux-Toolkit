@@ -27,4 +27,5 @@ DEFAULTS = {
 
     # Frame Mapping Settings
     "use_frame_mapper": True,  # Use VideoTimestamps for frame-perfect mapping
+    "use_pyav_seeking": True,  # Use PyAV for frame-accurate seeking (requires av package)
 }

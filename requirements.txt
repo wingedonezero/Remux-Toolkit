@@ -8,3 +8,4 @@ scenedetect[opencv]>=0.6.0
 opencv-python>=4.8.0
 videohash>=1.0.0
 VideoTimestamps>=1.0.0
+av>=10.0.0
