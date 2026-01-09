@@ -4,6 +4,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from pathlib import Path
 import subprocess
 import numpy as np
+import cv2
 import traceback
 import json
 import os
@@ -77,7 +78,9 @@ class ComparisonPipeline(QObject):
         if ts_b < 0 or ts_b >= self.source_b.info.duration:
             return chunk_idx, {}
 
-        chunk_duration = self.settings.get("analysis_chunk_duration", 2.0)
+        # IMPROVED: Reduced chunk duration from 2.0s to 1.0s for more granular sampling
+        # With 60 chunks @ 1.0s each = 60 seconds sampled (vs previous 8 chunks @ 2.0s = 16s)
+        chunk_duration = self.settings.get("analysis_chunk_duration", 1.0)
         chunk_results = {}
 
         # Store chunk metadata with per-frame scores
@@ -368,7 +371,10 @@ class ComparisonPipeline(QObject):
                         print(f"Global detector {detector.issue_name} failed: {e}")
 
             # 5. Frame-based analysis
-            num_chunks = self.settings.get('analysis_chunk_count', 8)
+            # IMPROVED: Increased from 8 to 60 chunks for 3.75x better coverage
+            # Each chunk: 1 second at 10fps = 10 frames
+            # Total: 600 frames analyzed (vs previous 160 frames)
+            num_chunks = self.settings.get('analysis_chunk_count', 60)
             self._emit(f"Analyzing {num_chunks} chunks with per-frame detection...", 35)
 
             # Initialize issue storage
@@ -451,6 +457,58 @@ class ComparisonPipeline(QObject):
         except Exception as e:
             self.finished.emit({"error": f"Pipeline failed: {e}\n{traceback.format_exc()}"})
 
+    def _is_low_information_frame(self, frame: np.ndarray, timestamp: float) -> bool:
+        """
+        Detect low-information frames that should be filtered from worst frame selection.
+
+        Filters out:
+        - Near-black frames (fade to black, credits on black background)
+        - Very low variance frames (static/freeze frames)
+        - Frames that are likely text-heavy (credits, subtitles)
+
+        Args:
+            frame: BGR frame from OpenCV
+            timestamp: Timestamp in seconds (for logging)
+
+        Returns:
+            True if frame should be filtered out, False if it's content
+        """
+        try:
+            # Convert to grayscale for analysis
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Check 1: Near-black frame (>80% of pixels below threshold)
+            black_threshold = 20  # Out of 255
+            black_pixel_ratio = np.sum(gray < black_threshold) / gray.size
+            if black_pixel_ratio > 0.80:
+                return True  # Mostly black
+
+            # Check 2: Very low variance (static/freeze frame or solid color)
+            variance = np.var(gray)
+            if variance < 10.0:  # Very low variance
+                return True  # Too uniform
+
+            # Check 3: Text detection (simple heuristic for credits)
+            # Credits typically have: high contrast edges + low overall variance
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / edges.size
+
+            # High edge density in specific regions = likely text
+            if edge_density > 0.05 and variance < 300:
+                # Additional check: text is usually in center or bottom
+                h, w = gray.shape
+                bottom_third = gray[int(h*0.66):, :]
+                bottom_variance = np.var(bottom_third)
+
+                if bottom_variance > variance * 0.5:  # Activity concentrated at bottom
+                    return True  # Likely credits/subtitles
+
+            return False  # Looks like real content
+
+        except Exception as e:
+            # If analysis fails, don't filter (safer)
+            return False
+
     def _compile_final_issues(self, aggregated_issues: Dict) -> Dict:
         """Compile and summarize the aggregated issue results."""
         final_issues = {}
@@ -468,9 +526,9 @@ class ComparisonPipeline(QObject):
             avg_a = np.mean(scores_a) if scores_a else -1
             avg_b = np.mean(scores_b) if scores_b else -1
 
-            # Find worst instances
-            worst_a = max(data.get('a', []), key=lambda x: x.get('score', -1), default={})
-            worst_b = max(data.get('b', []), key=lambda x: x.get('score', -1), default={})
+            # Find worst instances with content filtering
+            worst_a = self._find_worst_content_frame(data.get('a', []), 'A')
+            worst_b = self._find_worst_content_frame(data.get('b', []), 'B')
 
             # Build summaries
             summary_a = worst_a.get('summary', 'N/A')
@@ -482,9 +540,13 @@ class ComparisonPipeline(QObject):
                 summary_b = f"Avg: {avg_b:.1f} | Worst: {worst_b.get('summary', 'N/A')}"
 
             # Determine winner (lower score is better for most detectors)
+            # IMPROVED: More sensitive tie threshold for better differentiation
             winner = "Tie"
+            tie_threshold = self.settings.get('tie_threshold', 0.5)  # Configurable, default 0.5
+
             if avg_a >= 0 and avg_b >= 0:
-                if abs(avg_a - avg_b) >= 2.0:  # Significant difference threshold
+                diff = abs(avg_a - avg_b)
+                if diff >= tie_threshold:
                     winner = "A" if avg_a < avg_b else "B"
             elif avg_a >= 0:
                 winner = "A"
@@ -506,3 +568,55 @@ class ComparisonPipeline(QObject):
             }
 
         return final_issues
+
+    def _find_worst_content_frame(self, results: List[Dict], source_label: str) -> Dict:
+        """
+        Find worst frame from results, filtering out low-information frames.
+
+        Args:
+            results: List of detector results with scores and timestamps
+            source_label: 'A' or 'B' for logging
+
+        Returns:
+            Worst result dict, or empty dict if none found
+        """
+        if not results:
+            return {}
+
+        # Filter setting
+        enable_content_filter = self.settings.get('filter_low_information_frames', True)
+
+        if not enable_content_filter:
+            # Just return worst score (old behavior)
+            return max(results, key=lambda x: x.get('score', -1), default={})
+
+        # Try to find worst frame from actual content
+        content_results = []
+
+        for result in results:
+            timestamp = result.get('worst_frame_timestamp')
+            if timestamp is None:
+                content_results.append(result)  # Can't filter, include it
+                continue
+
+            # Extract frame at timestamp to analyze
+            try:
+                source = self.source_a if source_label == 'A' else self.source_b
+                frame = source.get_frame(timestamp, accurate=False)  # Fast seek is fine
+
+                if frame is not None:
+                    if not self._is_low_information_frame(frame, timestamp):
+                        content_results.append(result)  # Real content
+                else:
+                    content_results.append(result)  # Can't analyze, include it
+
+            except Exception:
+                content_results.append(result)  # Error, include it to be safe
+
+        # If we filtered everything out, fall back to original list
+        if not content_results:
+            print(f"Warning: Content filter removed all frames for source {source_label}, using unfiltered")
+            content_results = results
+
+        # Return worst from content frames
+        return max(content_results, key=lambda x: x.get('score', -1), default={})
