@@ -141,6 +141,13 @@ class VideoSource:
             self.pyav_extractor.close()
             self.pyav_extractor = None
 
+    def close(self):
+        """Close all resources and release file handles."""
+        self.close_pyav()
+        # Clear other resources
+        self.info = None
+        # No other file handles to close - FFmpeg is subprocess-based
+
     def get_frame(self, timestamp: float, *, accurate: bool = False) -> Optional[np.ndarray]:
         if not isinstance(self.source, Path) or not self.info or not self.info.video_stream:
             return None
