@@ -346,7 +346,7 @@ class ComparisonPipeline(QObject):
                         print(f"Frame mapping quality: {quality['exact_match_rate']:.1%} exact matches, "
                               f"avg drift {quality['avg_drift_ms']:.2f}ms, max drift {quality['max_drift_ms']:.2f}ms")
                     else:
-                        print("VideoTimestamps not available, using time-based seeking")
+                        print("Note: Using time-based frame seeking (VideoTimestamps not detected)")
                         self.frame_mapper = None
 
                 except Exception as e:
@@ -513,7 +513,10 @@ class ComparisonPipeline(QObject):
         """Compile and summarize the aggregated issue results."""
         final_issues = {}
 
-        for issue_name, data in aggregated_issues.items():
+        total_issues = len(aggregated_issues)
+        print(f"Compiling {total_issues} detector categories...")
+
+        for idx, (issue_name, data) in enumerate(aggregated_issues.items(), 1):
             scores_a = [res['score'] for res in data.get('a', [])
                        if res and 'score' in res and res['score'] >= 0]
             scores_b = [res['score'] for res in data.get('b', [])
@@ -527,6 +530,7 @@ class ComparisonPipeline(QObject):
             avg_b = np.mean(scores_b) if scores_b else -1
 
             # Find worst instances with content filtering
+            print(f"  [{idx}/{total_issues}] Processing {issue_name}...")
             worst_a = self._find_worst_content_frame(data.get('a', []), 'A')
             worst_b = self._find_worst_content_frame(data.get('b', []), 'B')
 
