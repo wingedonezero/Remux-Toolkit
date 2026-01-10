@@ -3,12 +3,36 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 import json
 import cv2
 import numpy as np
+import sys
 
 from .core.pipeline import ComparisonPipeline
 from .gui.results_widget import ResultsWidget
 from .gui.settings_dialog import SettingsDialog
 from .gui.detailed_comparison_widget import DetailedComparisonWidget
 from .video_ab_comparator_config import DEFAULTS
+
+
+class LogRedirector(QtCore.QObject):
+    """Redirects print() statements to Qt signal for logging."""
+    log_signal = QtCore.pyqtSignal(str)
+
+    def __init__(self, original_stream=None):
+        super().__init__()
+        self.original_stream = original_stream
+
+    def write(self, text):
+        """Called when print() writes to this stream."""
+        if text.strip():  # Only emit non-empty lines
+            self.log_signal.emit(text.rstrip())
+        # Also write to original stream (terminal) for debugging
+        if self.original_stream:
+            self.original_stream.write(text)
+
+    def flush(self):
+        """Required for file-like object."""
+        if self.original_stream:
+            self.original_stream.flush()
+
 
 class FrameLoader(QtCore.QObject):
     frames_ready = QtCore.pyqtSignal(object, object, float, float)
@@ -71,6 +95,11 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.chunk_frame_loader = None
         self.results_data = None
         self.settings = self.app_manager.load_config(self.tool_name, DEFAULTS)
+
+        # Set up logging redirection
+        self.log_redirector = LogRedirector(sys.stdout)
+        self.original_stdout = None
+
         self._init_ui()
 
     def _init_ui(self):
@@ -124,6 +153,9 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
 
         # Connect signals
         self.results_widget.scorecard_tree.itemClicked.connect(self.on_scorecard_item_clicked)
+
+        # Connect logging redirection to log tab
+        self.log_redirector.log_signal.connect(self.log_tab.append)
 
     def _select_file(self, line_edit):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Video File", "", "Video Files (*.mkv *.vob *.iso *.ts);;All Files (*)")
@@ -195,6 +227,10 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         # Clean up old temp files
         self._cleanup_temp_files(temp_dir)
 
+        # Redirect stdout to Analysis Log tab
+        self.original_stdout = sys.stdout
+        sys.stdout = self.log_redirector
+
         self.pipeline = ComparisonPipeline(path_a, path_b, self.settings, temp_dir)
 
         self.pipeline_thread = QtCore.QThread()
@@ -209,6 +245,11 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.progress_bar.setValue(value)
 
     def on_finished(self, results):
+        # Restore stdout
+        if self.original_stdout:
+            sys.stdout = self.original_stdout
+            self.original_stdout = None
+
         self.results_data = results
         self.log_tab.append("\n--- Analysis Complete ---")
         self.results_widget.populate(results)
@@ -366,6 +407,11 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
     def shutdown(self):
         """Called when tab is closed - clean up all resources."""
         print(f"Closing tab for {self.tool_name}. Shutting down worker...")
+
+        # Restore stdout if it was redirected
+        if self.original_stdout:
+            sys.stdout = self.original_stdout
+            self.original_stdout = None
 
         # Stop pipeline if running
         if self.pipeline_thread and self.pipeline_thread.isRunning():
