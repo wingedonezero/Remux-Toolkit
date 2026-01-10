@@ -133,7 +133,6 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.addRow(filter_checkbox)
         self.controls['filter_low_information_frames'] = filter_checkbox
 
-        layout.addStretch()
         self.tabs.addTab(tab, "Analysis")
 
     def _create_alignment_tab(self):
@@ -281,7 +280,6 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.addRow(pyav_checkbox)
         self.controls['use_pyav_seeking'] = pyav_checkbox
 
-        layout.addStretch()
         self.tabs.addTab(scroll, "Alignment")
 
     def _create_frame_sync_tab(self):
@@ -408,7 +406,6 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.addRow(tolerance_label, tolerance_spin)
         self.controls['align_visual_agreement_tolerance_ms'] = tolerance_spin
 
-        layout.addStretch()
         self.tabs.addTab(tab, "Frame Sync")
 
     def _create_detectors_tab(self):
