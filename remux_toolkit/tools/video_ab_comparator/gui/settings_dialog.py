@@ -19,6 +19,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
         # Create tabs
         self._create_analysis_tab()
+        self._create_scoring_tab()
         self._create_alignment_tab()
         self._create_frame_sync_tab()
         self._create_detectors_tab()
@@ -134,6 +135,142 @@ class SettingsDialog(QtWidgets.QDialog):
         self.controls['filter_low_information_frames'] = filter_checkbox
 
         self.tabs.addTab(tab, "Analysis")
+
+    def _create_scoring_tab(self):
+        """Weighted scoring settings for anime comparison."""
+        tab = QtWidgets.QWidget()
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(tab)
+
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        # Header
+        header = QtWidgets.QLabel("<b>Anime-Optimized Weighted Scoring</b>")
+        layout.addWidget(header)
+
+        info = QtWidgets.QLabel(
+            "Weighted scoring prioritizes critical quality issues for anime.\n"
+            "Choose a preset based on what you're comparing, or use 'balanced' for equal weighting."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: gray;")
+        layout.addWidget(info)
+
+        layout.addWidget(QtWidgets.QLabel(""))  # Spacer
+
+        # Enable weighted scoring
+        enable_weighted_checkbox = QtWidgets.QCheckBox("Enable Weighted Scoring")
+        enable_weighted_checkbox.setChecked(self.settings.get('enable_weighted_scoring', True))
+        enable_weighted_checkbox.setToolTip(
+            "Use weighted scoring instead of simple majority vote.\n"
+            "Critical detectors (compression, banding) count more than minor issues.\n"
+            "Recommended: ON for anime"
+        )
+        layout.addWidget(enable_weighted_checkbox)
+        self.controls['enable_weighted_scoring'] = enable_weighted_checkbox
+
+        layout.addWidget(QtWidgets.QLabel(""))  # Spacer
+
+        # Preset selection
+        preset_label = QtWidgets.QLabel("Scoring Preset:")
+        preset_combo = QtWidgets.QComboBox()
+        preset_combo.addItems([
+            "anime_bd_vs_bd - Standard BD comparison (upscaling critical)",
+            "anime_dvd_vs_bd - DVD vs BD (lower upscaling weight)",
+            "anime_dvd_vs_dvd - DVD comparison (focus on compression)",
+            "balanced - All detectors equal weight (classic mode)"
+        ])
+
+        current_preset = self.settings.get('scoring_preset', 'anime_bd_vs_bd')
+        preset_map = {
+            'anime_bd_vs_bd': 0,
+            'anime_dvd_vs_bd': 1,
+            'anime_dvd_vs_dvd': 2,
+            'balanced': 3
+        }
+        preset_combo.setCurrentIndex(preset_map.get(current_preset, 0))
+        preset_combo.setToolTip(
+            "Choose a preset based on your comparison type:\n\n"
+            "• BD vs BD: Standard anime quality comparison\n"
+            "  - Critical: Compression, Banding, Upscaling (3.0x)\n"
+            "  - Important: Ringing, Audio, Ghosting (2.0x)\n\n"
+            "• DVD vs BD: When comparing DVD to potentially upscaled BD\n"
+            "  - Critical: Compression, Banding (3.5x)\n"
+            "  - Upscaling weight reduced (BD may be upscaled DVD source)\n\n"
+            "• DVD vs DVD: Focus on encoding/filtering quality\n"
+            "  - Critical: Compression (3.5x), Banding (3.0x)\n"
+            "  - Upscaling less relevant (0.5x)\n\n"
+            "• Balanced: All detectors weighted equally (1.0x)"
+        )
+
+        layout.addWidget(preset_label)
+        layout.addWidget(preset_combo)
+        self.controls['scoring_preset_combo'] = preset_combo
+
+        layout.addWidget(QtWidgets.QLabel(""))  # Spacer
+
+        # Show detailed breakdown
+        show_breakdown_checkbox = QtWidgets.QCheckBox("Show Detailed Weight Breakdown")
+        show_breakdown_checkbox.setChecked(self.settings.get('show_detailed_breakdown', True))
+        show_breakdown_checkbox.setToolTip(
+            "Show per-detector weight contribution in results.\n"
+            "Helps understand why a source won.\n"
+            "Recommended: ON"
+        )
+        layout.addWidget(show_breakdown_checkbox)
+        self.controls['show_detailed_breakdown'] = show_breakdown_checkbox
+
+        layout.addWidget(QtWidgets.QLabel(""))  # Spacer
+
+        # Weight reference table
+        weights_group = QtWidgets.QGroupBox("Weight Reference (Current Preset)")
+        weights_layout = QtWidgets.QVBoxLayout(weights_group)
+
+        weights_info = QtWidgets.QLabel(
+            "Weight Scale:\n"
+            "• 3.0-3.5x = Critical (must win these for anime quality)\n"
+            "• 2.0-2.5x = Important (significant quality factors)\n"
+            "• 1.0-1.5x = Normal (less critical but still considered)\n"
+            "• 0.5x = Low priority (expected differences)"
+        )
+        weights_info.setStyleSheet("font-family: monospace; color: #555;")
+        weights_layout.addWidget(weights_info)
+
+        # Dynamic weight display
+        self.weights_display = QtWidgets.QTextEdit()
+        self.weights_display.setReadOnly(True)
+        self.weights_display.setMaximumHeight(200)
+        self.weights_display.setStyleSheet(
+            "font-family: monospace; font-size: 10pt; background-color: #f5f5f5;"
+        )
+        weights_layout.addWidget(self.weights_display)
+
+        layout.addWidget(weights_group)
+
+        # Update weight display when preset changes
+        def update_weight_display():
+            from ..video_ab_comparator_config import ANIME_PRESETS
+            preset_idx = preset_combo.currentIndex()
+            preset_names = ['anime_bd_vs_bd', 'anime_dvd_vs_bd', 'anime_dvd_vs_dvd', 'balanced']
+            preset_name = preset_names[preset_idx] if preset_idx < len(preset_names) else 'anime_bd_vs_bd'
+
+            weights = ANIME_PRESETS.get(preset_name, {})
+
+            # Sort by weight (descending) then by name
+            sorted_weights = sorted(weights.items(), key=lambda x: (-x[1], x[0]))
+
+            display_text = ""
+            for detector, weight in sorted_weights:
+                display_text += f"{detector:<30} {weight:>4.1f}x\n"
+
+            self.weights_display.setPlainText(display_text)
+
+        preset_combo.currentIndexChanged.connect(update_weight_display)
+        update_weight_display()
+
+        layout.addStretch()
+        self.tabs.addTab(scroll, "Anime Scoring")
 
     def _create_alignment_tab(self):
         """Audio alignment settings."""
@@ -490,6 +627,16 @@ class SettingsDialog(QtWidgets.QDialog):
         if 'filter_low_information_frames' in self.controls:
             self.controls['filter_low_information_frames'].setChecked(self.settings.get('filter_low_information_frames', True))
 
+        # Scoring tab
+        if 'enable_weighted_scoring' in self.controls:
+            self.controls['enable_weighted_scoring'].setChecked(self.settings.get('enable_weighted_scoring', True))
+        if 'scoring_preset_combo' in self.controls:
+            preset = self.settings.get('scoring_preset', 'anime_bd_vs_bd')
+            preset_map = {'anime_bd_vs_bd': 0, 'anime_dvd_vs_bd': 1, 'anime_dvd_vs_dvd': 2, 'balanced': 3}
+            self.controls['scoring_preset_combo'].setCurrentIndex(preset_map.get(preset, 0))
+        if 'show_detailed_breakdown' in self.controls:
+            self.controls['show_detailed_breakdown'].setChecked(self.settings.get('show_detailed_breakdown', True))
+
         # Alignment tab
         if 'use_advanced_alignment' in self.controls:
             self.controls['use_advanced_alignment'].setChecked(self.settings.get('use_advanced_alignment', False))
@@ -512,6 +659,16 @@ class SettingsDialog(QtWidgets.QDialog):
             self.settings['tie_threshold'] = self.controls['tie_threshold'].value()
         if 'filter_low_information_frames' in self.controls:
             self.settings['filter_low_information_frames'] = self.controls['filter_low_information_frames'].isChecked()
+
+        # Scoring tab
+        if 'enable_weighted_scoring' in self.controls:
+            self.settings['enable_weighted_scoring'] = self.controls['enable_weighted_scoring'].isChecked()
+        if 'scoring_preset_combo' in self.controls:
+            idx = self.controls['scoring_preset_combo'].currentIndex()
+            preset_map = {0: 'anime_bd_vs_bd', 1: 'anime_dvd_vs_bd', 2: 'anime_dvd_vs_dvd', 3: 'balanced'}
+            self.settings['scoring_preset'] = preset_map.get(idx, 'anime_bd_vs_bd')
+        if 'show_detailed_breakdown' in self.controls:
+            self.settings['show_detailed_breakdown'] = self.controls['show_detailed_breakdown'].isChecked()
 
         # Alignment tab
         if 'use_advanced_alignment' in self.controls:

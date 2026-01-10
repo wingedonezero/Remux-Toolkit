@@ -24,6 +24,7 @@ from ..detectors.noise import DNRDetector, SharpeningDetector
 from ..detectors.audio import AudioDetector
 from ..detectors.telecine import GhostingDetector, CadenceDetector
 from ..detectors.geometry import AspectRatioDetector
+from ..video_ab_comparator_config import ANIME_PRESETS
 
 class ComparisonPipeline(QObject):
     progress = pyqtSignal(str, int)
@@ -423,16 +424,74 @@ class ComparisonPipeline(QObject):
             self._emit("Finalizing report…", 95)
             final_issues = self._compile_final_issues(aggregated_issues)
 
-            # Calculate verdict
+            # Calculate verdict with weighted scoring
+            enable_weighted = self.settings.get('enable_weighted_scoring', True)
+            scoring_preset = self.settings.get('scoring_preset', 'anime_bd_vs_bd')
+            show_detailed = self.settings.get('show_detailed_breakdown', True)
+
+            # Get weights from preset or custom
+            if scoring_preset == "custom":
+                weights = self.settings.get('custom_detector_weights', {})
+            else:
+                weights = ANIME_PRESETS.get(scoring_preset, ANIME_PRESETS['anime_bd_vs_bd'])
+
+            # Calculate both unweighted and weighted scores
             wins_a = sum(1 for d in final_issues.values() if d.get('winner') == 'A')
             wins_b = sum(1 for d in final_issues.values() if d.get('winner') == 'B')
 
-            if wins_a > wins_b:
-                verdict = f"✅ Source A is recommended ({wins_a}/{len(final_issues)} categories)"
-            elif wins_b > wins_a:
-                verdict = f"✅ Source B is recommended ({wins_b}/{len(final_issues)} categories)"
+            weighted_score_a = 0.0
+            weighted_score_b = 0.0
+            total_weight = 0.0
+            weight_breakdown = []
+
+            if enable_weighted:
+                for detector_name, result in final_issues.items():
+                    winner = result.get('winner')
+                    if winner == 'Tie':
+                        continue
+
+                    # Get weight for this detector (default to 1.0 if not found)
+                    weight = weights.get(detector_name, 1.0)
+                    total_weight += weight
+
+                    # Add weighted contribution
+                    if winner == 'A':
+                        weighted_score_a += weight
+                        if show_detailed:
+                            weight_breakdown.append(f"  ✅ A wins {detector_name} (+{weight:.1f})")
+                    else:  # winner == 'B'
+                        weighted_score_b += weight
+                        if show_detailed:
+                            weight_breakdown.append(f"  ✅ B wins {detector_name} (+{weight:.1f})")
+
+            # Determine verdict based on weighted or unweighted scoring
+            if enable_weighted and total_weight > 0:
+                # Weighted verdict
+                score_diff = abs(weighted_score_a - weighted_score_b)
+                tie_threshold_weighted = self.settings.get('tie_threshold', 0.5)
+
+                if score_diff < tie_threshold_weighted:
+                    verdict = f"⚖️ Sources are equivalent (weighted scores: A={weighted_score_a:.1f}, B={weighted_score_b:.1f})"
+                elif weighted_score_a > weighted_score_b:
+                    verdict = f"✅ Source A is recommended (weighted score: {weighted_score_a:.1f} vs {weighted_score_b:.1f})"
+                    verdict += f"\n   [Preset: {scoring_preset}] A wins {wins_a}/{len(final_issues)} categories"
+                else:
+                    verdict = f"✅ Source B is recommended (weighted score: {weighted_score_b:.1f} vs {weighted_score_a:.1f})"
+                    verdict += f"\n   [Preset: {scoring_preset}] B wins {wins_b}/{len(final_issues)} categories"
+
+                # Add detailed breakdown if enabled
+                if show_detailed and weight_breakdown:
+                    verdict += "\n\n📊 Weighted Breakdown:"
+                    verdict += "\n" + "\n".join(weight_breakdown)
+                    verdict += f"\n   Total Weight Used: {total_weight:.1f}"
             else:
-                verdict = f"⚖️ Sources are equivalent ({wins_a} categories each)"
+                # Unweighted verdict (old behavior)
+                if wins_a > wins_b:
+                    verdict = f"✅ Source A is recommended ({wins_a}/{len(final_issues)} categories)"
+                elif wins_b > wins_a:
+                    verdict = f"✅ Source B is recommended ({wins_b}/{len(final_issues)} categories)"
+                else:
+                    verdict = f"⚖️ Sources are equivalent ({wins_a} categories each)"
 
             # Add alignment info to verdict
             if abs(align.offset_sec) > 0.02:  # More than ~half a frame at 24fps

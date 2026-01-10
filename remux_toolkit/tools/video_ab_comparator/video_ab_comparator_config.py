@@ -1,5 +1,101 @@
 # remux_toolkit/tools/video_ab_comparator/video_ab_comparator_config.py
 
+# Weighted Scoring Presets for Anime
+# These weights determine how much each detector contributes to the final verdict
+# Higher weight = more important for determining the winner
+ANIME_PRESETS = {
+    # BD vs BD comparison (standard anime quality comparison)
+    "anime_bd_vs_bd": {
+        # Critical - Most visible quality issues in anime (weight 3.0)
+        "Compression Artifacts": 3.0,      # Blocking/mosquito noise destroys flat colors and line art
+        "Color Banding": 3.0,              # Extremely visible in anime's smooth gradients
+        "Upscaled Video": 3.0,             # Native resolution matters for BD vs BD
+
+        # Important - Significant quality factors (weight 2.0)
+        "Ringing / Halos": 2.0,            # Very visible on line art and sharp edges
+        "Audio Analysis": 2.0,             # PAL speedup and quality issues critical
+        "Ghosting / Blending": 2.0,        # IVTC issues common in anime releases
+        "Excessive Sharpening": 2.0,       # Destroys line art quality
+
+        # Normal - Less critical but still important (weight 1.0)
+        "Aspect Ratio": 1.0,               # Important but usually obvious
+        "Dot Crawl": 1.0,                  # Less common in modern releases
+        "Chroma Shift": 1.0,               # Less visible in anime than live action
+        "Rainbowing / Cross-Color": 1.0,  # Less common in modern sources
+        "Color Cast": 1.0,                 # Can be stylistic choice
+        "Over-DNR / Waxiness": 1.0,        # Less critical than compression
+        "Interlace Combing": 1.0,          # Combined metric, less critical
+        "Cadence Irregularity": 1.0,       # Combined metric, less critical
+    },
+
+    # DVD vs BD comparison (upscaling is expected, focus on encoding quality)
+    "anime_dvd_vs_bd": {
+        # Critical - Encoding quality matters more than resolution (weight 3.0)
+        "Compression Artifacts": 3.5,      # DVD compression often worse, weight higher
+        "Color Banding": 3.5,              # Critical for distinguishing good DVD from bad BD
+
+        # Important - But upscaling is expected (weight 2.0)
+        "Upscaled Video": 1.5,             # Lower weight - BD might be upscaled DVD source
+        "Ringing / Halos": 2.5,            # Filtering artifacts more important
+        "Audio Analysis": 2.5,             # Audio quality often better on BD
+        "Ghosting / Blending": 2.5,        # IVTC quality critical
+        "Excessive Sharpening": 2.0,       # BD might over-sharpen DVD source
+        "Over-DNR / Waxiness": 2.0,        # BD might over-filter DVD source
+
+        # Normal (weight 1.0)
+        "Aspect Ratio": 1.0,
+        "Dot Crawl": 1.5,                  # More common in DVD sources
+        "Chroma Shift": 1.0,
+        "Rainbowing / Cross-Color": 1.5,  # More common in DVD sources
+        "Color Cast": 1.0,
+        "Interlace Combing": 1.5,          # More relevant for DVD sources
+        "Cadence Irregularity": 1.5,
+    },
+
+    # DVD vs DVD comparison (focus on encoding quality and filtering)
+    "anime_dvd_vs_dvd": {
+        # Critical - Compression and filtering quality (weight 3.0)
+        "Compression Artifacts": 3.5,      # Most important for DVD vs DVD
+        "Color Banding": 3.0,              # DVD often has banding issues
+
+        # Important (weight 2.0)
+        "Ringing / Halos": 2.5,            # Common filtering issue
+        "Audio Analysis": 2.0,             # Audio quality and PAL speedup
+        "Ghosting / Blending": 2.5,        # IVTC quality varies
+        "Excessive Sharpening": 2.0,
+        "Over-DNR / Waxiness": 2.0,        # Common DVD filtering issue
+        "Interlace Combing": 2.0,          # More relevant for DVD
+        "Cadence Irregularity": 2.0,
+
+        # Normal (weight 1.0)
+        "Upscaled Video": 0.5,             # Both are SD, less relevant
+        "Aspect Ratio": 1.0,
+        "Dot Crawl": 1.5,                  # More common in DVD
+        "Chroma Shift": 1.5,               # More common in DVD
+        "Rainbowing / Cross-Color": 1.5,  # More common in DVD
+        "Color Cast": 1.0,
+    },
+
+    # Balanced preset (all detectors weighted equally - old behavior)
+    "balanced": {
+        "Compression Artifacts": 1.0,
+        "Color Banding": 1.0,
+        "Upscaled Video": 1.0,
+        "Ringing / Halos": 1.0,
+        "Audio Analysis": 1.0,
+        "Ghosting / Blending": 1.0,
+        "Excessive Sharpening": 1.0,
+        "Over-DNR / Waxiness": 1.0,
+        "Aspect Ratio": 1.0,
+        "Dot Crawl": 1.0,
+        "Chroma Shift": 1.0,
+        "Rainbowing / Cross-Color": 1.0,
+        "Color Cast": 1.0,
+        "Interlace Combing": 1.0,
+        "Cadence Irregularity": 1.0,
+    }
+}
+
 DEFAULTS = {
     "source_a_path": "",
     "source_b_path": "",
@@ -10,6 +106,15 @@ DEFAULTS = {
     # Scoring settings
     "tie_threshold": 0.5,  # Reduced from 2.0: more sensitive winner detection
     "filter_low_information_frames": True,  # Filter credits/black frames from worst frame selection
+
+    # Weighted scoring for anime (NEW)
+    "enable_weighted_scoring": True,  # Use weighted scoring instead of simple majority vote
+    "scoring_preset": "anime_bd_vs_bd",  # Preset to use: anime_bd_vs_bd, anime_dvd_vs_bd, anime_dvd_vs_dvd, balanced
+    "show_detailed_breakdown": True,  # Show per-detector weight contribution in results
+
+    # Custom detector weights (used when scoring_preset is "custom")
+    # Format: {"Detector Name": weight} - set to override preset
+    "custom_detector_weights": {},
 
     "enable_audio_analysis": True,
     "enable_interlace_detection": True,
