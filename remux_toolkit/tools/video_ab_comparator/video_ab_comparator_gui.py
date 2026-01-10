@@ -180,6 +180,9 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         self.settings['source_b_path'] = path_b
         self.app_manager.save_config(self.tool_name, self.settings)
 
+        # Clean up previous run (critical - prevents file locks and RAM leaks)
+        self._cleanup_previous_run()
+
         self.start_button.setEnabled(False)
         self.export_button.setEnabled(False)
         self.log_tab.clear()
@@ -188,6 +191,9 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
 
         # Get temp directory for this tool
         temp_dir = self.app_manager.get_temp_dir(self.tool_name)
+
+        # Clean up old temp files
+        self._cleanup_temp_files(temp_dir)
 
         self.pipeline = ComparisonPipeline(path_a, path_b, self.settings, temp_dir)
 
@@ -308,18 +314,70 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
         else:
             self.results_widget.frame_b_label.setText(f"Frame B\n(Could not load at {ts_b:.2f}s)")
 
+    def _cleanup_previous_run(self):
+        """Clean up resources from previous comparison run."""
+        # Stop and clean up frame loader threads
+        if self.frame_loader_thread and self.frame_loader_thread.isRunning():
+            self.frame_loader_thread.quit()
+            self.frame_loader_thread.wait()
+        self.frame_loader = None
+        self.frame_loader_thread = None
+
+        if self.chunk_frame_loader_thread and self.chunk_frame_loader_thread.isRunning():
+            self.chunk_frame_loader_thread.quit()
+            self.chunk_frame_loader_thread.wait()
+        self.chunk_frame_loader = None
+        self.chunk_frame_loader_thread = None
+
+        # Clean up pipeline and VideoSource objects (releases file handles)
+        if self.pipeline:
+            try:
+                if hasattr(self.pipeline, 'source_a') and self.pipeline.source_a:
+                    self.pipeline.source_a.close()
+                if hasattr(self.pipeline, 'source_b') and self.pipeline.source_b:
+                    self.pipeline.source_b.close()
+            except Exception as e:
+                print(f"Error closing video sources: {e}")
+            self.pipeline = None
+
+        # Force garbage collection to free RAM
+        import gc
+        gc.collect()
+
+    def _cleanup_temp_files(self, temp_dir):
+        """Clean up temporary files from previous runs."""
+        if not temp_dir:
+            return
+
+        import os
+        try:
+            if os.path.exists(temp_dir):
+                for filename in os.listdir(temp_dir):
+                    file_path = os.path.join(temp_dir, filename)
+                    try:
+                        if os.path.isfile(file_path):
+                            os.unlink(file_path)
+                    except Exception as e:
+                        # Don't fail if we can't delete a file
+                        print(f"Could not delete temp file {filename}: {e}")
+        except Exception as e:
+            print(f"Error cleaning temp directory: {e}")
+
     def shutdown(self):
+        """Called when tab is closed - clean up all resources."""
+        print(f"Closing tab for {self.tool_name}. Shutting down worker...")
+
+        # Stop pipeline if running
         if self.pipeline_thread and self.pipeline_thread.isRunning():
             if self.pipeline:
                 self.pipeline.stop()
             self.pipeline_thread.quit()
             self.pipeline_thread.wait()
-        if self.frame_loader_thread and self.frame_loader_thread.isRunning():
-            self.frame_loader_thread.quit()
-            self.frame_loader_thread.wait()
-        if self.chunk_frame_loader_thread and self.chunk_frame_loader_thread.isRunning():
-            self.chunk_frame_loader_thread.quit()
-            self.chunk_frame_loader_thread.wait()
+
+        # Clean up all resources
+        self._cleanup_previous_run()
+
+        print(f"Tab {self.tool_name} closed successfully.")
 
     def save_settings(self):
         """Called when tab is closed to save settings."""

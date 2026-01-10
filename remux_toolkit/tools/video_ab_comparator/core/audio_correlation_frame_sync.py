@@ -607,9 +607,9 @@ def match_frame_at_checkpoint(
 
     print(f"[FrameSync]   Predicted target center: frame {target_center_frame} ({target_center_time_ms:.1f}ms)")
 
-    # Search range
-    search_start_frame = max(window_radius, target_center_frame - search_range_frames)
-    search_end_frame = target_center_frame + search_range_frames
+    # Search range - ensure all values are integers for range()
+    search_start_frame = int(max(window_radius, target_center_frame - search_range_frames))
+    search_end_frame = int(target_center_frame + search_range_frames)
 
     print(f"[FrameSync]   Searching frames {search_start_frame} to {search_end_frame} ({search_end_frame - search_start_frame + 1} positions)")
 
