@@ -670,7 +670,7 @@ def match_frame_at_checkpoint(
         # Progress update
         if progress_callback and (target_center - search_start_frame) % 10 == 0:
             progress = (target_center - search_start_frame) / (search_end_frame - search_start_frame + 1)
-            progress_callback(f"Searching checkpoint frames... {progress*100:.0f}%")
+            progress_callback(f"Searching checkpoint frames...", progress*100)
 
     # Calculate match quality
     window_size = len(source_hashes)

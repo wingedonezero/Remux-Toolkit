@@ -14,7 +14,7 @@ try:
     HAS_VIDEO_TIMESTAMPS = True
 except ImportError:
     HAS_VIDEO_TIMESTAMPS = False
-    print("WARNING: VideoTimestamps not installed. Install with: pip install VideoTimestamps")
+    # VideoTimestamps is optional - provides frame-perfect timestamp mapping if available
 
 
 @dataclass
@@ -70,7 +70,7 @@ class FrameMapper:
                 self.vts_a = None
                 self.vts_b = None
         else:
-            print("VideoTimestamps not available. Frame mapping will use calculated positions.")
+            print("Note: VideoTimestamps not detected, using calculated frame positions (this is fine for most cases)")
 
     def is_available(self) -> bool:
         """Check if frame mapping is available."""
