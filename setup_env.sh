@@ -75,8 +75,9 @@ install_python_conda() {
 
         # Use only conda-forge to avoid TOS issues with default channels
         # Also disable default channels with --override-channels
+        # Only allow up to 3.13.11 to avoid newer versions with missing libraries
         if conda install -y python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
-           conda install -y "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
+           conda install -y "python>=3.13.0,<=${PYTHON_VERSION}" pip --override-channels -c conda-forge; then
             return 0
         else
             return 1
@@ -84,8 +85,9 @@ install_python_conda() {
     elif command -v mamba &> /dev/null; then
         echo -e "${BLUE}Found mamba, installing Python ${PYTHON_VERSION}...${NC}"
         # Mamba doesn't have the same TOS restrictions, but use conda-forge anyway
+        # Only allow up to 3.13.11 to avoid newer versions with missing libraries
         if mamba install -y python="${PYTHON_VERSION}" pip -c conda-forge 2>/dev/null || \
-           mamba install -y "python>=${PYTHON_VERSION%.*},<3.14" pip -c conda-forge; then
+           mamba install -y "python>=3.13.0,<=${PYTHON_VERSION}" pip -c conda-forge; then
             return 0
         else
             return 1
@@ -118,16 +120,19 @@ install_python_standalone() {
                 head -1)
 
             if [ -z "$asset_url" ]; then
-                local minor_version="${PYTHON_VERSION%.*}"
-                asset_url=$(curl -sL "$api_url" | \
-                    grep -oE "https://github.com/[^\"]*cpython-${minor_version}\\.[0-9]+\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz" | \
-                    sort -Vr | \
-                    head -1)
+                # Try specific versions from 3.13.11 down to 3.13.0 to avoid newer versions with missing libraries
+                for patch_ver in {11..0}; do
+                    asset_url=$(curl -sL "$api_url" | \
+                        grep -oE "https://github.com/[^\"]*cpython-3\\.13\\.${patch_ver}\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz" | \
+                        head -1)
+                    if [ -n "$asset_url" ]; then
+                        echo -e "${YELLOW}Exact Python ${PYTHON_VERSION} build not found. Using Python 3.13.${patch_ver} instead.${NC}" >&2
+                        break
+                    fi
+                done
 
-                if [ -n "$asset_url" ]; then
-                    echo -e "${YELLOW}Exact Python ${PYTHON_VERSION} build not found. Falling back to latest ${minor_version}.x build.${NC}" >&2
-                else
-                    echo -e "${RED}Unable to find standalone Python ${PYTHON_VERSION} build.${NC}" >&2
+                if [ -z "$asset_url" ]; then
+                    echo -e "${RED}Unable to find standalone Python ${PYTHON_VERSION} build (tried 3.13.0-3.13.11).${NC}" >&2
                     return 1
                 fi
             fi
