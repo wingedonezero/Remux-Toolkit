@@ -42,9 +42,8 @@ check_python_version() {
     local python_cmd=$1
     if command -v "$python_cmd" &> /dev/null; then
         # Check version
-        local version
-        version=$("$python_cmd" --version 2>&1 | grep -oP '\d+\.\d+\.\d+')
-        if [[ "$version" == "$PYTHON_VERSION" ]]; then
+        local version=$("$python_cmd" --version 2>&1 | grep -oP '\d+\.\d+\.\d+')
+        if [[ "$version" == 3.13.* ]]; then
             # Verify Python actually works by running multiple checks
             if "$python_cmd" -c "import sys, encodings; print('OK')" &> /dev/null; then
                 # Also verify it can create a basic venv
@@ -75,8 +74,8 @@ install_python_conda() {
 
         # Use only conda-forge to avoid TOS issues with default channels
         # Also disable default channels with --override-channels
-        if conda install -y python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
-           conda install -y "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
+        if conda install -y python=3.13.11 --override-channels -c conda-forge 2>/dev/null || \
+           conda install -y "python>=3.13,<3.14" --override-channels -c conda-forge; then
             return 0
         else
             return 1
@@ -84,8 +83,8 @@ install_python_conda() {
     elif command -v mamba &> /dev/null; then
         echo -e "${BLUE}Found mamba, installing Python ${PYTHON_VERSION}...${NC}"
         # Mamba doesn't have the same TOS restrictions, but use conda-forge anyway
-        if mamba install -y python="${PYTHON_VERSION}" pip -c conda-forge 2>/dev/null || \
-           mamba install -y "python>=${PYTHON_VERSION%.*},<3.14" pip -c conda-forge; then
+        if mamba install -y python=3.13.11 -c conda-forge 2>/dev/null || \
+           mamba install -y "python>=3.13,<3.14" -c conda-forge; then
             return 0
         else
             return 1
@@ -96,45 +95,11 @@ install_python_conda() {
     fi
 }
 
-# Function to install Python into a local conda environment
-install_python_conda_env() {
-    local env_dir="$PROJECT_DIR/.conda-python"
-    local conda_cmd=""
-
-    if command -v conda &> /dev/null; then
-        conda_cmd="conda"
-    elif command -v mamba &> /dev/null; then
-        conda_cmd="mamba"
-    else
-        return 1
-    fi
-
-    echo -e "${YELLOW}Attempting to install Python ${PYTHON_VERSION} into local conda env...${NC}"
-    if [ -d "$env_dir" ]; then
-        echo -e "${BLUE}Updating existing conda env at: $env_dir${NC}"
-        if "$conda_cmd" install -y -p "$env_dir" python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
-           "$conda_cmd" install -y -p "$env_dir" "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
-            echo "$env_dir/bin/python"
-            return 0
-        fi
-    else
-        echo -e "${BLUE}Creating conda env at: $env_dir${NC}"
-        if "$conda_cmd" create -y -p "$env_dir" python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
-           "$conda_cmd" create -y -p "$env_dir" "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
-            echo "$env_dir/bin/python"
-            return 0
-        fi
-    fi
-
-    return 1
-}
-
 # Function to download and install standalone Python
 install_python_standalone() {
     echo -e "${YELLOW}Attempting to install Python ${PYTHON_VERSION} standalone build...${NC}" >&2
 
     local python_dir="$PROJECT_DIR/.python"
-    mkdir -p "$python_dir"
 
     # Detect architecture
     local arch
@@ -144,28 +109,11 @@ install_python_standalone() {
 
     if [[ "$os" == "linux" ]]; then
         if [[ "$arch" == "x86_64" ]]; then
-            local api_url="https://api.github.com/repos/astral-sh/python-build-standalone/releases?per_page=20"
-            local asset_url
-            asset_url=$(curl -sL "$api_url" | \
-                grep -oE "https://github.com/[^\"]*cpython-${PYTHON_VERSION}\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz" | \
-                head -1)
-
-            if [ -z "$asset_url" ]; then
-                local minor_version="${PYTHON_VERSION%.*}"
-                asset_url=$(curl -sL "$api_url" | \
-                    grep -oE "https://github.com/[^\"]*cpython-${minor_version}\\.[0-9]+\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz" | \
-                    sort -Vr | \
-                    head -1)
-
-                if [ -n "$asset_url" ]; then
-                    echo -e "${YELLOW}Exact Python ${PYTHON_VERSION} build not found. Falling back to latest ${minor_version}.x build.${NC}" >&2
-                else
-                    echo -e "${RED}Unable to find standalone Python ${PYTHON_VERSION} build.${NC}" >&2
-                    return 1
-                fi
-            fi
-
-            local python_url="$asset_url"
+            # Use python-build-standalone (Astral) and the tag that includes CPython 3.13.11
+            # (Release 20251205 includes CPython 3.13.11 for linux x86_64 gnu install_only.)
+            local tag="20251205"
+            local triple="x86_64-unknown-linux-gnu"
+            local python_url="https://github.com/astral-sh/python-build-standalone/releases/download/${tag}/cpython-${PYTHON_VERSION}+${tag}-${triple}-install_only.tar.gz"
         else
             echo -e "${RED}Unsupported architecture: $arch${NC}" >&2
             return 1
@@ -176,18 +124,43 @@ install_python_standalone() {
     fi
 
     echo -e "${BLUE}Downloading Python from: $python_url${NC}" >&2
-    local temp_file
-    temp_file=$(mktemp)
-    if curl -L -o "$temp_file" "$python_url" 2>&1 | grep -E "^\s*[0-9]+" >&2; then
-        echo -e "${BLUE}Extracting Python...${NC}" >&2
-        tar -xzf "$temp_file" -C "$python_dir" --strip-components=1 2>&2
-        rm "$temp_file"
 
-        # Check if extraction was successful
-        if [ -f "$python_dir/bin/python3" ]; then
-            echo "$python_dir/bin/python3"
-            return 0
+    # Clean target to avoid mixing versions
+    rm -rf "$python_dir"
+    mkdir -p "$python_dir"
+
+    local temp_file
+    temp_file="$(mktemp -t pbs-python.XXXXXX.tar.gz)"
+
+    # Better download: fail on HTTP errors, follow redirects, resume, retry
+    if ! curl -fL -C - --retry 5 --retry-delay 1 --retry-all-errors \
+        -o "$temp_file" "$python_url" >&2; then
+        echo -e "${RED}Failed to download Python tarball${NC}" >&2
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    echo -e "${BLUE}Extracting Python...${NC}" >&2
+    if ! tar -xzf "$temp_file" -C "$python_dir" --strip-components=1 >&2; then
+        echo -e "${RED}Failed to extract Python tarball${NC}" >&2
+        rm -f "$temp_file"
+        return 1
+    fi
+    rm -f "$temp_file"
+
+    # Check if extraction was successful
+    if [[ -x "$python_dir/bin/python3" ]]; then
+        # Sanity check: ensure we truly got the version requested
+        local got
+        got="$("$python_dir/bin/python3" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null || true)"
+        if [[ "$got" != "$PYTHON_VERSION" ]]; then
+            echo -e "${RED}Installed Python version mismatch: expected ${PYTHON_VERSION}, got ${got}${NC}" >&2
+            echo -e "${RED}URL used: $python_url${NC}" >&2
+            return 1
         fi
+
+        echo "$python_dir/bin/python3"
+        return 0
     fi
 
     echo -e "${RED}Failed to download/extract Python${NC}" >&2
@@ -418,27 +391,14 @@ full_setup() {
 
     # First, try to install via conda if available (preferred method)
     if command -v conda &> /dev/null || command -v mamba &> /dev/null; then
-        local conda_base=""
-        if command -v conda &> /dev/null; then
-            conda_base=$(conda info --base 2>/dev/null)
-        elif command -v mamba &> /dev/null; then
-            conda_base=$(mamba info --base 2>/dev/null)
-        fi
-        if [ -n "$conda_base" ] && [ ! -w "$conda_base" ]; then
-            echo -e "${YELLOW}Conda base is not writable ($conda_base). Using a local conda env instead.${NC}"
-            if PYTHON_CMD=$(install_python_conda_env); then
-                echo -e "${GREEN}✓ Installed Python ${PYTHON_VERSION} via local conda env: $PYTHON_CMD${NC}"
-            fi
-        else
-            echo -e "${BLUE}Conda/Mamba detected, installing Python ${PYTHON_VERSION}...${NC}"
-            if install_python_conda; then
-                for py in python3.13 python3 python; do
-                    if PYTHON_CMD=$(check_python_version "$py"); then
-                        echo -e "${GREEN}✓ Installed Python ${PYTHON_VERSION} via conda: $PYTHON_CMD${NC}"
-                        break
-                    fi
-                done
-            fi
+        echo -e "${BLUE}Conda/Mamba detected, installing Python ${PYTHON_VERSION}...${NC}"
+        if install_python_conda; then
+            for py in python3.13 python3 python; do
+                if PYTHON_CMD=$(check_python_version "$py"); then
+                    echo -e "${GREEN}✓ Installed Python ${PYTHON_VERSION} via conda: $PYTHON_CMD${NC}"
+                    break
+                fi
+            done
         fi
     else
         echo -e "${YELLOW}Conda/Mamba not detected in PATH${NC}"
