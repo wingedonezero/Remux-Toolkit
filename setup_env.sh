@@ -42,8 +42,7 @@ check_python_version() {
     local python_cmd=$1
     if command -v "$python_cmd" &> /dev/null; then
         # Check version
-        local version
-        version=$("$python_cmd" --version 2>&1 | grep -oP '\d+\.\d+\.\d+')
+        local version=$("$python_cmd" --version 2>&1 | grep -oP '\d+\.\d+\.\d+')
         if [[ "$version" == "$PYTHON_VERSION" ]]; then
             # Verify Python actually works by running multiple checks
             if "$python_cmd" -c "import sys, encodings; print('OK')" &> /dev/null; then
@@ -75,8 +74,8 @@ install_python_conda() {
 
         # Use only conda-forge to avoid TOS issues with default channels
         # Also disable default channels with --override-channels
-        if conda install -y python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
-           conda install -y "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
+        if conda install -y python=3.13.11 --override-channels -c conda-forge 2>/dev/null || \
+           conda install -y "python>=3.13,<3.14" --override-channels -c conda-forge; then
             return 0
         else
             return 1
@@ -84,8 +83,8 @@ install_python_conda() {
     elif command -v mamba &> /dev/null; then
         echo -e "${BLUE}Found mamba, installing Python ${PYTHON_VERSION}...${NC}"
         # Mamba doesn't have the same TOS restrictions, but use conda-forge anyway
-        if mamba install -y python="${PYTHON_VERSION}" pip -c conda-forge 2>/dev/null || \
-           mamba install -y "python>=${PYTHON_VERSION%.*},<3.14" pip -c conda-forge; then
+        if mamba install -y python=3.13.11 -c conda-forge 2>/dev/null || \
+           mamba install -y "python>=3.13,<3.14" -c conda-forge; then
             return 0
         else
             return 1
@@ -137,35 +136,21 @@ install_python_standalone() {
     mkdir -p "$python_dir"
 
     # Detect architecture
-    local arch
-    arch=$(uname -m)
-    local os
-    os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    local arch=$(uname -m)
+    local os=$(uname -s | tr '[:upper:]' '[:lower:]')
 
     if [[ "$os" == "linux" ]]; then
         if [[ "$arch" == "x86_64" ]]; then
-            local api_url="https://api.github.com/repos/astral-sh/python-build-standalone/releases?per_page=20"
-            local asset_url
-            asset_url=$(curl -sL "$api_url" | \
+            local api_url="https://api.github.com/repos/indygreg/python-build-standalone/releases?per_page=20"
+            local python_url
+            python_url=$(curl -sL "$api_url" | \
                 grep -oE "https://github.com/[^\"]*cpython-${PYTHON_VERSION}\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz" | \
                 head -1)
 
-            if [ -z "$asset_url" ]; then
-                local minor_version="${PYTHON_VERSION%.*}"
-                asset_url=$(curl -sL "$api_url" | \
-                    grep -oE "https://github.com/[^\"]*cpython-${minor_version}\\.[0-9]+\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz" | \
-                    sort -Vr | \
-                    head -1)
-
-                if [ -n "$asset_url" ]; then
-                    echo -e "${YELLOW}Exact Python ${PYTHON_VERSION} build not found. Falling back to latest ${minor_version}.x build.${NC}" >&2
-                else
-                    echo -e "${RED}Unable to find standalone Python ${PYTHON_VERSION} build.${NC}" >&2
-                    return 1
-                fi
+            if [ -z "$python_url" ]; then
+                echo -e "${RED}Unable to find standalone Python ${PYTHON_VERSION} build.${NC}" >&2
+                return 1
             fi
-
-            local python_url="$asset_url"
         else
             echo -e "${RED}Unsupported architecture: $arch${NC}" >&2
             return 1
@@ -438,6 +423,12 @@ full_setup() {
                         break
                     fi
                 done
+            fi
+            if [ -z "$PYTHON_CMD" ]; then
+                echo -e "${YELLOW}Conda base install failed. Trying local conda env...${NC}"
+                if PYTHON_CMD=$(install_python_conda_env); then
+                    echo -e "${GREEN}✓ Installed Python ${PYTHON_VERSION} via local conda env: $PYTHON_CMD${NC}"
+                fi
             fi
         fi
     else
