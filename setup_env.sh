@@ -43,7 +43,7 @@ check_python_version() {
     if command -v "$python_cmd" &> /dev/null; then
         # Check version
         local version=$("$python_cmd" --version 2>&1 | grep -oP '\d+\.\d+\.\d+')
-        if [[ "$version" == 3.13.* ]]; then
+        if [[ "$version" == "$PYTHON_VERSION" ]]; then
             # Verify Python actually works by running multiple checks
             if "$python_cmd" -c "import sys, encodings; print('OK')" &> /dev/null; then
                 # Also verify it can create a basic venv
@@ -95,6 +95,39 @@ install_python_conda() {
     fi
 }
 
+# Function to install Python into a local conda environment
+install_python_conda_env() {
+    local env_dir="$PROJECT_DIR/.conda-python"
+    local conda_cmd=""
+
+    if command -v conda &> /dev/null; then
+        conda_cmd="conda"
+    elif command -v mamba &> /dev/null; then
+        conda_cmd="mamba"
+    else
+        return 1
+    fi
+
+    echo -e "${YELLOW}Attempting to install Python ${PYTHON_VERSION} into local conda env...${NC}"
+    if [ -d "$env_dir" ]; then
+        echo -e "${BLUE}Updating existing conda env at: $env_dir${NC}"
+        if "$conda_cmd" install -y -p "$env_dir" python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
+           "$conda_cmd" install -y -p "$env_dir" "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
+            echo "$env_dir/bin/python"
+            return 0
+        fi
+    else
+        echo -e "${BLUE}Creating conda env at: $env_dir${NC}"
+        if "$conda_cmd" create -y -p "$env_dir" python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
+           "$conda_cmd" create -y -p "$env_dir" "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
+            echo "$env_dir/bin/python"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 # Function to download and install standalone Python
 install_python_standalone() {
     echo -e "${YELLOW}Attempting to install Python ${PYTHON_VERSION} standalone build...${NC}" >&2
@@ -108,7 +141,16 @@ install_python_standalone() {
 
     if [[ "$os" == "linux" ]]; then
         if [[ "$arch" == "x86_64" ]]; then
-            local python_url="https://github.com/indygreg/python-build-standalone/releases/download/20241016/cpython-3.13.0+20241016-x86_64-unknown-linux-gnu-install_only.tar.gz"
+            local api_url="https://api.github.com/repos/indygreg/python-build-standalone/releases?per_page=20"
+            local python_url
+            python_url=$(curl -sL "$api_url" | \
+                grep -oE "https://github.com/[^\"]*cpython-${PYTHON_VERSION}\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz" | \
+                head -1)
+
+            if [ -z "$python_url" ]; then
+                echo -e "${RED}Unable to find standalone Python ${PYTHON_VERSION} build.${NC}" >&2
+                return 1
+            fi
         else
             echo -e "${RED}Unsupported architecture: $arch${NC}" >&2
             return 1
@@ -361,14 +403,27 @@ full_setup() {
 
     # First, try to install via conda if available (preferred method)
     if command -v conda &> /dev/null || command -v mamba &> /dev/null; then
-        echo -e "${BLUE}Conda/Mamba detected, installing Python ${PYTHON_VERSION}...${NC}"
-        if install_python_conda; then
-            for py in python3.13 python3 python; do
-                if PYTHON_CMD=$(check_python_version "$py"); then
-                    echo -e "${GREEN}✓ Installed Python ${PYTHON_VERSION} via conda: $PYTHON_CMD${NC}"
-                    break
-                fi
-            done
+        local conda_base=""
+        if command -v conda &> /dev/null; then
+            conda_base=$(conda info --base 2>/dev/null)
+        elif command -v mamba &> /dev/null; then
+            conda_base=$(mamba info --base 2>/dev/null)
+        fi
+        if [ -n "$conda_base" ] && [ ! -w "$conda_base" ]; then
+            echo -e "${YELLOW}Conda base is not writable ($conda_base). Using a local conda env instead.${NC}"
+            if PYTHON_CMD=$(install_python_conda_env); then
+                echo -e "${GREEN}✓ Installed Python ${PYTHON_VERSION} via local conda env: $PYTHON_CMD${NC}"
+            fi
+        else
+            echo -e "${BLUE}Conda/Mamba detected, installing Python ${PYTHON_VERSION}...${NC}"
+            if install_python_conda; then
+                for py in python3.13 python3 python; do
+                    if PYTHON_CMD=$(check_python_version "$py"); then
+                        echo -e "${GREEN}✓ Installed Python ${PYTHON_VERSION} via conda: $PYTHON_CMD${NC}"
+                        break
+                    fi
+                done
+            fi
         fi
     else
         echo -e "${YELLOW}Conda/Mamba not detected in PATH${NC}"
