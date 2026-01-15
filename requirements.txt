@@ -1,14 +1,14 @@
 # GUI + core numerical stack
-PyQt6>=6.4.0
-numpy>=1.24.0
-scipy>=1.10.0
+PyQt6
+numpy
+scipy
 
 # Media processing
-opencv-python>=4.8.0
-Pillow>=10.0.0
-imagehash>=4.3.0
-scenedetect[opencv]>=0.6.0
-librosa>=0.10.0
-videohash>=1.0.0
-VideoTimestamps>=1.0.0
-av>=10.0.0
+opencv-python
+Pillow
+imagehash
+scenedetect[opencv]
+librosa
+videohash
+VideoTimestamps
+av
