@@ -16,6 +16,19 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$PROJECT_DIR/.venv"
 VENV_PYTHON="$VENV_DIR/bin/python"
 PYTHON_VERSION="3.13.11"
+PYTHON_RELEASES_JSON="https://raw.githubusercontent.com/astral-sh/python-build-standalone/latest-release/latest-release.json"
+
+get_json_python() {
+    if command -v python3 &> /dev/null; then
+        echo "python3"
+        return 0
+    fi
+    if command -v python &> /dev/null; then
+        echo "python"
+        return 0
+    fi
+    return 1
+}
 
 # Function to show main menu
 show_menu() {
@@ -129,6 +142,72 @@ install_python_conda_env() {
 }
 
 # Function to download and install standalone Python
+select_python_standalone_version() {
+    local series="${PYTHON_VERSION%.*}"
+    local versions_json
+    local versions
+
+    if ! versions_json=$(curl -sL "$PYTHON_RELEASES_JSON"); then
+        echo -e "${RED}Failed to fetch Python standalone release metadata.${NC}" >&2
+        return 1
+    fi
+
+    local json_python
+    if ! json_python=$(get_json_python); then
+        echo -e "${RED}Python is required to parse release metadata. Please install python3 or python.${NC}" >&2
+        return 1
+    fi
+
+    versions=$("$json_python" - <<PY
+import json
+import sys
+
+data = json.load(sys.stdin)
+versions = sorted(
+    {entry["version"] for entry in data.get("builds", []) if entry.get("version", "").startswith("${series}.")},
+    key=lambda v: [int(x) for x in v.split(".")],
+    reverse=True,
+)
+for version in versions:
+    print(version)
+PY
+    <<< "$versions_json")
+
+    if [ -z "$versions" ]; then
+        echo -e "${RED}No Python ${series}.x standalone builds found.${NC}" >&2
+        return 1
+    fi
+
+    echo ""
+    echo "Available Python ${series}.x standalone builds:"
+    local i=1
+    while IFS= read -r version; do
+        printf "  %2d) %s\n" "$i" "$version"
+        i=$((i + 1))
+    done <<< "$versions"
+
+    local default_choice=""
+    if echo "$versions" | grep -q "^${PYTHON_VERSION}$"; then
+        default_choice=$(echo "$versions" | grep -n "^${PYTHON_VERSION}$" | cut -d: -f1 | head -1)
+    else
+        default_choice=1
+    fi
+
+    echo ""
+    echo -n "Select a version [default ${default_choice}]: "
+    read -r selection
+    selection="${selection:-$default_choice}"
+
+    local selected_version
+    selected_version=$(echo "$versions" | sed -n "${selection}p")
+    if [ -z "$selected_version" ]; then
+        echo -e "${RED}Invalid selection.${NC}" >&2
+        return 1
+    fi
+
+    echo "$selected_version"
+}
+
 install_python_standalone() {
     echo -e "${YELLOW}Attempting to install Python ${PYTHON_VERSION} standalone build...${NC}" >&2
 
@@ -141,14 +220,43 @@ install_python_standalone() {
 
     if [[ "$os" == "linux" ]]; then
         if [[ "$arch" == "x86_64" ]]; then
-            local api_url="https://api.github.com/repos/indygreg/python-build-standalone/releases?per_page=20"
+            local selected_version
+            if ! selected_version=$(select_python_standalone_version); then
+                return 1
+            fi
+
+            local release_json
+            if ! release_json=$(curl -sL "$PYTHON_RELEASES_JSON"); then
+                echo -e "${RED}Failed to fetch Python standalone release metadata.${NC}" >&2
+                return 1
+            fi
+
             local python_url
-            python_url=$(curl -sL "$api_url" | \
-                grep -oE "https://github.com/[^\"]*cpython-${PYTHON_VERSION}\\+[0-9]+-x86_64-unknown-linux-gnu-install_only\\.tar\\.gz" | \
-                head -1)
+    local json_python
+    if ! json_python=$(get_json_python); then
+        echo -e "${RED}Python is required to parse release metadata. Please install python3 or python.${NC}" >&2
+        return 1
+    fi
+
+    python_url=$("$json_python" - <<PY
+import json
+import sys
+
+data = json.load(sys.stdin)
+version = "${selected_version}"
+targets = [
+    entry["url"]
+    for entry in data.get("builds", [])
+    if entry.get("version") == version
+    and entry.get("target_triple") == "x86_64-unknown-linux-gnu"
+    and entry.get("archive") == "install_only"
+]
+print(targets[0] if targets else "")
+PY
+            <<< "$release_json")
 
             if [ -z "$python_url" ]; then
-                echo -e "${RED}Unable to find standalone Python ${PYTHON_VERSION} build.${NC}" >&2
+                echo -e "${RED}Unable to find standalone Python ${selected_version} build.${NC}" >&2
                 return 1
             fi
         else
