@@ -424,6 +424,12 @@ full_setup() {
                     fi
                 done
             fi
+            if [ -z "$PYTHON_CMD" ]; then
+                echo -e "${YELLOW}Conda base install failed. Trying local conda env...${NC}"
+                if PYTHON_CMD=$(install_python_conda_env); then
+                    echo -e "${GREEN}✓ Installed Python ${PYTHON_VERSION} via local conda env: $PYTHON_CMD${NC}"
+                fi
+            fi
         fi
     else
         echo -e "${YELLOW}Conda/Mamba not detected in PATH${NC}"
