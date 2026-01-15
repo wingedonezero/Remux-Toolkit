@@ -2,6 +2,8 @@
 PyQt6
 numpy
 scipy
+numba>=0.61.0
+llvmlite>=0.43.0
 
 # Media processing
 opencv-python
