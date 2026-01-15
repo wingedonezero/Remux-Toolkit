@@ -75,8 +75,8 @@ install_python_conda() {
 
         # Use only conda-forge to avoid TOS issues with default channels
         # Also disable default channels with --override-channels
-        if conda install -y python="${PYTHON_VERSION}" --override-channels -c conda-forge 2>/dev/null || \
-           conda install -y "python>=${PYTHON_VERSION%.*},<3.14" --override-channels -c conda-forge; then
+        if conda install -y python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
+           conda install -y "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
             return 0
         else
             return 1
@@ -84,8 +84,8 @@ install_python_conda() {
     elif command -v mamba &> /dev/null; then
         echo -e "${BLUE}Found mamba, installing Python ${PYTHON_VERSION}...${NC}"
         # Mamba doesn't have the same TOS restrictions, but use conda-forge anyway
-        if mamba install -y python="${PYTHON_VERSION}" -c conda-forge 2>/dev/null || \
-           mamba install -y "python>=${PYTHON_VERSION%.*},<3.14" -c conda-forge; then
+        if mamba install -y python="${PYTHON_VERSION}" pip -c conda-forge 2>/dev/null || \
+           mamba install -y "python>=${PYTHON_VERSION%.*},<3.14" pip -c conda-forge; then
             return 0
         else
             return 1
@@ -112,15 +112,15 @@ install_python_conda_env() {
     echo -e "${YELLOW}Attempting to install Python ${PYTHON_VERSION} into local conda env...${NC}"
     if [ -d "$env_dir" ]; then
         echo -e "${BLUE}Updating existing conda env at: $env_dir${NC}"
-        if "$conda_cmd" install -y -p "$env_dir" python="${PYTHON_VERSION}" --override-channels -c conda-forge 2>/dev/null || \
-           "$conda_cmd" install -y -p "$env_dir" "python>=${PYTHON_VERSION%.*},<3.14" --override-channels -c conda-forge; then
+        if "$conda_cmd" install -y -p "$env_dir" python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
+           "$conda_cmd" install -y -p "$env_dir" "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
             echo "$env_dir/bin/python"
             return 0
         fi
     else
         echo -e "${BLUE}Creating conda env at: $env_dir${NC}"
-        if "$conda_cmd" create -y -p "$env_dir" python="${PYTHON_VERSION}" --override-channels -c conda-forge 2>/dev/null || \
-           "$conda_cmd" create -y -p "$env_dir" "python>=${PYTHON_VERSION%.*},<3.14" --override-channels -c conda-forge; then
+        if "$conda_cmd" create -y -p "$env_dir" python="${PYTHON_VERSION}" pip --override-channels -c conda-forge 2>/dev/null || \
+           "$conda_cmd" create -y -p "$env_dir" "python>=${PYTHON_VERSION%.*},<3.14" pip --override-channels -c conda-forge; then
             echo "$env_dir/bin/python"
             return 0
         fi
