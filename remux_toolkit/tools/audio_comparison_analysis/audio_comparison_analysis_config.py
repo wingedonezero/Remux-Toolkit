@@ -33,6 +33,7 @@ DEFAULTS = {
     "pal_speed_ratio": 1.0416667,
     "pitch_semitone_shift": 0.7,
     "pitch_tolerance_ratio": 0.006,
+    "scc_min_match_confidence": 0.7,
     "channel_swap_corr_threshold": 0.8,
     "lfe_rolloff_hz": 120,
     "lfe_high_ratio_db": -15.0,

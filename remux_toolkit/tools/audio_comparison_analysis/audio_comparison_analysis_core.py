@@ -70,6 +70,7 @@ class AnalysisSettings:
     pal_speed_ratio: float
     pitch_semitone_shift: float
     pitch_tolerance_ratio: float
+    scc_min_match_confidence: float
     channel_swap_corr_threshold: float
     lfe_rolloff_hz: float
     lfe_high_ratio_db: float
@@ -144,6 +145,9 @@ class AudioAnalysisResult:
     alignment_offset_s: float
     alignment_confidence: float
     aligned_duration_s: float
+    alignment_method: str
+    alignment_failed: bool
+    alignment_warning: str | None
     bitrate_kbps: float | None
     bitrate_bloat: bool
     file_size_mb: float
@@ -327,6 +331,44 @@ def _apply_offset(
     min_len = min(ref.size, cand.size)
     return ref[:min_len], cand[:min_len]
 
+
+def _scc_align_offset(
+    ref: np.ndarray,
+    cand: np.ndarray,
+    sr: int,
+    min_confidence: float,
+) -> tuple[float, float, bool, str | None]:
+    """SCC-style chunked correlation alignment with consensus confidence."""
+    if ref.size == 0 or cand.size == 0:
+        return 0.0, 0.0, True, "Empty audio for alignment."
+    chunk_seconds = 5.0
+    hop_seconds = 2.5
+    chunk_len = int(chunk_seconds * sr)
+    hop_len = int(hop_seconds * sr)
+    if chunk_len <= 0 or hop_len <= 0:
+        return 0.0, 0.0, True, "Invalid SCC chunk sizing."
+    offsets = []
+    confidences = []
+    max_start = max(0, min(ref.size, cand.size) - chunk_len)
+    for start in range(0, max_start + 1, hop_len):
+        ref_chunk = ref[start : start + chunk_len]
+        cand_chunk = cand[start : start + chunk_len]
+        if ref_chunk.size == 0 or cand_chunk.size == 0:
+            continue
+        corr = scipy.signal.fftconvolve(cand_chunk, ref_chunk[::-1], mode="full")
+        peak_idx = int(np.argmax(corr))
+        peak_val = float(corr[peak_idx])
+        confidence = peak_val / (np.mean(np.abs(corr)) + 1e-12)
+        offset_samples = peak_idx - (len(ref_chunk) - 1)
+        offsets.append(offset_samples / sr)
+        confidences.append(confidence)
+    if not offsets:
+        return 0.0, 0.0, True, "SCC alignment failed to find chunks."
+    median_confidence = float(np.median(confidences))
+    if median_confidence < min_confidence:
+        return 0.0, median_confidence, True, "SCC confidence below threshold."
+    offset_s = float(np.median(offsets))
+    return offset_s, median_confidence, False, None
 def _log_power_spectrogram(
     y_mono: np.ndarray, sr: int, settings: AnalysisSettings
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -999,6 +1041,8 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
         parts.append("PAL speed shift")
     if result.pitch_shift_detected:
         parts.append("Pitch shift")
+    if result.alignment_failed and result.alignment_warning:
+        parts.append(f"Alignment warning: {result.alignment_warning}")
     if result.limiting_segments:
         parts.append(f"Limiting hot spots: {len(result.limiting_segments)}")
     return "; ".join(parts)
@@ -1105,16 +1149,32 @@ def analyze_files(
         alignment_offset_s = 0.0
         alignment_confidence = 0.0
         aligned_duration_s = 0.0
+        alignment_method = "none"
+        alignment_failed = False
+        alignment_warning = None
         aligned_ref_mono = None
         aligned_cand_mono = None
         if ref_audio is not None and path != reference_path:
             ref_band = _bandpass_mono(ref_mono, sr, 300.0, 3000.0)
             cand_band = _bandpass_mono(y_mono, sr, 300.0, 3000.0)
-            alignment_offset_s, alignment_confidence = _align_offset(ref_band, cand_band, sr)
-            aligned_ref_mono, aligned_cand_mono = _apply_offset(
-                ref_mono, y_mono, alignment_offset_s, sr
+            alignment_offset_s, alignment_confidence, alignment_failed, alignment_warning = (
+                _scc_align_offset(
+                    ref_band,
+                    cand_band,
+                    sr,
+                    settings.scc_min_match_confidence,
+                )
             )
-            aligned_duration_s = aligned_cand_mono.size / sr if aligned_cand_mono is not None else 0.0
+            if not alignment_failed:
+                alignment_method = "scc"
+                aligned_ref_mono, aligned_cand_mono = _apply_offset(
+                    ref_mono, y_mono, alignment_offset_s, sr
+                )
+                aligned_duration_s = (
+                    aligned_cand_mono.size / sr if aligned_cand_mono is not None else 0.0
+                )
+            else:
+                alignment_method = "unmatched"
 
         freq_score = _score_metric(cutoff_hz, sr / 2)
         if shelf_detected:
@@ -1283,6 +1343,9 @@ def analyze_files(
             alignment_offset_s=alignment_offset_s,
             alignment_confidence=alignment_confidence,
             aligned_duration_s=aligned_duration_s,
+            alignment_method=alignment_method,
+            alignment_failed=alignment_failed,
+            alignment_warning=alignment_warning,
             bitrate_kbps=bitrate_kbps,
             bitrate_bloat=bitrate_bloat,
             file_size_mb=size_mb,

@@ -539,6 +539,15 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         set_tip(self.pitch_tolerance_ratio, "Tolerance ratio for pitch/speed detection.")
         layout.addRow("Pitch/Speed Tolerance", self.pitch_tolerance_ratio)
 
+        self.scc_min_match_confidence = QtWidgets.QDoubleSpinBox()
+        self.scc_min_match_confidence.setRange(0.5, 0.99)
+        self.scc_min_match_confidence.setSingleStep(0.01)
+        set_tip(
+            self.scc_min_match_confidence,
+            "Minimum SCC alignment confidence; below this uses unaligned analysis.",
+        )
+        layout.addRow("SCC Min Match Confidence", self.scc_min_match_confidence)
+
         self.channel_swap_corr_threshold = QtWidgets.QDoubleSpinBox()
         self.channel_swap_corr_threshold.setRange(0.5, 0.99)
         self.channel_swap_corr_threshold.setSingleStep(0.05)
@@ -792,6 +801,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.pitch_tolerance_ratio.setValue(
             settings.get("pitch_tolerance_ratio", DEFAULTS["pitch_tolerance_ratio"])
         )
+        self.scc_min_match_confidence.setValue(
+            settings.get("scc_min_match_confidence", DEFAULTS["scc_min_match_confidence"])
+        )
         self.channel_swap_corr_threshold.setValue(
             settings.get("channel_swap_corr_threshold", DEFAULTS["channel_swap_corr_threshold"])
         )
@@ -899,6 +911,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             "pal_speed_ratio": self.pal_speed_ratio.value(),
             "pitch_semitone_shift": self.pitch_semitone_shift.value(),
             "pitch_tolerance_ratio": self.pitch_tolerance_ratio.value(),
+            "scc_min_match_confidence": self.scc_min_match_confidence.value(),
             "channel_swap_corr_threshold": self.channel_swap_corr_threshold.value(),
             "lfe_rolloff_hz": self.lfe_rolloff_hz.value(),
             "lfe_high_ratio_db": self.lfe_high_ratio_db.value(),
@@ -1077,6 +1090,8 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 flags.append("Pitch shift")
             if result.get("limiting_segments"):
                 flags.append("Limiting hotspots")
+            if result.get("alignment_failed"):
+                flags.append("Alignment failed")
 
             labels["name"].setText(os.path.basename(result["path"]))
             codec_name = result.get("codec_name")
