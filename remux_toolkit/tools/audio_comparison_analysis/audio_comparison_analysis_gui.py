@@ -88,6 +88,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
 
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidgetResizable(True)
+        scroll_area.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
         panel_layout.addWidget(scroll_area, 1)
 
         content = QtWidgets.QWidget()
@@ -141,6 +142,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
 
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidgetResizable(True)
+        scroll_area.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
         panel_layout.addWidget(scroll_area, 1)
 
         content = QtWidgets.QWidget()
