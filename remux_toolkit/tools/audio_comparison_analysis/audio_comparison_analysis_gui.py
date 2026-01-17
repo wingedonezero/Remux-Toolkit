@@ -163,6 +163,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 "eq": QtWidgets.QLabel("-"),
                 "pitch": QtWidgets.QLabel("-"),
                 "channel": QtWidgets.QLabel("-"),
+                "alignment": QtWidgets.QLabel("-"),
                 "scores": QtWidgets.QLabel("-"),
                 "glitches": QtWidgets.QLabel("-"),
                 "limiting": QtWidgets.QLabel("-"),
@@ -193,7 +194,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             )
             card_layout.addRow("File Info", labels["name"])
             card_layout.addRow("Stream", labels["info"])
-            card_layout.addRow("True DR14", labels["dr"])
+            card_layout.addRow("Crest Factor", labels["dr"])
             card_layout.addRow("Dynamics Score", labels["dr_score"])
             card_layout.addRow("Loudness Range", labels["lra"])
             card_layout.addRow("Dialog Balance", labels["balance"])
@@ -202,6 +203,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             card_layout.addRow("EQ Delta", labels["eq"])
             card_layout.addRow("Pitch/Speed", labels["pitch"])
             card_layout.addRow("Channel Integrity", labels["channel"])
+            card_layout.addRow("Alignment", labels["alignment"])
             card_layout.addRow("Score Breakdown", labels["scores"])
             card_layout.addRow("Pops/Crackles", labels["glitches"])
             card_layout.addRow("Limiting Hot Spots", labels["limiting"])
@@ -1044,6 +1046,13 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             if result.get("lfe_rolloff_error"):
                 channel_text = f"{channel_text}, LFE roll-off" if channel_text != "OK" else "LFE roll-off"
             labels["channel"].setText(channel_text)
+            if result.get("reference_path") and result.get("path") != result.get("reference_path"):
+                labels["alignment"].setText(
+                    f"{result.get('alignment_offset_s', 0.0):+.3f}s "
+                    f"(conf {result.get('alignment_confidence', 0.0):.1f})"
+                )
+            else:
+                labels["alignment"].setText("N/A")
             breakdown = (
                 f"Freq {result.get('freq_score', 0.0):.1f} | "
                 f"Clean {result.get('cleanliness_score', 0.0):.1f} | "

@@ -14,6 +14,10 @@ import librosa
 import numpy as np
 import scipy.signal
 import soundfile as sf
+try:
+    import soxr
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    soxr = None
 
 import matplotlib
 matplotlib.use("Agg")
@@ -21,6 +25,14 @@ import matplotlib.pyplot as plt
 
 
 def check_dependencies() -> tuple[bool, str]:
+    missing = []
+    for tool in ("ffprobe", "ffmpeg"):
+        try:
+            subprocess.check_output([tool, "-version"], text=True, stderr=subprocess.STDOUT)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            missing.append(tool)
+    if missing:
+        return False, f"Missing dependencies: {', '.join(missing)}"
     return True, "Dependencies available."
 
 
@@ -129,6 +141,9 @@ class AudioAnalysisResult:
     pitch_ratio: float | None
     speed_shift_detected: bool
     pitch_shift_detected: bool
+    alignment_offset_s: float
+    alignment_confidence: float
+    aligned_duration_s: float
     bitrate_kbps: float | None
     bitrate_bloat: bool
     file_size_mb: float
@@ -181,13 +196,7 @@ def _load_audio(path: str, target_sr: int) -> tuple[np.ndarray, int]:
             audio = audio[np.newaxis, :]
 
     if sr != target_sr:
-        audio = np.stack(
-            [
-                librosa.resample(channel, orig_sr=sr, target_sr=target_sr)
-                for channel in audio
-            ],
-            axis=0,
-        )
+        audio = np.stack([_resample_audio(channel, sr, target_sr) for channel in audio], axis=0)
         sr = target_sr
 
     return audio, sr
@@ -261,6 +270,58 @@ def _calculate_loudness_metrics(
     loudness_db = float(np.mean(rms_db_blocks))
     return loudness_db, lra_db
 
+
+def _resample_audio(y: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    if orig_sr == target_sr:
+        return y
+    if soxr is not None:
+        return soxr.resample(y, orig_sr, target_sr, quality="HQ")
+    return librosa.resample(y, orig_sr=orig_sr, target_sr=target_sr)
+
+
+def _bandpass_mono(y: np.ndarray, sr: int, low_hz: float, high_hz: float) -> np.ndarray:
+    if y.size == 0:
+        return y
+    low = max(1.0, low_hz) / (sr / 2)
+    high = min(high_hz, sr / 2 - 1.0) / (sr / 2)
+    if high <= low:
+        return y
+    sos = scipy.signal.butter(4, [low, high], btype="bandpass", output="sos")
+    return scipy.signal.sosfilt(sos, y)
+
+
+def _align_offset(
+    ref: np.ndarray, cand: np.ndarray, sr: int
+) -> tuple[float, float]:
+    if ref.size == 0 or cand.size == 0:
+        return 0.0, 0.0
+    corr = scipy.signal.fftconvolve(cand, ref[::-1], mode="full")
+    peak_idx = int(np.argmax(corr))
+    if 1 <= peak_idx < len(corr) - 1:
+        left = corr[peak_idx - 1]
+        mid = corr[peak_idx]
+        right = corr[peak_idx + 1]
+        denom = max(1e-12, (left - 2 * mid + right))
+        peak_adjust = 0.5 * (left - right) / denom
+    else:
+        peak_adjust = 0.0
+    peak_idx = peak_idx + peak_adjust
+    offset_samples = peak_idx - (len(ref) - 1)
+    offset_s = float(offset_samples / sr)
+    confidence = float(np.max(corr) / (np.mean(np.abs(corr)) + 1e-12))
+    return offset_s, confidence
+
+
+def _apply_offset(
+    ref: np.ndarray, cand: np.ndarray, offset_s: float, sr: int
+) -> tuple[np.ndarray, np.ndarray]:
+    offset_samples = int(round(offset_s * sr))
+    if offset_samples > 0:
+        cand = cand[offset_samples:]
+    elif offset_samples < 0:
+        ref = ref[abs(offset_samples):]
+    min_len = min(ref.size, cand.size)
+    return ref[:min_len], cand[:min_len]
 
 def _log_power_spectrogram(
     y_mono: np.ndarray, sr: int, settings: AnalysisSettings
@@ -427,11 +488,11 @@ def _detect_surround_swaps(
 
 
 def _detect_lfe_rolloff(
-    y: np.ndarray, sr: int, settings: AnalysisSettings
+    y: np.ndarray, sr: int, settings: AnalysisSettings, lfe_idx: int | None
 ) -> bool:
-    if y.shape[0] < 4:
+    if lfe_idx is None or y.shape[0] <= lfe_idx:
         return False
-    lfe = y[3]
+    lfe = y[lfe_idx]
     freqs, mag_db = _mean_spectrum_db(lfe, sr, settings)
     low_band = freqs <= settings.lfe_rolloff_hz
     high_band = freqs >= settings.lfe_rolloff_hz
@@ -699,6 +760,75 @@ def _probe_audio_codec(path: str) -> tuple[str | None, str | None, bool | None]:
         return None, None, None
 
 
+def _probe_audio_metadata(path: str) -> dict:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=channels,channel_layout,sample_rate,bit_rate,codec_name,profile",
+        "-show_entries",
+        "format=duration:format_tags=ENCODER",
+        "-of",
+        "json",
+        path,
+    ]
+    try:
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    try:
+        data = json.loads(output)
+    except (ValueError, TypeError):
+        return {}
+    streams = data.get("streams", [])
+    fmt = data.get("format", {})
+    tags = fmt.get("tags", {}) if isinstance(fmt, dict) else {}
+    stream = streams[0] if streams else {}
+    return {
+        "channels": stream.get("channels"),
+        "channel_layout": stream.get("channel_layout"),
+        "sample_rate": stream.get("sample_rate"),
+        "bit_rate": stream.get("bit_rate"),
+        "codec_name": stream.get("codec_name"),
+        "profile": stream.get("profile"),
+        "duration": fmt.get("duration"),
+        "encoder": tags.get("ENCODER") if isinstance(tags, dict) else None,
+    }
+
+
+def _channel_index(channel_layout: str | None, target: str, channels: int) -> int | None:
+    if not channel_layout:
+        if target == "FC" and channels >= 3:
+            return 2
+        if target == "LFE" and channels >= 4:
+            return 3
+        return None
+    layout = channel_layout.lower()
+    layout_map = {
+        "mono": ["FC"],
+        "stereo": ["FL", "FR"],
+        "2.1": ["FL", "FR", "LFE"],
+        "3.0": ["FL", "FR", "FC"],
+        "3.1": ["FL", "FR", "FC", "LFE"],
+        "4.0": ["FL", "FR", "FC", "BC"],
+        "4.1": ["FL", "FR", "FC", "LFE", "BC"],
+        "5.0": ["FL", "FR", "FC", "BL", "BR"],
+        "5.1": ["FL", "FR", "FC", "LFE", "BL", "BR"],
+        "5.1(side)": ["FL", "FR", "FC", "LFE", "SL", "SR"],
+        "6.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "BC"],
+        "7.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+    }
+    order = layout_map.get(layout)
+    if not order:
+        return None
+    try:
+        return order.index(target)
+    except ValueError:
+        return None
+
 def _probe_audio_bitrate(path: str) -> float | None:
     cmd = [
         "ffprobe",
@@ -830,7 +960,7 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
         parts.append(f"Frequency response up to {int(result.freq_cutoff_hz)} Hz")
     if result.eq_warnings:
         parts.append(", ".join(result.eq_warnings))
-    parts.append(f"True DR {result.dr_db:.1f} dB")
+    parts.append(f"Crest factor {result.dr_db:.1f} dB")
     if result.loudness_range_db > 0:
         parts.append(f"Loudness range {result.loudness_range_db:.1f} dB")
     if result.is_lossless is True:
@@ -930,6 +1060,7 @@ def analyze_files(
     for path in file_paths:
         y, sr = _load_audio(path, settings.target_sample_rate)
         duration_s = float(librosa.get_duration(y=y, sr=sr))
+        metadata = _probe_audio_metadata(path)
         y_mono = np.mean(y, axis=0) if y.shape[0] > 1 else y[0]
         codec_name, codec_profile, is_lossless = _probe_audio_codec(path)
         peak, rms, dr_db, dr_blocks_used = _calculate_dynamic_range(y, sr, settings)
@@ -943,9 +1074,11 @@ def analyze_files(
         nr_filtered = _detect_nr_filtered(mag_db, freqs, settings, reference_mag)
         glitch_timestamps = _scan_glitches(y, sr, settings)
         fake_multichannel = _detect_fake_multichannel(y, settings)
+        center_idx = _channel_index(metadata.get("channel_layout"), "FC", y.shape[0])
+        lfe_idx = _channel_index(metadata.get("channel_layout"), "LFE", y.shape[0])
         surround_swap_detected = _detect_surround_swaps(ref_audio, y, settings)
-        lfe_rolloff_error = _detect_lfe_rolloff(y, sr, settings)
-        center_channel = y[2] if y.shape[0] >= 3 else y_mono
+        lfe_rolloff_error = _detect_lfe_rolloff(y, sr, settings, lfe_idx)
+        center_channel = y[center_idx] if center_idx is not None else y_mono
         center_clipping_ratio = float(np.mean(np.abs(center_channel) >= settings.clip_threshold))
         center_clipping_detected = center_clipping_ratio >= settings.clip_ratio_warn
         center_freqs, center_mag_db = _mean_spectrum_db(center_channel, sr, settings)
@@ -964,6 +1097,19 @@ def analyze_files(
         pitch_ratio, speed_shift_detected, pitch_shift_detected = _detect_pitch_speed_shift(
             ref_f0, f0_candidate, settings
         )
+        alignment_offset_s = 0.0
+        alignment_confidence = 0.0
+        aligned_duration_s = 0.0
+        aligned_ref_mono = None
+        aligned_cand_mono = None
+        if ref_audio is not None and path != reference_path:
+            ref_band = _bandpass_mono(ref_mono, sr, 300.0, 3000.0)
+            cand_band = _bandpass_mono(y_mono, sr, 300.0, 3000.0)
+            alignment_offset_s, alignment_confidence = _align_offset(ref_band, cand_band, sr)
+            aligned_ref_mono, aligned_cand_mono = _apply_offset(
+                ref_mono, y_mono, alignment_offset_s, sr
+            )
+            aligned_duration_s = aligned_cand_mono.size / sr if aligned_cand_mono is not None else 0.0
 
         freq_score = _score_metric(cutoff_hz, sr / 2)
         if shelf_detected:
@@ -1006,14 +1152,32 @@ def analyze_files(
                 _save_difference_spectrum(freqs, diff_db, diff_spectrum_path)
         if reference_path and ref_power_db is not None and ref_freqs is not None and path != reference_path:
             if ref_power_db.shape == power_db.shape:
-                delta_db = power_db - ref_power_db
+                if aligned_ref_mono is not None and aligned_cand_mono is not None:
+                    aligned_freqs, aligned_times, aligned_power = _log_power_spectrogram(
+                        aligned_cand_mono, sr, settings
+                    )
+                    _, _, aligned_ref_power = _log_power_spectrogram(
+                        aligned_ref_mono, sr, settings
+                    )
+                    if aligned_power.shape == aligned_ref_power.shape:
+                        delta_db = aligned_power - aligned_ref_power
+                        delta_freqs = aligned_freqs
+                        delta_times = aligned_times
+                    else:
+                        delta_db = power_db - ref_power_db
+                        delta_freqs = spec_freqs
+                        delta_times = spec_times
+                else:
+                    delta_db = power_db - ref_power_db
+                    delta_freqs = spec_freqs
+                    delta_times = spec_times
                 eq_muffle_db, eq_boom_db, eq_warnings = _evaluate_eq_delta(
-                    spec_freqs, delta_db, settings
+                    delta_freqs, delta_db, settings
                 )
                 if output_dir:
                     base = os.path.splitext(os.path.basename(path))[0]
                     delta_eq_path = os.path.join(output_dir, f"{base}_delta_eq.png")
-                    _save_delta_eq_map(spec_freqs, spec_times, delta_db, delta_eq_path)
+                    _save_delta_eq_map(delta_freqs, delta_times, delta_db, delta_eq_path)
         weighted_score = _weighted_score(
             freq_score,
             dr_score,
@@ -1111,6 +1275,9 @@ def analyze_files(
             pitch_ratio=pitch_ratio,
             speed_shift_detected=speed_shift_detected,
             pitch_shift_detected=pitch_shift_detected,
+            alignment_offset_s=alignment_offset_s,
+            alignment_confidence=alignment_confidence,
+            aligned_duration_s=aligned_duration_s,
             bitrate_kbps=bitrate_kbps,
             bitrate_bloat=bitrate_bloat,
             file_size_mb=size_mb,
