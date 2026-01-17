@@ -126,7 +126,7 @@ class AudioAnalysisResult:
     freq_cutoff_hz: float
     shelf_detected: bool
     reencode_detected: bool
-    nr_filtered: bool
+    nr_filtered: float
     eq_muffle_db: float
     eq_boom_db: float
     eq_warnings: list[str]
@@ -134,7 +134,7 @@ class AudioAnalysisResult:
     clipping_detected: bool
     center_clipping_ratio: float
     center_clipping_detected: bool
-    center_nr_filtered: bool
+    center_nr_filtered: float
     phase_inversion: bool
     fake_multichannel: bool
     surround_swap_detected: bool
@@ -171,6 +171,7 @@ class AudioAnalysisResult:
     glitch_timestamps: list[float]
     limiting_segments: list[tuple[float, float]]
     reference_path: str | None
+    stereo_width: float
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -478,17 +479,42 @@ def _detect_nr_filtered(
     freqs: np.ndarray,
     settings: AnalysisSettings,
     reference_mag_db: np.ndarray | None = None,
-) -> bool:
+) -> float:
+    """
+    Returns NR severity as a float from 0.0 (no NR) to 1.0 (heavy NR).
+    Takes into account reference if provided - only penalizes if worse than reference.
+    """
     high_band = freqs >= settings.nr_cutoff_hz
     mid_band = (freqs >= settings.dialog_band_low_hz) & (freqs <= settings.dialog_band_high_hz)
     high_mean = float(np.mean(mag_db[high_band])) if np.any(high_band) else -120.0
     mid_mean = float(np.mean(mag_db[mid_band])) if np.any(mid_band) else -120.0
     ratio_db = mid_mean - high_mean
+
+    # If we have a reference, compare relative to it
     if reference_mag_db is not None:
         ref_high = float(np.mean(reference_mag_db[high_band])) if np.any(high_band) else -120.0
-        if ref_high - high_mean >= settings.nr_drop_db:
-            return True
-    return ratio_db >= settings.nr_ratio_db
+        ref_mid = float(np.mean(reference_mag_db[mid_band])) if np.any(mid_band) else -120.0
+        ref_ratio_db = ref_mid - ref_high
+
+        # Calculate how much worse this file is than reference
+        high_drop_vs_ref = ref_high - high_mean
+
+        # Only consider it NR if it's worse than reference
+        if high_drop_vs_ref > 0:
+            # Severity based on how much worse (0-1 range, clamped)
+            severity = min(1.0, high_drop_vs_ref / 20.0)  # 20 dB = max severity
+            return severity
+        else:
+            # Not worse than reference - no penalty
+            return 0.0
+
+    # No reference: use absolute threshold
+    if ratio_db < settings.nr_ratio_db:
+        return 0.0
+
+    # Scale severity: 12 dB ratio = 0.5, 24+ dB = 1.0
+    severity = min(1.0, (ratio_db - settings.nr_ratio_db) / 12.0)
+    return severity
 
 
 def _evaluate_eq_delta(
@@ -688,6 +714,41 @@ def _scan_glitches(y: np.ndarray, sr: int, settings: AnalysisSettings) -> list[f
     return [float(ts) for ts in timestamps[: settings.glitch_max_count]]
 
 
+def _measure_stereo_width(y: np.ndarray) -> float:
+    """
+    Measure stereo width/soundstage using mid-side analysis.
+    Returns a value from 0.0 (mono/narrow) to 1.0 (wide stereo).
+    Based on the ratio of side (difference) to mid (sum) energy.
+    """
+    if y.shape[0] < 2:
+        return 0.0  # Mono or no stereo
+
+    left = y[0, :]
+    right = y[1, :]
+
+    # Mid-Side encoding
+    mid = (left + right) / 2.0
+    side = (left - right) / 2.0
+
+    # Calculate RMS energy
+    mid_rms = float(np.sqrt(np.mean(mid**2)))
+    side_rms = float(np.sqrt(np.mean(side**2)))
+
+    # Avoid division by zero
+    if mid_rms < 1e-12:
+        return 0.0
+
+    # Width ratio: side/mid
+    # Convert to 0-1 scale where 0.5 = balanced, 1.0 = very wide
+    width_ratio = side_rms / mid_rms
+
+    # Normalize to 0-1 range (typical music has 0.3-0.8)
+    # Values above 0.8 = very wide, below 0.3 = narrow
+    normalized_width = min(1.0, width_ratio / 0.8)
+
+    return normalized_width
+
+
 def _detect_fake_multichannel(y: np.ndarray, settings: AnalysisSettings) -> bool:
     if y.shape[0] < 6:
         return False
@@ -714,14 +775,15 @@ def _score_mastering_accuracy(mean_abs_diff_db: float, settings: AnalysisSetting
 
 def _score_dialogue_clarity(
     center_clipping_ratio: float,
-    center_nr_filtered: bool,
+    center_nr_filtered: float,
     settings: AnalysisSettings,
 ) -> float:
     score = 100.0
     if center_clipping_ratio > 0:
         score -= min(60.0, center_clipping_ratio * 100000)
-    if center_nr_filtered:
-        score -= settings.dialogue_clarity_penalty
+    # Scale NR penalty by severity (0.0-1.0)
+    if center_nr_filtered > 0:
+        score -= center_nr_filtered * settings.dialogue_clarity_penalty
     return max(0.0, score)
 
 
@@ -1047,9 +1109,15 @@ def _weighted_score_with_penalties(
     penalties: dict[str, float] = {}
     total_penalty = 0.0
 
-    if result.nr_filtered:
-        penalties["noise_reduction"] = 18.0
-        total_penalty += penalties["noise_reduction"]
+    # NR penalty: scaled by severity (0.0-1.0)
+    # For lossless files, reduce penalty by 75% (likely source characteristic)
+    if result.nr_filtered > 0:
+        nr_multiplier = 0.25 if result.is_lossless else 1.0
+        max_nr_penalty = 20.0
+        nr_penalty = result.nr_filtered * max_nr_penalty * nr_multiplier
+        if nr_penalty > 1.0:  # Only add if meaningful
+            penalties["noise_reduction"] = nr_penalty
+            total_penalty += nr_penalty
 
     muffle_thresh = settings.eq_muffle_drop_db
     if result.eq_muffle_db <= -muffle_thresh:
@@ -1118,7 +1186,7 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
         parts.append("Surround channel swap detected")
     if result.lfe_rolloff_error:
         parts.append("LFE roll-off error")
-    if result.center_nr_filtered or result.nr_filtered:
+    if result.center_nr_filtered > 0.3 or result.nr_filtered > 0.3:
         parts.append("Excessive NR/Filtered highs")
     if result.phase_inversion:
         parts.append("Phase inversion detected")
@@ -1136,6 +1204,11 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
         parts.append(f"Alignment warning: {result.alignment_warning}")
     if result.limiting_segments:
         parts.append(f"Limiting hot spots: {len(result.limiting_segments)}")
+    if result.stereo_width > 0:
+        if result.stereo_width < 0.3:
+            parts.append("Narrow soundstage")
+        elif result.stereo_width > 0.7:
+            parts.append("Wide soundstage")
     return "; ".join(parts)
 
 
@@ -1213,6 +1286,7 @@ def analyze_files(
         reference_mag = ref_mag_db if ref_mag_db is not None and ref_mag_db.shape == mag_db.shape else None
         nr_filtered = _detect_nr_filtered(mag_db, freqs, settings, reference_mag)
         glitch_timestamps = _scan_glitches(y, sr, settings)
+        stereo_width = _measure_stereo_width(y)
         fake_multichannel = _detect_fake_multichannel(y, settings)
         center_idx = _channel_index(metadata.get("channel_layout"), "FC", y.shape[0])
         lfe_idx = _channel_index(metadata.get("channel_layout"), "LFE", y.shape[0])
@@ -1278,13 +1352,24 @@ def analyze_files(
         if shelf_detected:
             freq_score = max(0.0, freq_score - 50.0)
         dr_score = _score_loudness_range(loudness_range_db, settings)
+
+        # Cleanliness score: focus on actual limiting/clipping, not just hot levels
+        # Start with clipping penalty based on actual clipping ratio
         clipping_score = 100.0 - min(100.0, clipping_ratio * 100000)
-        if true_peak_db >= settings.true_peak_dbfs:
-            clipping_score -= 50.0
+
+        # True-peak penalty: only apply to lossy files (indicates encoding issues)
+        # For lossless, hot levels are source characteristics, not problems
+        if true_peak_db >= settings.true_peak_dbfs and is_lossless is False:
+            clipping_score -= 30.0  # Reduced from 50
+
+        # Phase inversion is a real problem regardless of codec
         if phase_inversion:
             clipping_score -= 30.0
+
+        # Dialog balance warning - reduce penalty (may be intentional mastering)
         if abs(dialog_balance_db) >= settings.dialog_balance_warn_db:
-            clipping_score -= 20.0
+            clipping_score -= 10.0  # Reduced from 20
+
         clipping_score = max(0.0, clipping_score)
         efficiency_score = 50.0
         if is_lossless is True:
@@ -1473,6 +1558,7 @@ def analyze_files(
             glitch_timestamps=glitch_timestamps,
             limiting_segments=limiting_segments,
             reference_path=reference_path,
+            stereo_width=stereo_width,
         )
         result.score, result.score_explain = _weighted_score_with_penalties(
             result.score, result, settings
