@@ -15,11 +15,12 @@ class Worker(QtCore.QObject):
     analysis_complete = QtCore.pyqtSignal(list)
     error = QtCore.pyqtSignal(str)
 
-    @QtCore.pyqtSlot(list, dict, str)
-    def run(self, file_paths: list[str], settings: dict, output_dir: str):
+    @QtCore.pyqtSlot(list, dict, str, str)
+    def run(self, file_paths: list[str], settings: dict, output_dir: str, reference_path: str):
         try:
             settings_obj = core.AnalysisSettings(**settings)
-            results = core.analyze_files(file_paths, settings_obj, output_dir)
+            reference = reference_path or None
+            results = core.analyze_files(file_paths, settings_obj, output_dir, reference)
             self.analysis_complete.emit([r.to_dict() for r in results])
         except Exception as exc:  # noqa: BLE001
             self.error.emit(str(exc))
@@ -34,7 +35,10 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.worker = None
         self.file_inputs: list[QtWidgets.QLineEdit] = []
         self.spectrogram_labels: list[QtWidgets.QLabel] = []
+        self.diff_spectrum_labels: list[QtWidgets.QLabel] = []
+        self.clipping_heatmap_labels: list[QtWidgets.QLabel] = []
         self.file_cards: list[dict[str, QtWidgets.QLabel]] = []
+        self.reference_index: int | None = None
         self.setAcceptDrops(True)
         self._init_ui()
         self._load_settings()
@@ -66,12 +70,18 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         for idx in range(4):
             label = QtWidgets.QLabel(f"File {idx + 1}:")
             line_edit = QtWidgets.QLineEdit()
+            line_edit.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+            line_edit.customContextMenuRequested.connect(
+                lambda pos, i=idx: self._show_reference_menu(i, pos)
+            )
             browse_btn = QtWidgets.QPushButton("Browse")
             browse_btn.clicked.connect(lambda _, i=idx: self._browse_file(i))
             self.file_inputs.append(line_edit)
             file_layout.addWidget(label, idx, 0)
             file_layout.addWidget(line_edit, idx, 1)
             file_layout.addWidget(browse_btn, idx, 2)
+        self.reference_label = QtWidgets.QLabel("Reference: None")
+        file_layout.addWidget(self.reference_label, 4, 0, 1, 3)
         panel_layout.addWidget(file_group)
 
         action_layout = QtWidgets.QHBoxLayout()
@@ -87,6 +97,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         analysis_tabs = QtWidgets.QTabWidget()
         analysis_tabs.addTab(self._create_results_panel(), "Results")
         analysis_tabs.addTab(self._create_spectrogram_panel(), "Spectrograms")
+        analysis_tabs.addTab(self._create_forensic_panel(), "Forensic")
         analysis_tabs.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Expanding,
@@ -144,6 +155,10 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 "dr_score": QtWidgets.QLabel("-"),
                 "lra": QtWidgets.QLabel("-"),
                 "balance": QtWidgets.QLabel("-"),
+                "dialogue": QtWidgets.QLabel("-"),
+                "mastering": QtWidgets.QLabel("-"),
+                "scores": QtWidgets.QLabel("-"),
+                "glitches": QtWidgets.QLabel("-"),
                 "cutoff": QtWidgets.QLabel("-"),
                 "grade": QtWidgets.QLabel("-"),
                 "score": QtWidgets.QLabel("-"),
@@ -154,12 +169,26 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Policy.Expanding,
                 QtWidgets.QSizePolicy.Policy.Preferred,
             )
+            labels["scores"].setWordWrap(True)
+            labels["scores"].setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
+            labels["glitches"].setWordWrap(True)
+            labels["glitches"].setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
             card_layout.addRow("File Info", labels["name"])
             card_layout.addRow("Stream", labels["info"])
             card_layout.addRow("True DR14", labels["dr"])
             card_layout.addRow("Dynamics Score", labels["dr_score"])
             card_layout.addRow("Loudness Range", labels["lra"])
             card_layout.addRow("Dialog Balance", labels["balance"])
+            card_layout.addRow("Dialogue Score", labels["dialogue"])
+            card_layout.addRow("Mastering Score", labels["mastering"])
+            card_layout.addRow("Score Breakdown", labels["scores"])
+            card_layout.addRow("Pops/Crackles", labels["glitches"])
             card_layout.addRow("Cutoff (kHz)", labels["cutoff"])
             card_layout.addRow("Quality Grade", labels["grade"])
             card_layout.addRow("Score", labels["score"])
@@ -236,6 +265,63 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             spectrogram_layout.addWidget(label, idx // 2, idx % 2)
         content_layout.addWidget(spectrogram_group, 1)
 
+        scroll_area.setWidget(content)
+
+        return panel
+
+    def _create_forensic_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        scroll_area.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        panel_layout.addWidget(scroll_area, 1)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        content.setMinimumHeight(0)
+
+        forensic_group = QtWidgets.QGroupBox("Forensic Comparison")
+        forensic_layout = QtWidgets.QGridLayout(forensic_group)
+        forensic_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+
+        for idx in range(4):
+            card = QtWidgets.QGroupBox(f"File {idx + 1}")
+            card_layout = QtWidgets.QVBoxLayout(card)
+
+            diff_label = QtWidgets.QLabel("Difference spectrum unavailable")
+            diff_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            diff_label.setMinimumHeight(180)
+            diff_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
+            heat_label = QtWidgets.QLabel("Clipping heatmap unavailable")
+            heat_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            heat_label.setMinimumHeight(120)
+            heat_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
+
+            self.diff_spectrum_labels.append(diff_label)
+            self.clipping_heatmap_labels.append(heat_label)
+
+            card_layout.addWidget(diff_label)
+            card_layout.addWidget(heat_label)
+            forensic_layout.addWidget(card, idx // 2, idx % 2)
+
+        content_layout.addWidget(forensic_group, 1)
         scroll_area.setWidget(content)
 
         return panel
@@ -331,6 +417,35 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.lra_high_penalty_db.setSingleStep(0.5)
         layout.addRow("Loudness Range High Penalty", self.lra_high_penalty_db)
 
+        self.nr_cutoff_hz = QtWidgets.QDoubleSpinBox()
+        self.nr_cutoff_hz.setRange(1000.0, 8000.0)
+        self.nr_cutoff_hz.setSingleStep(100.0)
+        layout.addRow("NR Cutoff (Hz)", self.nr_cutoff_hz)
+
+        self.nr_drop_db = QtWidgets.QDoubleSpinBox()
+        self.nr_drop_db.setRange(1.0, 20.0)
+        self.nr_drop_db.setSingleStep(0.5)
+        layout.addRow("NR Drop vs Reference (dB)", self.nr_drop_db)
+
+        self.nr_ratio_db = QtWidgets.QDoubleSpinBox()
+        self.nr_ratio_db.setRange(3.0, 30.0)
+        self.nr_ratio_db.setSingleStep(0.5)
+        layout.addRow("NR High/Mid Ratio (dB)", self.nr_ratio_db)
+
+        self.glitch_diff_threshold = QtWidgets.QDoubleSpinBox()
+        self.glitch_diff_threshold.setRange(0.1, 1.0)
+        self.glitch_diff_threshold.setSingleStep(0.05)
+        layout.addRow("Glitch Diff Threshold", self.glitch_diff_threshold)
+
+        self.glitch_max_count = QtWidgets.QSpinBox()
+        self.glitch_max_count.setRange(1, 100)
+        layout.addRow("Glitch Max Count", self.glitch_max_count)
+
+        self.clip_heatmap_block_seconds = QtWidgets.QDoubleSpinBox()
+        self.clip_heatmap_block_seconds.setRange(1.0, 30.0)
+        self.clip_heatmap_block_seconds.setSingleStep(1.0)
+        layout.addRow("Clipping Heatmap Block (s)", self.clip_heatmap_block_seconds)
+
         self.true_peak_dbfs = QtWidgets.QDoubleSpinBox()
         self.true_peak_dbfs.setRange(-3.0, 0.0)
         self.true_peak_dbfs.setSingleStep(0.1)
@@ -374,6 +489,26 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.loudness_diff_warn_db.setSingleStep(0.5)
         layout.addRow("Loudness Diff Warn (dB)", self.loudness_diff_warn_db)
 
+        self.mastering_diff_penalty_db = QtWidgets.QDoubleSpinBox()
+        self.mastering_diff_penalty_db.setRange(0.5, 10.0)
+        self.mastering_diff_penalty_db.setSingleStep(0.5)
+        layout.addRow("Mastering Diff Penalty", self.mastering_diff_penalty_db)
+
+        self.dialogue_clarity_penalty = QtWidgets.QDoubleSpinBox()
+        self.dialogue_clarity_penalty.setRange(5.0, 60.0)
+        self.dialogue_clarity_penalty.setSingleStep(5.0)
+        layout.addRow("Dialogue Clarity Penalty", self.dialogue_clarity_penalty)
+
+        self.fake_multichannel_corr_threshold = QtWidgets.QDoubleSpinBox()
+        self.fake_multichannel_corr_threshold.setRange(0.7, 0.999)
+        self.fake_multichannel_corr_threshold.setSingleStep(0.01)
+        layout.addRow("Fake Multi Corr Threshold", self.fake_multichannel_corr_threshold)
+
+        self.fake_multichannel_energy_variance_db = QtWidgets.QDoubleSpinBox()
+        self.fake_multichannel_energy_variance_db.setRange(1.0, 20.0)
+        self.fake_multichannel_energy_variance_db.setSingleStep(0.5)
+        layout.addRow("Fake Multi Energy Spread (dB)", self.fake_multichannel_energy_variance_db)
+
         self.mel_bins = QtWidgets.QSpinBox()
         self.mel_bins.setRange(32, 512)
         layout.addRow("Mel Bins", self.mel_bins)
@@ -395,6 +530,12 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.weight_format = QtWidgets.QSpinBox()
         self.weight_format.setRange(0, 100)
         weights_layout.addRow("Format", self.weight_format)
+        self.weight_dialogue = QtWidgets.QSpinBox()
+        self.weight_dialogue.setRange(0, 100)
+        weights_layout.addRow("Dialogue", self.weight_dialogue)
+        self.weight_mastering = QtWidgets.QSpinBox()
+        self.weight_mastering.setRange(0, 100)
+        weights_layout.addRow("Mastering", self.weight_mastering)
         layout.addRow(weights_group)
 
         return panel
@@ -439,6 +580,16 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.lra_high_penalty_db.setValue(
             settings.get("lra_high_penalty_db", DEFAULTS["lra_high_penalty_db"])
         )
+        self.nr_cutoff_hz.setValue(settings.get("nr_cutoff_hz", DEFAULTS["nr_cutoff_hz"]))
+        self.nr_drop_db.setValue(settings.get("nr_drop_db", DEFAULTS["nr_drop_db"]))
+        self.nr_ratio_db.setValue(settings.get("nr_ratio_db", DEFAULTS["nr_ratio_db"]))
+        self.glitch_diff_threshold.setValue(
+            settings.get("glitch_diff_threshold", DEFAULTS["glitch_diff_threshold"])
+        )
+        self.glitch_max_count.setValue(settings.get("glitch_max_count", DEFAULTS["glitch_max_count"]))
+        self.clip_heatmap_block_seconds.setValue(
+            settings.get("clip_heatmap_block_seconds", DEFAULTS["clip_heatmap_block_seconds"])
+        )
         self.true_peak_dbfs.setValue(settings.get("true_peak_dbfs", DEFAULTS["true_peak_dbfs"]))
         self.brickwall_dr_db.setValue(settings.get("brickwall_dr_db", DEFAULTS["brickwall_dr_db"]))
         self.target_dr_min.setValue(settings.get("target_dr_min", DEFAULTS["target_dr_min"]))
@@ -459,6 +610,21 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.loudness_diff_warn_db.setValue(
             settings.get("loudness_diff_warn_db", DEFAULTS["loudness_diff_warn_db"])
         )
+        self.mastering_diff_penalty_db.setValue(
+            settings.get("mastering_diff_penalty_db", DEFAULTS["mastering_diff_penalty_db"])
+        )
+        self.dialogue_clarity_penalty.setValue(
+            settings.get("dialogue_clarity_penalty", DEFAULTS["dialogue_clarity_penalty"])
+        )
+        self.fake_multichannel_corr_threshold.setValue(
+            settings.get("fake_multichannel_corr_threshold", DEFAULTS["fake_multichannel_corr_threshold"])
+        )
+        self.fake_multichannel_energy_variance_db.setValue(
+            settings.get(
+                "fake_multichannel_energy_variance_db",
+                DEFAULTS["fake_multichannel_energy_variance_db"],
+            )
+        )
         self.mel_bins.setValue(settings.get("mel_bins", DEFAULTS["mel_bins"]))
         self.weight_frequency.setValue(settings.get("weight_frequency", DEFAULTS["weight_frequency"]))
         self.weight_dynamic_range.setValue(
@@ -467,6 +633,8 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.weight_cleanliness.setValue(settings.get("weight_cleanliness", DEFAULTS["weight_cleanliness"]))
         self.weight_efficiency.setValue(settings.get("weight_efficiency", DEFAULTS["weight_efficiency"]))
         self.weight_format.setValue(settings.get("weight_format", DEFAULTS["weight_format"]))
+        self.weight_dialogue.setValue(settings.get("weight_dialogue", DEFAULTS["weight_dialogue"]))
+        self.weight_mastering.setValue(settings.get("weight_mastering", DEFAULTS["weight_mastering"]))
 
     def save_settings(self):
         self.app_manager.save_config(self.tool_name, self._gather_settings())
@@ -491,6 +659,12 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             "lra_target_min": self.lra_target_min.value(),
             "lra_target_max": self.lra_target_max.value(),
             "lra_high_penalty_db": self.lra_high_penalty_db.value(),
+            "nr_cutoff_hz": self.nr_cutoff_hz.value(),
+            "nr_drop_db": self.nr_drop_db.value(),
+            "nr_ratio_db": self.nr_ratio_db.value(),
+            "glitch_diff_threshold": self.glitch_diff_threshold.value(),
+            "glitch_max_count": self.glitch_max_count.value(),
+            "clip_heatmap_block_seconds": self.clip_heatmap_block_seconds.value(),
             "true_peak_dbfs": self.true_peak_dbfs.value(),
             "brickwall_dr_db": self.brickwall_dr_db.value(),
             "target_dr_min": self.target_dr_min.value(),
@@ -501,12 +675,18 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             "presence_band_high_hz": self.presence_band_high_hz.value(),
             "dialog_balance_warn_db": self.dialog_balance_warn_db.value(),
             "loudness_diff_warn_db": self.loudness_diff_warn_db.value(),
+            "mastering_diff_penalty_db": self.mastering_diff_penalty_db.value(),
+            "dialogue_clarity_penalty": self.dialogue_clarity_penalty.value(),
+            "fake_multichannel_corr_threshold": self.fake_multichannel_corr_threshold.value(),
+            "fake_multichannel_energy_variance_db": self.fake_multichannel_energy_variance_db.value(),
             "mel_bins": self.mel_bins.value(),
             "weight_frequency": self.weight_frequency.value(),
             "weight_dynamic_range": self.weight_dynamic_range.value(),
             "weight_cleanliness": self.weight_cleanliness.value(),
             "weight_efficiency": self.weight_efficiency.value(),
             "weight_format": self.weight_format.value(),
+            "weight_dialogue": self.weight_dialogue.value(),
+            "weight_mastering": self.weight_mastering.value(),
         }
 
     def _browse_file(self, index: int):
@@ -519,16 +699,41 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         if path:
             self.file_inputs[index].setText(path)
 
+    def _show_reference_menu(self, index: int, pos: QtCore.QPoint) -> None:
+        menu = QtWidgets.QMenu(self)
+        set_action = menu.addAction("Set as Reference")
+        clear_action = menu.addAction("Clear Reference")
+        action = menu.exec(self.file_inputs[index].mapToGlobal(pos))
+        if action == set_action:
+            self._set_reference_index(index)
+        elif action == clear_action:
+            self._set_reference_index(None)
+
+    def _set_reference_index(self, index: int | None) -> None:
+        self.reference_index = index
+        if index is None:
+            self.reference_label.setText("Reference: None")
+        else:
+            name = os.path.basename(self.file_inputs[index].text().strip()) or f"File {index + 1}"
+            self.reference_label.setText(f"Reference: {name}")
+
     def _clear_inputs(self):
         for line_edit in self.file_inputs:
             line_edit.clear()
         self.summary_box.clear()
         self.verdict_box.clear()
+        self._set_reference_index(None)
         for labels in self.file_cards:
             for label in labels.values():
                 label.setText("-")
         for label in self.spectrogram_labels:
             label.setText("No spectrogram")
+            label.setPixmap(QtGui.QPixmap())
+        for label in self.diff_spectrum_labels:
+            label.setText("Difference spectrum unavailable")
+            label.setPixmap(QtGui.QPixmap())
+        for label in self.clipping_heatmap_labels:
+            label.setText("Clipping heatmap unavailable")
             label.setPixmap(QtGui.QPixmap())
 
     def _collect_files(self) -> list[str]:
@@ -543,6 +748,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.run_button.setEnabled(False)
         self.summary_box.setText("Analyzing audio files...")
         temp_dir = self.app_manager.get_temp_dir(self.tool_name)
+        reference_path = None
+        if self.reference_index is not None and self.reference_index < len(self.file_inputs):
+            reference_path = self.file_inputs[self.reference_index].text().strip() or None
         QtCore.QMetaObject.invokeMethod(
             self.worker,
             "run",
@@ -550,6 +758,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             QtCore.Q_ARG(list, file_paths),
             QtCore.Q_ARG(dict, self._gather_settings()),
             QtCore.Q_ARG(str, temp_dir),
+            QtCore.Q_ARG(str, reference_path or ""),
         )
 
     def _on_analysis_complete(self, results: list[dict]):
@@ -557,6 +766,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self._populate_results(results)
         self._update_summary(results)
         self._load_spectrograms(results)
+        self._load_forensics(results)
 
     def _on_error(self, message: str):
         self.run_button.setEnabled(True)
@@ -570,10 +780,14 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         for idx, result in enumerate(results[:4]):
             labels = self.file_cards[idx]
             flags = []
+            if result.get("reference_path") and result.get("path") == result.get("reference_path"):
+                flags.append("Reference")
             if result.get("reencode_detected"):
                 flags.append("RE-ENCODE DETECTED")
             if result.get("shelf_detected"):
                 flags.append("Spectral shelf")
+            if result.get("nr_filtered") or result.get("center_nr_filtered"):
+                flags.append("Excessive NR/Filtered")
             if abs(result.get("dialog_balance_db", 0.0)) >= self.dialog_balance_warn_db.value():
                 if result.get("dialog_balance_db", 0.0) < 0:
                     flags.append("Presence boost")
@@ -583,6 +797,8 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 flags.append("True-peak clipping risk")
             if result.get("phase_inversion"):
                 flags.append("Phase inversion")
+            if result.get("fake_multichannel"):
+                flags.append("Fake multichannel")
             if result.get("bitrate_bloat"):
                 flags.append("Bitrate bloat")
             if result.get("is_lossless") is True:
@@ -591,6 +807,8 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 flags.append("Lossy")
             if abs(result.get("loudness_offset_db", 0.0)) >= self.loudness_diff_warn_db.value():
                 flags.append("Loudness offset")
+            if result.get("glitch_timestamps"):
+                flags.append("Transient spikes")
 
             labels["name"].setText(os.path.basename(result["path"]))
             codec_name = result.get("codec_name")
@@ -605,6 +823,25 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             labels["dr_score"].setText(f"{result['dr_score']:.1f}")
             labels["lra"].setText(f"{result.get('loudness_range_db', 0.0):.1f} dB")
             labels["balance"].setText(f"{result.get('dialog_balance_db', 0.0):.1f} dB")
+            labels["dialogue"].setText(f"{result.get('dialogue_score', 0.0):.1f}")
+            if result.get("reference_path"):
+                labels["mastering"].setText(f"{result.get('mastering_score', 0.0):.1f}")
+            else:
+                labels["mastering"].setText("N/A")
+            breakdown = (
+                f"Freq {result.get('freq_score', 0.0):.1f} | "
+                f"Clean {result.get('cleanliness_score', 0.0):.1f} | "
+                f"Eff {result.get('efficiency_score', 0.0):.1f} | "
+                f"Fmt {result.get('format_score', 0.0):.1f}"
+            )
+            labels["scores"].setText(breakdown)
+            glitches = result.get("glitch_timestamps") or []
+            if glitches:
+                sample = ", ".join(f"{ts:.2f}s" for ts in glitches[:6])
+                more = "…" if len(glitches) > 6 else ""
+                labels["glitches"].setText(f"{sample}{more}")
+            else:
+                labels["glitches"].setText("None")
             labels["cutoff"].setText(f"{result['freq_cutoff_hz'] / 1000:.1f}")
             labels["grade"].setText(result.get("quality_grade", "-"))
             labels["score"].setText(f"{result['score']:.1f}")
@@ -642,6 +879,33 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             scaled = pixmap.scaled(400, 200, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
             self.spectrogram_labels[idx].setPixmap(scaled)
             self.spectrogram_labels[idx].setText("")
+
+    def _load_forensics(self, results: list[dict]):
+        for label in self.diff_spectrum_labels:
+            label.setText("Difference spectrum unavailable")
+            label.setPixmap(QtGui.QPixmap())
+        for label in self.clipping_heatmap_labels:
+            label.setText("Clipping heatmap unavailable")
+            label.setPixmap(QtGui.QPixmap())
+
+        for idx, result in enumerate(results[:4]):
+            diff_path = result.get("diff_spectrum_path")
+            if diff_path and os.path.exists(diff_path):
+                pixmap = QtGui.QPixmap(diff_path)
+                if not pixmap.isNull():
+                    scaled = pixmap.scaled(400, 200, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+                    self.diff_spectrum_labels[idx].setPixmap(scaled)
+                    self.diff_spectrum_labels[idx].setText("")
+            elif result.get("reference_path") and result.get("path") == result.get("reference_path"):
+                self.diff_spectrum_labels[idx].setText("Reference file")
+
+            heat_path = result.get("clipping_heatmap_path")
+            if heat_path and os.path.exists(heat_path):
+                pixmap = QtGui.QPixmap(heat_path)
+                if not pixmap.isNull():
+                    scaled = pixmap.scaled(400, 140, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+                    self.clipping_heatmap_labels[idx].setPixmap(scaled)
+                    self.clipping_heatmap_labels[idx].setText("")
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():

@@ -44,6 +44,12 @@ class AnalysisSettings:
     lra_target_min: float
     lra_target_max: float
     lra_high_penalty_db: float
+    nr_cutoff_hz: float
+    nr_drop_db: float
+    nr_ratio_db: float
+    glitch_diff_threshold: float
+    glitch_max_count: int
+    clip_heatmap_block_seconds: float
     true_peak_dbfs: float
     brickwall_dr_db: float
     target_dr_min: float
@@ -54,12 +60,18 @@ class AnalysisSettings:
     presence_band_high_hz: float
     dialog_balance_warn_db: float
     loudness_diff_warn_db: float
+    mastering_diff_penalty_db: float
+    dialogue_clarity_penalty: float
+    fake_multichannel_corr_threshold: float
+    fake_multichannel_energy_variance_db: float
     mel_bins: int
     weight_frequency: float
     weight_dynamic_range: float
     weight_cleanliness: float
     weight_efficiency: float
     weight_format: float
+    weight_dialogue: float
+    weight_mastering: float
 
 
 @dataclass
@@ -83,9 +95,14 @@ class AudioAnalysisResult:
     freq_cutoff_hz: float
     shelf_detected: bool
     reencode_detected: bool
+    nr_filtered: bool
     clipping_ratio: float
     clipping_detected: bool
+    center_clipping_ratio: float
+    center_clipping_detected: bool
+    center_nr_filtered: bool
     phase_inversion: bool
+    fake_multichannel: bool
     bitrate_kbps: float | None
     bitrate_bloat: bool
     file_size_mb: float
@@ -94,10 +111,16 @@ class AudioAnalysisResult:
     cleanliness_score: float
     efficiency_score: float
     format_score: float
+    dialogue_score: float
+    mastering_score: float
     quality_grade: str
     score: float
     summary: str
     spectrogram_path: str | None
+    diff_spectrum_path: str | None
+    clipping_heatmap_path: str | None
+    glitch_timestamps: list[float]
+    reference_path: str | None
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -209,6 +232,17 @@ def _calculate_loudness_metrics(
     return loudness_db, lra_db
 
 
+def _mean_spectrum_db(
+    y_mono: np.ndarray, sr: int, settings: AnalysisSettings
+) -> tuple[np.ndarray, np.ndarray]:
+    stft = librosa.stft(y_mono, n_fft=settings.fft_size, hop_length=settings.hop_length)
+    mag = np.abs(stft)
+    mean_mag = np.mean(mag, axis=1)
+    mag_db = librosa.amplitude_to_db(mean_mag, ref=np.max)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=settings.fft_size)
+    return freqs, mag_db
+
+
 def _spectral_cutoff(
     y_mono: np.ndarray, sr: int, settings: AnalysisSettings
 ) -> tuple[float, bool, bool]:
@@ -253,6 +287,115 @@ def _dialog_balance_db(
     return dialog_mean - presence_mean
 
 
+def _detect_nr_filtered(
+    mag_db: np.ndarray,
+    freqs: np.ndarray,
+    settings: AnalysisSettings,
+    reference_mag_db: np.ndarray | None = None,
+) -> bool:
+    high_band = freqs >= settings.nr_cutoff_hz
+    mid_band = (freqs >= settings.dialog_band_low_hz) & (freqs <= settings.dialog_band_high_hz)
+    high_mean = float(np.mean(mag_db[high_band])) if np.any(high_band) else -120.0
+    mid_mean = float(np.mean(mag_db[mid_band])) if np.any(mid_band) else -120.0
+    ratio_db = mid_mean - high_mean
+    if reference_mag_db is not None:
+        ref_high = float(np.mean(reference_mag_db[high_band])) if np.any(high_band) else -120.0
+        if ref_high - high_mean >= settings.nr_drop_db:
+            return True
+    return ratio_db >= settings.nr_ratio_db
+
+
+def _scan_glitches(y: np.ndarray, sr: int, settings: AnalysisSettings) -> list[float]:
+    if y.size == 0:
+        return []
+    diffs = []
+    for channel in y:
+        channel_diff = np.abs(np.diff(channel))
+        if channel_diff.size:
+            diffs.append(channel_diff)
+    if not diffs:
+        return []
+    diff = np.max(np.vstack(diffs), axis=0)
+    if diff.size == 0:
+        return []
+    mean = float(np.mean(diff))
+    std = float(np.std(diff))
+    threshold = max(settings.glitch_diff_threshold, mean + 6.0 * std)
+    spikes = np.where(diff >= threshold)[0]
+    if spikes.size == 0:
+        return []
+    timestamps = (spikes / sr).tolist()
+    return [float(ts) for ts in timestamps[: settings.glitch_max_count]]
+
+
+def _detect_fake_multichannel(y: np.ndarray, settings: AnalysisSettings) -> bool:
+    if y.shape[0] < 6:
+        return False
+    channels = y[: y.shape[0], :]
+    if channels.shape[1] == 0:
+        return False
+    corr = np.nan_to_num(np.corrcoef(channels))
+    if corr.shape[0] < 2:
+        return False
+    upper = corr[np.triu_indices_from(corr, k=1)]
+    median_corr = float(np.median(np.abs(upper))) if upper.size else 0.0
+    rms = np.sqrt(np.mean(channels**2, axis=1))
+    rms_db = 20 * np.log10(np.maximum(rms, 1e-12))
+    energy_spread = float(np.max(rms_db) - np.min(rms_db))
+    return (
+        median_corr >= settings.fake_multichannel_corr_threshold
+        and energy_spread <= settings.fake_multichannel_energy_variance_db
+    )
+
+
+def _score_mastering_accuracy(mean_abs_diff_db: float, settings: AnalysisSettings) -> float:
+    return max(0.0, 100.0 - mean_abs_diff_db * settings.mastering_diff_penalty_db)
+
+
+def _score_dialogue_clarity(
+    center_clipping_ratio: float,
+    center_nr_filtered: bool,
+    settings: AnalysisSettings,
+) -> float:
+    score = 100.0
+    if center_clipping_ratio > 0:
+        score -= min(60.0, center_clipping_ratio * 100000)
+    if center_nr_filtered:
+        score -= settings.dialogue_clarity_penalty
+    return max(0.0, score)
+
+
+def _save_difference_spectrum(
+    freqs: np.ndarray,
+    diff_db: np.ndarray,
+    out_path: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 3), dpi=200)
+    ax.plot(freqs / 1000.0, diff_db, color="#1f77b4", linewidth=1.0)
+    ax.axhline(0.0, color="#888888", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("Frequency (kHz)")
+    ax.set_ylabel("Diff (dB)")
+    ax.set_title("Difference Spectrum (Target - Reference)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _save_clipping_heatmap(
+    clipping_series: list[float],
+    block_seconds: float,
+    out_path: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 2.2), dpi=200)
+    times = np.arange(len(clipping_series)) * block_seconds
+    ax.bar(times, clipping_series, width=block_seconds, color="#d62728", alpha=0.7)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Clip ratio")
+    ax.set_title("Clipping Heatmap")
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
 def _detect_clipping(y: np.ndarray, settings: AnalysisSettings) -> tuple[float, bool]:
     flat = np.abs(y.reshape(-1))
     if flat.size == 0:
@@ -445,6 +588,8 @@ def _weighted_score(
     cleanliness_score: float,
     efficiency_score: float,
     format_score: float,
+    dialogue_score: float,
+    mastering_score: float,
     settings: AnalysisSettings,
 ) -> float:
     return (
@@ -453,6 +598,8 @@ def _weighted_score(
         + cleanliness_score * settings.weight_cleanliness / 100.0
         + efficiency_score * settings.weight_efficiency / 100.0
         + format_score * settings.weight_format / 100.0
+        + dialogue_score * settings.weight_dialogue / 100.0
+        + mastering_score * settings.weight_mastering / 100.0
     )
 
 
@@ -480,10 +627,16 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
             parts.append("Presence boost (dialog recessed)")
         else:
             parts.append("Dialog-heavy balance")
+    if result.center_nr_filtered or result.nr_filtered:
+        parts.append("Excessive NR/Filtered highs")
     if result.phase_inversion:
         parts.append("Phase inversion detected")
+    if result.fake_multichannel:
+        parts.append("Fake multichannel remix")
     if result.bitrate_bloat:
         parts.append("Possible bitrate bloat")
+    if result.glitch_timestamps:
+        parts.append(f"Transient spikes: {len(result.glitch_timestamps)}")
     return "; ".join(parts)
 
 
@@ -530,8 +683,15 @@ def analyze_files(
     file_paths: Iterable[str],
     settings: AnalysisSettings,
     output_dir: str,
+    reference_path: str | None = None,
 ) -> list[AudioAnalysisResult]:
     results: list[AudioAnalysisResult] = []
+    ref_freqs = None
+    ref_mag_db = None
+    if reference_path:
+        ref_audio, ref_sr = _load_audio(reference_path, settings.target_sample_rate)
+        ref_mono = np.mean(ref_audio, axis=0) if ref_audio.shape[0] > 1 else ref_audio[0]
+        ref_freqs, ref_mag_db = _mean_spectrum_db(ref_mono, ref_sr, settings)
     for path in file_paths:
         y, sr = _load_audio(path, settings.target_sample_rate)
         duration_s = float(librosa.get_duration(y=y, sr=sr))
@@ -541,7 +701,22 @@ def analyze_files(
         loudness_db, loudness_range_db = _calculate_loudness_metrics(y, sr, settings)
         true_peak_db = _true_peak_db(y)
         cutoff_hz, shelf_detected, reencode_detected = _spectral_cutoff(y_mono, sr, settings)
+        freqs, mag_db = _mean_spectrum_db(y_mono, sr, settings)
         dialog_balance_db = _dialog_balance_db(y_mono, sr, settings)
+        reference_mag = ref_mag_db if ref_mag_db is not None and ref_mag_db.shape == mag_db.shape else None
+        nr_filtered = _detect_nr_filtered(mag_db, freqs, settings, reference_mag)
+        glitch_timestamps = _scan_glitches(y, sr, settings)
+        fake_multichannel = _detect_fake_multichannel(y, settings)
+        center_channel = y[2] if y.shape[0] >= 3 else y_mono
+        center_clipping_ratio = float(np.mean(np.abs(center_channel) >= settings.clip_threshold))
+        center_clipping_detected = center_clipping_ratio >= settings.clip_ratio_warn
+        center_freqs, center_mag_db = _mean_spectrum_db(center_channel, sr, settings)
+        center_reference_mag = (
+            ref_mag_db if ref_mag_db is not None and ref_mag_db.shape == center_mag_db.shape else None
+        )
+        center_nr_filtered = _detect_nr_filtered(
+            center_mag_db, center_freqs, settings, center_reference_mag
+        )
         clipping_ratio, clipping_detected = _detect_clipping(y, settings)
         phase_inversion = _detect_phase_inversion(y, settings)
         bitrate_kbps = _estimate_bitrate(path, duration_s)
@@ -567,15 +742,54 @@ def analyze_files(
             format_score = 60.0
         else:
             format_score = 50.0
+        dialogue_score = _score_dialogue_clarity(
+            center_clipping_ratio, center_nr_filtered, settings
+        )
+        mastering_score = 100.0
+        diff_spectrum_path = None
+        if reference_path and reference_mag is not None and ref_freqs is not None and path != reference_path:
+            diff_db = mag_db - reference_mag
+            band_mask = (freqs >= 20.0) & (freqs <= settings.shelf_high_hz)
+            mean_abs_diff = float(np.mean(np.abs(diff_db[band_mask]))) if np.any(band_mask) else 0.0
+            mastering_score = _score_mastering_accuracy(mean_abs_diff, settings)
+            if output_dir:
+                base = os.path.splitext(os.path.basename(path))[0]
+                diff_spectrum_path = os.path.join(output_dir, f"{base}_diff_spectrum.png")
+                _save_difference_spectrum(freqs, diff_db, diff_spectrum_path)
         weighted_score = _weighted_score(
-            freq_score, dr_score, clipping_score, efficiency_score, format_score, settings
+            freq_score,
+            dr_score,
+            clipping_score,
+            efficiency_score,
+            format_score,
+            dialogue_score,
+            mastering_score,
+            settings,
         )
 
         spectrogram_path = None
+        clipping_heatmap_path = None
         if output_dir:
             base = os.path.splitext(os.path.basename(path))[0]
             spectrogram_path = os.path.join(output_dir, f"{base}_spectrogram.png")
             _save_spectrogram(y_mono, sr, spectrogram_path, settings)
+            block_size = int(settings.clip_heatmap_block_seconds * sr)
+            if block_size > 0:
+                block_count = max(1, y.shape[1] // block_size)
+                clipping_series = []
+                for idx in range(block_count):
+                    start = idx * block_size
+                    end = start + block_size
+                    block = y[:, start:end]
+                    if block.size == 0:
+                        clipping_series.append(0.0)
+                        continue
+                    ratio = float(np.mean(np.abs(block) >= settings.clip_threshold))
+                    clipping_series.append(ratio)
+                clipping_heatmap_path = os.path.join(output_dir, f"{base}_clip_heatmap.png")
+                _save_clipping_heatmap(
+                    clipping_series, settings.clip_heatmap_block_seconds, clipping_heatmap_path
+                )
 
         result = AudioAnalysisResult(
             path=path,
@@ -597,9 +811,14 @@ def analyze_files(
             freq_cutoff_hz=cutoff_hz,
             shelf_detected=shelf_detected,
             reencode_detected=reencode_detected and (bitrate_kbps or 0.0) >= 128.0,
+            nr_filtered=nr_filtered,
             clipping_ratio=clipping_ratio,
             clipping_detected=clipping_detected,
+            center_clipping_ratio=center_clipping_ratio,
+            center_clipping_detected=center_clipping_detected,
+            center_nr_filtered=center_nr_filtered,
             phase_inversion=phase_inversion,
+            fake_multichannel=fake_multichannel,
             bitrate_kbps=bitrate_kbps,
             bitrate_bloat=bitrate_bloat,
             file_size_mb=size_mb,
@@ -608,10 +827,16 @@ def analyze_files(
             cleanliness_score=clipping_score,
             efficiency_score=efficiency_score,
             format_score=format_score,
+            dialogue_score=dialogue_score,
+            mastering_score=mastering_score,
             quality_grade="",
             score=weighted_score,
             summary="",
             spectrogram_path=spectrogram_path,
+            diff_spectrum_path=diff_spectrum_path,
+            clipping_heatmap_path=clipping_heatmap_path,
+            glitch_timestamps=glitch_timestamps,
+            reference_path=reference_path,
         )
         result.quality_grade = _grade_score(result.score)
         result.summary = _build_summary(result, settings)
@@ -633,6 +858,8 @@ def analyze_files(
                         result.cleanliness_score,
                         result.efficiency_score,
                         result.format_score,
+                        result.dialogue_score,
+                        result.mastering_score,
                         settings,
                     )
                     result.quality_grade = _grade_score(result.score)
@@ -650,6 +877,8 @@ def analyze_files(
                     result.cleanliness_score,
                     result.efficiency_score,
                     result.format_score,
+                    result.dialogue_score,
+                    result.mastering_score,
                     settings,
                 )
                 result.quality_grade = _grade_score(result.score)
