@@ -47,10 +47,18 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.tabs.addTab(self._create_analysis_tab(), "Analysis")
         self.tabs.addTab(self._create_settings_tab(), "Settings")
         layout.addWidget(self.tabs)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
 
     def _create_analysis_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
 
         file_group = QtWidgets.QGroupBox("Input Audio Files (up to 4)")
         file_layout = QtWidgets.QGridLayout(file_group)
@@ -85,17 +93,34 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
     def _create_results_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
 
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        scroll_area.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         panel_layout.addWidget(scroll_area, 1)
 
         content = QtWidgets.QWidget()
         content_layout = QtWidgets.QVBoxLayout(content)
+        content.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        content.setMinimumHeight(0)
 
         cards_group = QtWidgets.QGroupBox("File Comparison")
         cards_layout = QtWidgets.QGridLayout(cards_group)
+        cards_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
         for idx in range(4):
             card = QtWidgets.QGroupBox(f"File {idx + 1}")
             card_layout = QtWidgets.QFormLayout(card)
@@ -125,11 +150,19 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.verdict_box = QtWidgets.QTextEdit()
         self.verdict_box.setReadOnly(True)
         self.verdict_box.setPlaceholderText("Verdict summary will appear here...")
+        self.verdict_box.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Minimum,
+        )
         content_layout.addWidget(self.verdict_box)
 
         self.summary_box = QtWidgets.QTextEdit()
         self.summary_box.setReadOnly(True)
         self.summary_box.setPlaceholderText("Detailed analysis will appear here...")
+        self.summary_box.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         content_layout.addWidget(self.summary_box, 1)
 
         scroll_area.setWidget(content)
@@ -139,17 +172,34 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
     def _create_spectrogram_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
 
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        scroll_area.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         panel_layout.addWidget(scroll_area, 1)
 
         content = QtWidgets.QWidget()
         content_layout = QtWidgets.QVBoxLayout(content)
+        content.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        content.setMinimumHeight(0)
 
         spectrogram_group = QtWidgets.QGroupBox("Spectrogram Comparison")
         spectrogram_layout = QtWidgets.QGridLayout(spectrogram_group)
+        spectrogram_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         for idx in range(4):
             label = QtWidgets.QLabel("No spectrogram")
             label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
