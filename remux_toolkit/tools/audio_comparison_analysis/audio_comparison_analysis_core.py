@@ -272,6 +272,7 @@ def _calculate_loudness_metrics(
 
 
 def _resample_audio(y: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample with SOXR HQ if available, fallback to librosa."""
     if orig_sr == target_sr:
         return y
     if soxr is not None:
@@ -280,6 +281,7 @@ def _resample_audio(y: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
 
 
 def _bandpass_mono(y: np.ndarray, sr: int, low_hz: float, high_hz: float) -> np.ndarray:
+    """Bandpass filter used for robust alignment correlation."""
     if y.size == 0:
         return y
     low = max(1.0, low_hz) / (sr / 2)
@@ -293,6 +295,7 @@ def _bandpass_mono(y: np.ndarray, sr: int, low_hz: float, high_hz: float) -> np.
 def _align_offset(
     ref: np.ndarray, cand: np.ndarray, sr: int
 ) -> tuple[float, float]:
+    """Cross-correlation with peak interpolation for sub-sample offset."""
     if ref.size == 0 or cand.size == 0:
         return 0.0, 0.0
     corr = scipy.signal.fftconvolve(cand, ref[::-1], mode="full")
@@ -315,6 +318,7 @@ def _align_offset(
 def _apply_offset(
     ref: np.ndarray, cand: np.ndarray, offset_s: float, sr: int
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Trim arrays so aligned sections overlap."""
     offset_samples = int(round(offset_s * sr))
     if offset_samples > 0:
         cand = cand[offset_samples:]
@@ -326,6 +330,7 @@ def _apply_offset(
 def _log_power_spectrogram(
     y_mono: np.ndarray, sr: int, settings: AnalysisSettings
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Log-power spectrogram for delta EQ mapping."""
     stft = librosa.stft(y_mono, n_fft=settings.fft_size, hop_length=settings.hop_length)
     power = np.abs(stft) ** 2
     power_db = librosa.power_to_db(power, ref=np.max)
