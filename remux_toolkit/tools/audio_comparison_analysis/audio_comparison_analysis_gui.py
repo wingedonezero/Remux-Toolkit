@@ -373,7 +373,19 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
 
     def _create_settings_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
-        layout = QtWidgets.QFormLayout(panel)
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        scroll_area.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        panel_layout.addWidget(scroll_area, 1)
+
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QFormLayout(content)
 
         def set_tip(widget: QtWidgets.QWidget, text: str) -> None:
             widget.setToolTip(text)
@@ -735,6 +747,8 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         set_tip(self.weight_mastering, "Weight for mastering accuracy score.")
         weights_layout.addRow("Mastering", self.weight_mastering)
         layout.addRow(weights_group)
+
+        scroll_area.setWidget(content)
 
         return panel
 
