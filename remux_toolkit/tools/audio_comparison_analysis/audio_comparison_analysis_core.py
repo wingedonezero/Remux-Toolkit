@@ -8,10 +8,12 @@ import math
 import os
 import subprocess
 from typing import Iterable
+import warnings
 
 import librosa
 import numpy as np
 import scipy.signal
+import soundfile as sf
 
 import matplotlib
 matplotlib.use("Agg")
@@ -86,10 +88,38 @@ class AudioAnalysisResult:
 
 
 def _load_audio(path: str, target_sr: int) -> tuple[np.ndarray, int]:
-    y, sr = librosa.load(path, sr=target_sr, mono=False)
-    if y.ndim == 1:
-        y = y[np.newaxis, :]
-    return y, sr
+    try:
+        audio, sr = sf.read(path, always_2d=True, dtype="float32")
+        audio = audio.T
+    except (RuntimeError, sf.LibsndfileError, ValueError):
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="PySoundFile failed.*",
+                category=UserWarning,
+                module="librosa",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="librosa.core.audio.__audioread_load.*",
+                category=FutureWarning,
+                module="librosa",
+            )
+            audio, sr = librosa.load(path, sr=None, mono=False)
+        if audio.ndim == 1:
+            audio = audio[np.newaxis, :]
+
+    if sr != target_sr:
+        audio = np.stack(
+            [
+                librosa.resample(channel, orig_sr=sr, target_sr=target_sr)
+                for channel in audio
+            ],
+            axis=0,
+        )
+        sr = target_sr
+
+    return audio, sr
 
 
 def _calculate_dynamic_range(

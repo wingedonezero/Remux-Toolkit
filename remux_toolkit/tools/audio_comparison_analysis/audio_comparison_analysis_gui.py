@@ -124,11 +124,19 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         cards_layout = QtWidgets.QGridLayout(cards_group)
         cards_group.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Minimum,
+            QtWidgets.QSizePolicy.Policy.Expanding,
         )
         for idx in range(4):
             card = QtWidgets.QGroupBox(f"File {idx + 1}")
+            card.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Expanding,
+            )
             card_layout = QtWidgets.QFormLayout(card)
+            card_layout.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+            card_layout.setFieldGrowthPolicy(
+                QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+            )
             labels = {
                 "name": QtWidgets.QLabel("-"),
                 "info": QtWidgets.QLabel("-"),
@@ -140,6 +148,10 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 "flags": QtWidgets.QLabel("-"),
             }
             labels["flags"].setWordWrap(True)
+            labels["flags"].setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
             card_layout.addRow("File Info", labels["name"])
             card_layout.addRow("Stream", labels["info"])
             card_layout.addRow("True DR14", labels["dr"])
@@ -150,7 +162,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             card_layout.addRow("Flags", labels["flags"])
             self.file_cards.append(labels)
             cards_layout.addWidget(card, 0, idx)
-        content_layout.addWidget(cards_group)
+            cards_layout.setColumnStretch(idx, 1)
+        cards_layout.setRowStretch(0, 1)
+        content_layout.addWidget(cards_group, 1)
 
         self.verdict_box = QtWidgets.QTextEdit()
         self.verdict_box.setReadOnly(True)

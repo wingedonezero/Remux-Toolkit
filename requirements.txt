@@ -11,6 +11,7 @@ Pillow
 imagehash
 scenedetect[opencv]
 librosa
+soundfile
 videohash
 VideoTimestamps
 av
