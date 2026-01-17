@@ -142,6 +142,8 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 "info": QtWidgets.QLabel("-"),
                 "dr": QtWidgets.QLabel("-"),
                 "dr_score": QtWidgets.QLabel("-"),
+                "lra": QtWidgets.QLabel("-"),
+                "balance": QtWidgets.QLabel("-"),
                 "cutoff": QtWidgets.QLabel("-"),
                 "grade": QtWidgets.QLabel("-"),
                 "score": QtWidgets.QLabel("-"),
@@ -155,7 +157,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             card_layout.addRow("File Info", labels["name"])
             card_layout.addRow("Stream", labels["info"])
             card_layout.addRow("True DR14", labels["dr"])
-            card_layout.addRow("DR Score", labels["dr_score"])
+            card_layout.addRow("Dynamics Score", labels["dr_score"])
+            card_layout.addRow("Loudness Range", labels["lra"])
+            card_layout.addRow("Dialog Balance", labels["balance"])
             card_layout.addRow("Cutoff (kHz)", labels["cutoff"])
             card_layout.addRow("Quality Grade", labels["grade"])
             card_layout.addRow("Score", labels["score"])
@@ -312,6 +316,21 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.dr_top_percent.setSingleStep(0.05)
         layout.addRow("DR Top Percent", self.dr_top_percent)
 
+        self.lra_target_min = QtWidgets.QDoubleSpinBox()
+        self.lra_target_min.setRange(1.0, 20.0)
+        self.lra_target_min.setSingleStep(0.5)
+        layout.addRow("Loudness Range Min (dB)", self.lra_target_min)
+
+        self.lra_target_max = QtWidgets.QDoubleSpinBox()
+        self.lra_target_max.setRange(2.0, 30.0)
+        self.lra_target_max.setSingleStep(0.5)
+        layout.addRow("Loudness Range Max (dB)", self.lra_target_max)
+
+        self.lra_high_penalty_db = QtWidgets.QDoubleSpinBox()
+        self.lra_high_penalty_db.setRange(0.5, 5.0)
+        self.lra_high_penalty_db.setSingleStep(0.5)
+        layout.addRow("Loudness Range High Penalty", self.lra_high_penalty_db)
+
         self.true_peak_dbfs = QtWidgets.QDoubleSpinBox()
         self.true_peak_dbfs.setRange(-3.0, 0.0)
         self.true_peak_dbfs.setSingleStep(0.1)
@@ -328,6 +347,32 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.target_dr_max = QtWidgets.QDoubleSpinBox()
         self.target_dr_max.setRange(8.0, 20.0)
         layout.addRow("Target DR Max", self.target_dr_max)
+
+        self.dialog_band_low_hz = QtWidgets.QSpinBox()
+        self.dialog_band_low_hz.setRange(100, 1000)
+        layout.addRow("Dialog Band Low (Hz)", self.dialog_band_low_hz)
+
+        self.dialog_band_high_hz = QtWidgets.QSpinBox()
+        self.dialog_band_high_hz.setRange(1500, 6000)
+        layout.addRow("Dialog Band High (Hz)", self.dialog_band_high_hz)
+
+        self.presence_band_low_hz = QtWidgets.QSpinBox()
+        self.presence_band_low_hz.setRange(1500, 8000)
+        layout.addRow("Presence Band Low (Hz)", self.presence_band_low_hz)
+
+        self.presence_band_high_hz = QtWidgets.QSpinBox()
+        self.presence_band_high_hz.setRange(4000, 16000)
+        layout.addRow("Presence Band High (Hz)", self.presence_band_high_hz)
+
+        self.dialog_balance_warn_db = QtWidgets.QDoubleSpinBox()
+        self.dialog_balance_warn_db.setRange(2.0, 15.0)
+        self.dialog_balance_warn_db.setSingleStep(0.5)
+        layout.addRow("Dialog Balance Warn (dB)", self.dialog_balance_warn_db)
+
+        self.loudness_diff_warn_db = QtWidgets.QDoubleSpinBox()
+        self.loudness_diff_warn_db.setRange(0.5, 10.0)
+        self.loudness_diff_warn_db.setSingleStep(0.5)
+        layout.addRow("Loudness Diff Warn (dB)", self.loudness_diff_warn_db)
 
         self.mel_bins = QtWidgets.QSpinBox()
         self.mel_bins.setRange(32, 512)
@@ -347,6 +392,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.weight_efficiency = QtWidgets.QSpinBox()
         self.weight_efficiency.setRange(0, 100)
         weights_layout.addRow("Efficiency", self.weight_efficiency)
+        self.weight_format = QtWidgets.QSpinBox()
+        self.weight_format.setRange(0, 100)
+        weights_layout.addRow("Format", self.weight_format)
         layout.addRow(weights_group)
 
         return panel
@@ -386,10 +434,31 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.dr_block_seconds.setValue(settings.get("dr_block_seconds", DEFAULTS["dr_block_seconds"]))
         self.dr_silence_db.setValue(settings.get("dr_silence_db", DEFAULTS["dr_silence_db"]))
         self.dr_top_percent.setValue(settings.get("dr_top_percent", DEFAULTS["dr_top_percent"]))
+        self.lra_target_min.setValue(settings.get("lra_target_min", DEFAULTS["lra_target_min"]))
+        self.lra_target_max.setValue(settings.get("lra_target_max", DEFAULTS["lra_target_max"]))
+        self.lra_high_penalty_db.setValue(
+            settings.get("lra_high_penalty_db", DEFAULTS["lra_high_penalty_db"])
+        )
         self.true_peak_dbfs.setValue(settings.get("true_peak_dbfs", DEFAULTS["true_peak_dbfs"]))
         self.brickwall_dr_db.setValue(settings.get("brickwall_dr_db", DEFAULTS["brickwall_dr_db"]))
         self.target_dr_min.setValue(settings.get("target_dr_min", DEFAULTS["target_dr_min"]))
         self.target_dr_max.setValue(settings.get("target_dr_max", DEFAULTS["target_dr_max"]))
+        self.dialog_band_low_hz.setValue(settings.get("dialog_band_low_hz", DEFAULTS["dialog_band_low_hz"]))
+        self.dialog_band_high_hz.setValue(
+            settings.get("dialog_band_high_hz", DEFAULTS["dialog_band_high_hz"])
+        )
+        self.presence_band_low_hz.setValue(
+            settings.get("presence_band_low_hz", DEFAULTS["presence_band_low_hz"])
+        )
+        self.presence_band_high_hz.setValue(
+            settings.get("presence_band_high_hz", DEFAULTS["presence_band_high_hz"])
+        )
+        self.dialog_balance_warn_db.setValue(
+            settings.get("dialog_balance_warn_db", DEFAULTS["dialog_balance_warn_db"])
+        )
+        self.loudness_diff_warn_db.setValue(
+            settings.get("loudness_diff_warn_db", DEFAULTS["loudness_diff_warn_db"])
+        )
         self.mel_bins.setValue(settings.get("mel_bins", DEFAULTS["mel_bins"]))
         self.weight_frequency.setValue(settings.get("weight_frequency", DEFAULTS["weight_frequency"]))
         self.weight_dynamic_range.setValue(
@@ -397,6 +466,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         )
         self.weight_cleanliness.setValue(settings.get("weight_cleanliness", DEFAULTS["weight_cleanliness"]))
         self.weight_efficiency.setValue(settings.get("weight_efficiency", DEFAULTS["weight_efficiency"]))
+        self.weight_format.setValue(settings.get("weight_format", DEFAULTS["weight_format"]))
 
     def save_settings(self):
         self.app_manager.save_config(self.tool_name, self._gather_settings())
@@ -418,15 +488,25 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             "dr_block_seconds": self.dr_block_seconds.value(),
             "dr_silence_db": self.dr_silence_db.value(),
             "dr_top_percent": self.dr_top_percent.value(),
+            "lra_target_min": self.lra_target_min.value(),
+            "lra_target_max": self.lra_target_max.value(),
+            "lra_high_penalty_db": self.lra_high_penalty_db.value(),
             "true_peak_dbfs": self.true_peak_dbfs.value(),
             "brickwall_dr_db": self.brickwall_dr_db.value(),
             "target_dr_min": self.target_dr_min.value(),
             "target_dr_max": self.target_dr_max.value(),
+            "dialog_band_low_hz": self.dialog_band_low_hz.value(),
+            "dialog_band_high_hz": self.dialog_band_high_hz.value(),
+            "presence_band_low_hz": self.presence_band_low_hz.value(),
+            "presence_band_high_hz": self.presence_band_high_hz.value(),
+            "dialog_balance_warn_db": self.dialog_balance_warn_db.value(),
+            "loudness_diff_warn_db": self.loudness_diff_warn_db.value(),
             "mel_bins": self.mel_bins.value(),
             "weight_frequency": self.weight_frequency.value(),
             "weight_dynamic_range": self.weight_dynamic_range.value(),
             "weight_cleanliness": self.weight_cleanliness.value(),
             "weight_efficiency": self.weight_efficiency.value(),
+            "weight_format": self.weight_format.value(),
         }
 
     def _browse_file(self, index: int):
@@ -494,22 +574,37 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 flags.append("RE-ENCODE DETECTED")
             if result.get("shelf_detected"):
                 flags.append("Spectral shelf")
+            if abs(result.get("dialog_balance_db", 0.0)) >= self.dialog_balance_warn_db.value():
+                if result.get("dialog_balance_db", 0.0) < 0:
+                    flags.append("Presence boost")
+                else:
+                    flags.append("Dialog-heavy")
             if result.get("clipping_detected") or result.get("true_peak_db", -120.0) >= -0.1:
                 flags.append("True-peak clipping risk")
             if result.get("phase_inversion"):
                 flags.append("Phase inversion")
             if result.get("bitrate_bloat"):
                 flags.append("Bitrate bloat")
+            if result.get("is_lossless") is True:
+                flags.append("Lossless")
+            elif result.get("is_lossless") is False:
+                flags.append("Lossy")
+            if abs(result.get("loudness_offset_db", 0.0)) >= self.loudness_diff_warn_db.value():
+                flags.append("Loudness offset")
 
             labels["name"].setText(os.path.basename(result["path"]))
+            codec_name = result.get("codec_name")
+            codec_label = f" | {codec_name}" if codec_name else ""
             labels["info"].setText(
                 f"{result['channels']}ch @ {result['sample_rate']} Hz | "
-                f"{result.get('bitrate_kbps', 0):.0f} kbps | {result['file_size_mb']:.1f} MB"
+                f"{result.get('bitrate_kbps', 0):.0f} kbps{codec_label} | {result['file_size_mb']:.1f} MB"
                 if result.get("bitrate_kbps")
-                else f"{result['channels']}ch @ {result['sample_rate']} Hz | {result['file_size_mb']:.1f} MB"
+                else f"{result['channels']}ch @ {result['sample_rate']} Hz{codec_label} | {result['file_size_mb']:.1f} MB"
             )
             labels["dr"].setText(f"{result['dr_db']:.1f} dB (blocks {result['dr_blocks_used']})")
             labels["dr_score"].setText(f"{result['dr_score']:.1f}")
+            labels["lra"].setText(f"{result.get('loudness_range_db', 0.0):.1f} dB")
+            labels["balance"].setText(f"{result.get('dialog_balance_db', 0.0):.1f} dB")
             labels["cutoff"].setText(f"{result['freq_cutoff_hz'] / 1000:.1f}")
             labels["grade"].setText(result.get("quality_grade", "-"))
             labels["score"].setText(f"{result['score']:.1f}")
