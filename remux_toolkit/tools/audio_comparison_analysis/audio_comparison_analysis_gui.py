@@ -452,7 +452,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.dr_reference_db = QtWidgets.QDoubleSpinBox()
         self.dr_reference_db.setRange(4.0, 40.0)
         set_tip(self.dr_reference_db, "Reference DR (legacy parameter; kept for compatibility).")
-        layout.addRow("DR Reference (dB)", self.dr_reference_db)
+        layout.addRow("Crest Reference (dB)", self.dr_reference_db)
 
         self.dr_block_seconds = QtWidgets.QDoubleSpinBox()
         self.dr_block_seconds.setRange(1.0, 10.0)

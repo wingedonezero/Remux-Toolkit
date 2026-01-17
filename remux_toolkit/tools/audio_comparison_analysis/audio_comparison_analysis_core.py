@@ -148,6 +148,7 @@ class AudioAnalysisResult:
     alignment_method: str
     alignment_failed: bool
     alignment_warning: str | None
+    score_explain: dict
     bitrate_kbps: float | None
     bitrate_bloat: bool
     file_size_mb: float
@@ -381,6 +382,40 @@ def _log_power_spectrogram(
         np.arange(power_db.shape[1]), sr=sr, hop_length=settings.hop_length
     )
     return freqs, times, power_db
+
+
+def _robust_level_match_gain_db(
+    ref: np.ndarray, cand: np.ndarray, sr: int, silence_db: float
+) -> float:
+    eps = 1e-12
+    win = sr
+    if ref.size < win or cand.size < win:
+        ref_rms = float(np.sqrt(np.mean(ref * ref) + eps))
+        cand_rms = float(np.sqrt(np.mean(cand * cand) + eps))
+        return 20.0 * math.log10((ref_rms + eps) / (cand_rms + eps))
+
+    def window_rms(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        n = (x.size // win) * win
+        x = x[:n]
+        frames = x.reshape(-1, win)
+        rms = np.sqrt(np.mean(frames * frames, axis=1) + eps)
+        db = 20.0 * np.log10(rms + eps)
+        return rms, db
+
+    ref_rms, ref_db = window_rms(ref)
+    cand_rms, cand_db = window_rms(cand)
+    mask = (ref_db > silence_db) & (cand_db > silence_db)
+    if not np.any(mask):
+        ref_rms = float(np.sqrt(np.mean(ref * ref) + eps))
+        cand_rms = float(np.sqrt(np.mean(cand * cand) + eps))
+        return 20.0 * math.log10((ref_rms + eps) / (cand_rms + eps))
+    ratio = float(np.median((ref_rms[mask] + eps) / (cand_rms[mask] + eps)))
+    return 20.0 * math.log10(ratio + eps)
+
+
+def _apply_gain_db(x: np.ndarray, gain_db: float) -> np.ndarray:
+    g = 10.0 ** (gain_db / 20.0)
+    return np.clip(x * g, -1.0, 1.0)
 
 
 def _mean_spectrum_db(
@@ -997,6 +1032,62 @@ def _weighted_score(
     )
 
 
+def _penalty_points_from_count(count: int, soft: int, hard: int, max_penalty: float) -> float:
+    if count <= soft:
+        return 0.0
+    if count >= hard:
+        return max_penalty
+    t = (count - soft) / max(1, (hard - soft))
+    return max_penalty * (t * t)
+
+
+def _weighted_score_with_penalties(
+    base_score: float, result: AudioAnalysisResult, settings: AnalysisSettings
+) -> tuple[float, dict]:
+    penalties: dict[str, float] = {}
+    total_penalty = 0.0
+
+    if result.nr_filtered:
+        penalties["noise_reduction"] = 18.0
+        total_penalty += penalties["noise_reduction"]
+
+    muffle_thresh = settings.eq_muffle_drop_db
+    if result.eq_muffle_db <= -muffle_thresh:
+        extra = min(1.0, (-result.eq_muffle_db - muffle_thresh) / max(1e-6, muffle_thresh))
+        p = 10.0 + 10.0 * extra
+        penalties["muffled_eq"] = p
+        total_penalty += p
+
+    limiting_hotspots = len(result.limiting_segments) if result.limiting_segments else 0
+    p_lim = _penalty_points_from_count(limiting_hotspots, soft=1, hard=30, max_penalty=25.0)
+    if p_lim > 0:
+        penalties["sustained_limiting"] = p_lim
+        total_penalty += p_lim
+
+    if result.phase_inversion:
+        penalties["phase_inversion"] = 5.0
+        total_penalty += 5.0
+
+    if result.surround_swap_detected:
+        penalties["channel_swap"] = 8.0
+        total_penalty += 8.0
+
+    tp_warn = settings.true_peak_dbfs
+    if result.true_peak_db > tp_warn:
+        t = min(1.0, (result.true_peak_db - tp_warn) / max(1e-6, (0.0 - tp_warn)))
+        p = 1.0 + 4.0 * t
+        penalties["true_peak"] = p
+        total_penalty += p
+
+    final_score = max(0.0, base_score - total_penalty)
+    explanation = {
+        "base_score": base_score,
+        "final_score": final_score,
+        "penalties": penalties,
+    }
+    return final_score, explanation
+
+
 def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> str:
     parts = []
     if result.reencode_detected:
@@ -1176,6 +1267,13 @@ def analyze_files(
             else:
                 alignment_method = "unmatched"
 
+        level_matched_mono = None
+        if aligned_ref_mono is not None and aligned_cand_mono is not None:
+            gain_db = _robust_level_match_gain_db(
+                aligned_ref_mono, aligned_cand_mono, sr, settings.dr_silence_db
+            )
+            level_matched_mono = _apply_gain_db(aligned_cand_mono, gain_db)
+
         freq_score = _score_metric(cutoff_hz, sr / 2)
         if shelf_detected:
             freq_score = max(0.0, freq_score - 50.0)
@@ -1207,19 +1305,25 @@ def analyze_files(
         limiting_heatmap_path = None
         limiting_waveform_paths: list[str] = []
         if reference_path and reference_mag is not None and ref_freqs is not None and path != reference_path:
-            diff_db = mag_db - reference_mag
-            band_mask = (freqs >= 20.0) & (freqs <= settings.shelf_high_hz)
+            diff_source = level_matched_mono if level_matched_mono is not None else y_mono
+            diff_freqs, diff_mag_db = _mean_spectrum_db(diff_source, sr, settings)
+            if diff_mag_db.shape == reference_mag.shape:
+                diff_db = diff_mag_db - reference_mag
+            else:
+                diff_db = mag_db - reference_mag
+            band_mask = (diff_freqs >= 20.0) & (diff_freqs <= settings.shelf_high_hz)
             mean_abs_diff = float(np.mean(np.abs(diff_db[band_mask]))) if np.any(band_mask) else 0.0
             mastering_score = _score_mastering_accuracy(mean_abs_diff, settings)
             if output_dir:
                 base = os.path.splitext(os.path.basename(path))[0]
                 diff_spectrum_path = os.path.join(output_dir, f"{base}_diff_spectrum.png")
-                _save_difference_spectrum(freqs, diff_db, diff_spectrum_path)
+                _save_difference_spectrum(diff_freqs, diff_db, diff_spectrum_path)
         if reference_path and ref_power_db is not None and ref_freqs is not None and path != reference_path:
             if ref_power_db.shape == power_db.shape:
                 if aligned_ref_mono is not None and aligned_cand_mono is not None:
+                    matched_candidate = level_matched_mono or aligned_cand_mono
                     aligned_freqs, aligned_times, aligned_power = _log_power_spectrogram(
-                        aligned_cand_mono, sr, settings
+                        matched_candidate, sr, settings
                     )
                     _, _, aligned_ref_power = _log_power_spectrogram(
                         aligned_ref_mono, sr, settings
@@ -1346,6 +1450,7 @@ def analyze_files(
             alignment_method=alignment_method,
             alignment_failed=alignment_failed,
             alignment_warning=alignment_warning,
+            score_explain={},
             bitrate_kbps=bitrate_kbps,
             bitrate_bloat=bitrate_bloat,
             file_size_mb=size_mb,
@@ -1368,6 +1473,9 @@ def analyze_files(
             glitch_timestamps=glitch_timestamps,
             limiting_segments=limiting_segments,
             reference_path=reference_path,
+        )
+        result.score, result.score_explain = _weighted_score_with_penalties(
+            result.score, result, settings
         )
         result.quality_grade = _grade_score(result.score)
         result.summary = _build_summary(result, settings)
@@ -1393,6 +1501,9 @@ def analyze_files(
                         result.mastering_score,
                         settings,
                     )
+                    result.score, result.score_explain = _weighted_score_with_penalties(
+                        result.score, result, settings
+                    )
                     result.quality_grade = _grade_score(result.score)
 
         sizes = [r.file_size_mb for r in results]
@@ -1411,6 +1522,9 @@ def analyze_files(
                     result.dialogue_score,
                     result.mastering_score,
                     settings,
+                )
+                result.score, result.score_explain = _weighted_score_with_penalties(
+                    result.score, result, settings
                 )
                 result.quality_grade = _grade_score(result.score)
     results.sort(key=lambda r: r.score, reverse=True)
