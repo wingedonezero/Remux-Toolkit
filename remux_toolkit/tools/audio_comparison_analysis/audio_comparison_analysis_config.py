@@ -1,0 +1,28 @@
+# remux_toolkit/tools/audio_comparison_analysis/audio_comparison_analysis_config.py
+
+DEFAULTS = {
+    "target_sample_rate": 48000,
+    "fft_size": 4096,
+    "hop_length": 1024,
+    "cutoff_db_below_peak": 60,
+    "shelf_low_hz": 16000,
+    "shelf_high_hz": 18000,
+    "shelf_drop_db": 30,
+    "clip_threshold": 0.999,
+    "clip_ratio_warn": 0.001,
+    "phase_inversion_threshold": -0.8,
+    "bitrate_reference_kbps": 320,
+    "dr_reference_db": 14,
+    "dr_block_seconds": 3.0,
+    "dr_silence_db": -60.0,
+    "dr_top_percent": 0.2,
+    "true_peak_dbfs": -0.1,
+    "brickwall_dr_db": 6.0,
+    "target_dr_min": 9.0,
+    "target_dr_max": 12.0,
+    "mel_bins": 128,
+    "weight_frequency": 40,
+    "weight_dynamic_range": 30,
+    "weight_cleanliness": 20,
+    "weight_efficiency": 10,
+}
