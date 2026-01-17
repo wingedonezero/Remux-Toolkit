@@ -86,6 +86,13 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         panel = QtWidgets.QWidget()
         panel_layout = QtWidgets.QVBoxLayout(panel)
 
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        panel_layout.addWidget(scroll_area, 1)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+
         cards_group = QtWidgets.QGroupBox("File Comparison")
         cards_layout = QtWidgets.QGridLayout(cards_group)
         for idx in range(4):
@@ -112,23 +119,32 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             card_layout.addRow("Flags", labels["flags"])
             self.file_cards.append(labels)
             cards_layout.addWidget(card, 0, idx)
-        panel_layout.addWidget(cards_group)
+        content_layout.addWidget(cards_group)
 
         self.verdict_box = QtWidgets.QTextEdit()
         self.verdict_box.setReadOnly(True)
         self.verdict_box.setPlaceholderText("Verdict summary will appear here...")
-        panel_layout.addWidget(self.verdict_box)
+        content_layout.addWidget(self.verdict_box)
 
         self.summary_box = QtWidgets.QTextEdit()
         self.summary_box.setReadOnly(True)
         self.summary_box.setPlaceholderText("Detailed analysis will appear here...")
-        panel_layout.addWidget(self.summary_box, 1)
+        content_layout.addWidget(self.summary_box, 1)
+
+        scroll_area.setWidget(content)
 
         return panel
 
     def _create_spectrogram_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         panel_layout = QtWidgets.QVBoxLayout(panel)
+
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        panel_layout.addWidget(scroll_area, 1)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
 
         spectrogram_group = QtWidgets.QGroupBox("Spectrogram Comparison")
         spectrogram_layout = QtWidgets.QGridLayout(spectrogram_group)
@@ -139,7 +155,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
             self.spectrogram_labels.append(label)
             spectrogram_layout.addWidget(label, idx // 2, idx % 2)
-        panel_layout.addWidget(spectrogram_group, 1)
+        content_layout.addWidget(spectrogram_group, 1)
+
+        scroll_area.setWidget(content)
 
         return panel
 
