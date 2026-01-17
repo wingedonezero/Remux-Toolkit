@@ -150,20 +150,24 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.verdict_box = QtWidgets.QTextEdit()
         self.verdict_box.setReadOnly(True)
         self.verdict_box.setPlaceholderText("Verdict summary will appear here...")
+        self.verdict_box.setFixedHeight(120)
         self.verdict_box.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Minimum,
+            QtWidgets.QSizePolicy.Policy.Fixed,
         )
         content_layout.addWidget(self.verdict_box)
 
         self.summary_box = QtWidgets.QTextEdit()
         self.summary_box.setReadOnly(True)
         self.summary_box.setPlaceholderText("Detailed analysis will appear here...")
+        self.summary_box.setFixedHeight(240)
         self.summary_box.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
         )
-        content_layout.addWidget(self.summary_box, 1)
+        content_layout.addWidget(self.summary_box)
+
+        content_layout.addStretch()
 
         scroll_area.setWidget(content)
 
