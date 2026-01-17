@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Iterable
 
@@ -92,8 +93,11 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.run_button.clicked.connect(self._run_analysis)
         self.clear_button = QtWidgets.QPushButton("Clear")
         self.clear_button.clicked.connect(self._clear_inputs)
+        self.export_button = QtWidgets.QPushButton("Export Results")
+        self.export_button.clicked.connect(self._export_results)
         action_layout.addWidget(self.run_button)
         action_layout.addWidget(self.clear_button)
+        action_layout.addWidget(self.export_button)
         action_layout.addStretch()
         panel_layout.addLayout(action_layout)
 
@@ -1033,6 +1037,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self._set_reference_index(None)
+        self._latest_results = []
         for labels in self.file_cards:
             for label in labels.values():
                 label.setText("-")
@@ -1082,11 +1087,40 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             QtCore.Q_ARG(str, reference_path or ""),
         )
 
+    def _export_results(self):
+        if not getattr(self, "_latest_results", None):
+            QtWidgets.QMessageBox.information(
+                self,
+                "No results",
+                "Run an analysis before exporting results.",
+            )
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Results",
+            os.path.expanduser("~/audio_comparison_results.json"),
+            "JSON (*.json)",
+        )
+        if not path:
+            return
+        export_payload = {
+            "settings": self._gather_settings(),
+            "results": self._latest_results,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(export_payload, handle, indent=2)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        self.log_box.append(f"Exported results to {path}")
+
     def _on_analysis_complete(self, results: list[dict]):
         self.run_button.setEnabled(True)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
         self.log_box.append("Analysis complete.")
+        self._latest_results = results
         self._populate_results(results)
         self._update_summary(results)
         self._load_spectrograms(results)
