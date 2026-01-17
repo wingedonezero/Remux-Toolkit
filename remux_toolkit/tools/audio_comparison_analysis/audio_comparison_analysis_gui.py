@@ -51,6 +51,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
+        self.setMinimumSize(0, 0)
 
     def _create_analysis_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
@@ -86,6 +87,10 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         analysis_tabs = QtWidgets.QTabWidget()
         analysis_tabs.addTab(self._create_results_panel(), "Results")
         analysis_tabs.addTab(self._create_spectrogram_panel(), "Spectrograms")
+        analysis_tabs.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         panel_layout.addWidget(analysis_tabs, 1)
 
         return panel
@@ -216,6 +221,12 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         scroll_area.setWidget(content)
 
         return panel
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(1200, 720)
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(900, 600)
 
     def _create_settings_tab(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
