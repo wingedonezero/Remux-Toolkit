@@ -16,6 +16,9 @@ from remux_toolkit.tools.telecine_detector.telecine_detector_gui import Telecine
 from remux_toolkit.tools.media_info.media_info_gui import MediaInfoWidget
 from remux_toolkit.tools.mkv_combiner.mkv_combiner_gui import MKVCombinerWidget
 from remux_toolkit.tools.video_sync.video_sync_gui import VideoSyncWidget
+from remux_toolkit.tools.audio_comparison_analysis.audio_comparison_analysis_gui import (
+    AudioComparisonAnalysisWidget,
+)
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -73,6 +76,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_video_sync_action = QtGui.QAction("Video Sync (Audio Alignment)", self)
         self.open_video_sync_action.triggered.connect(self.open_video_sync)
 
+        self.open_audio_comparison_analysis_action = QtGui.QAction("Audio Comparison Analysis", self)
+        self.open_audio_comparison_analysis_action.triggered.connect(self.open_audio_comparison_analysis)
+
 
     def _create_menus(self):
         menu_bar = self.menuBar()
@@ -91,6 +97,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_media_info_action)
         tools_menu.addAction(self.open_mkv_combiner_action)
         tools_menu.addAction(self.open_video_sync_action)
+        tools_menu.addAction(self.open_audio_comparison_analysis_action)
 
 
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
@@ -107,6 +114,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_media_info(self): self._open_tool("MediaInfo", "Media Info", MediaInfoWidget)
     def open_mkv_combiner(self): self._open_tool("MKVCombiner", "MKV Combiner", MKVCombinerWidget)
     def open_video_sync(self): self._open_tool("VideoSync", "Video Sync", VideoSyncWidget)
+    def open_audio_comparison_analysis(self): self._open_tool(
+        "AudioComparisonAnalysis", "Audio Comparison Analysis", AudioComparisonAnalysisWidget
+    )
 
 
     def _open_tool(self, tool_name, tab_title, widget_class):
