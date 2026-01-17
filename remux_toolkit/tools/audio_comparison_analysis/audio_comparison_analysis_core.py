@@ -47,6 +47,24 @@ class AnalysisSettings:
     nr_cutoff_hz: float
     nr_drop_db: float
     nr_ratio_db: float
+    eq_muffle_drop_db: float
+    eq_boom_boost_db: float
+    eq_muffle_low_hz: float
+    eq_muffle_high_hz: float
+    eq_boom_center_hz: float
+    eq_boom_band_hz: float
+    f0_segment_seconds: float
+    f0_segment_offset_ratio: float
+    pal_speed_ratio: float
+    pitch_semitone_shift: float
+    pitch_tolerance_ratio: float
+    channel_swap_corr_threshold: float
+    lfe_rolloff_hz: float
+    lfe_high_ratio_db: float
+    limiting_window_ms: int
+    limiting_ratio: float
+    limiting_heatmap_block_seconds: float
+    limiting_waveform_segments: int
     glitch_diff_threshold: float
     glitch_max_count: int
     clip_heatmap_block_seconds: float
@@ -96,6 +114,9 @@ class AudioAnalysisResult:
     shelf_detected: bool
     reencode_detected: bool
     nr_filtered: bool
+    eq_muffle_db: float
+    eq_boom_db: float
+    eq_warnings: list[str]
     clipping_ratio: float
     clipping_detected: bool
     center_clipping_ratio: float
@@ -103,6 +124,11 @@ class AudioAnalysisResult:
     center_nr_filtered: bool
     phase_inversion: bool
     fake_multichannel: bool
+    surround_swap_detected: bool
+    lfe_rolloff_error: bool
+    pitch_ratio: float | None
+    speed_shift_detected: bool
+    pitch_shift_detected: bool
     bitrate_kbps: float | None
     bitrate_bloat: bool
     file_size_mb: float
@@ -119,7 +145,11 @@ class AudioAnalysisResult:
     spectrogram_path: str | None
     diff_spectrum_path: str | None
     clipping_heatmap_path: str | None
+    delta_eq_path: str | None
+    limiting_heatmap_path: str | None
+    limiting_waveform_paths: list[str]
     glitch_timestamps: list[float]
+    limiting_segments: list[tuple[float, float]]
     reference_path: str | None
 
     def to_dict(self) -> dict:
@@ -232,6 +262,19 @@ def _calculate_loudness_metrics(
     return loudness_db, lra_db
 
 
+def _log_power_spectrogram(
+    y_mono: np.ndarray, sr: int, settings: AnalysisSettings
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    stft = librosa.stft(y_mono, n_fft=settings.fft_size, hop_length=settings.hop_length)
+    power = np.abs(stft) ** 2
+    power_db = librosa.power_to_db(power, ref=np.max)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=settings.fft_size)
+    times = librosa.frames_to_time(
+        np.arange(power_db.shape[1]), sr=sr, hop_length=settings.hop_length
+    )
+    return freqs, times, power_db
+
+
 def _mean_spectrum_db(
     y_mono: np.ndarray, sr: int, settings: AnalysisSettings
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -303,6 +346,180 @@ def _detect_nr_filtered(
         if ref_high - high_mean >= settings.nr_drop_db:
             return True
     return ratio_db >= settings.nr_ratio_db
+
+
+def _evaluate_eq_delta(
+    freqs: np.ndarray,
+    delta_db: np.ndarray,
+    settings: AnalysisSettings,
+) -> tuple[float, float, list[str]]:
+    warnings: list[str] = []
+    mean_delta = np.mean(delta_db, axis=1)
+    muffle_band = (freqs >= settings.eq_muffle_low_hz) & (freqs <= settings.eq_muffle_high_hz)
+    boom_band = (freqs >= settings.eq_boom_center_hz - settings.eq_boom_band_hz) & (
+        freqs <= settings.eq_boom_center_hz + settings.eq_boom_band_hz
+    )
+    muffle_db = float(np.mean(mean_delta[muffle_band])) if np.any(muffle_band) else 0.0
+    boom_db = float(np.mean(mean_delta[boom_band])) if np.any(boom_band) else 0.0
+    if muffle_db <= -settings.eq_muffle_drop_db:
+        warnings.append("NR/Muffleness (2-7 kHz drop)")
+    if boom_db >= settings.eq_boom_boost_db:
+        warnings.append("Boominess (~120 Hz boost)")
+    return muffle_db, boom_db, warnings
+
+
+def _estimate_f0(
+    y_mono: np.ndarray, sr: int, settings: AnalysisSettings
+) -> float | None:
+    if y_mono.size == 0:
+        return None
+    segment_length = int(settings.f0_segment_seconds * sr)
+    if segment_length <= 0:
+        return None
+    start = int(settings.f0_segment_offset_ratio * y_mono.size)
+    start = max(0, min(start, max(0, y_mono.size - segment_length)))
+    segment = y_mono[start : start + segment_length]
+    if segment.size == 0:
+        return None
+    f0 = librosa.yin(
+        segment,
+        fmin=80.0,
+        fmax=400.0,
+        sr=sr,
+        frame_length=2048,
+        hop_length=512,
+    )
+    f0 = f0[np.isfinite(f0)]
+    if f0.size == 0:
+        return None
+    return float(np.median(f0))
+
+
+def _detect_pitch_speed_shift(
+    f0_ref: float | None, f0_candidate: float | None, settings: AnalysisSettings
+) -> tuple[float | None, bool, bool]:
+    if not f0_ref or not f0_candidate or f0_ref <= 0:
+        return None, False, False
+    ratio = f0_candidate / f0_ref
+    pal_ratio = settings.pal_speed_ratio
+    semitone_ratio = 2 ** (settings.pitch_semitone_shift / 12.0)
+    tol = settings.pitch_tolerance_ratio
+    speed_shift = abs(ratio - pal_ratio) <= pal_ratio * tol
+    pitch_shift = abs(ratio - semitone_ratio) <= semitone_ratio * tol
+    return ratio, speed_shift, pitch_shift
+
+
+def _detect_surround_swaps(
+    ref_audio: np.ndarray | None, cand_audio: np.ndarray, settings: AnalysisSettings
+) -> bool:
+    if ref_audio is None:
+        return False
+    if ref_audio.shape[0] < 5 or cand_audio.shape[0] < 5:
+        return False
+    ref_channels = ref_audio[:5, :]
+    cand_channels = cand_audio[:5, :]
+    corr = np.nan_to_num(np.corrcoef(np.vstack([ref_channels, cand_channels])))
+    ref_count = ref_channels.shape[0]
+    corr_block = corr[:ref_count, ref_count:]
+    max_indices = np.argmax(np.abs(corr_block), axis=1)
+    swaps = sum(idx != i for i, idx in enumerate(max_indices))
+    return swaps > 0 and np.max(np.abs(corr_block)) >= settings.channel_swap_corr_threshold
+
+
+def _detect_lfe_rolloff(
+    y: np.ndarray, sr: int, settings: AnalysisSettings
+) -> bool:
+    if y.shape[0] < 4:
+        return False
+    lfe = y[3]
+    freqs, mag_db = _mean_spectrum_db(lfe, sr, settings)
+    low_band = freqs <= settings.lfe_rolloff_hz
+    high_band = freqs >= settings.lfe_rolloff_hz
+    low_mean = float(np.mean(mag_db[low_band])) if np.any(low_band) else -120.0
+    high_mean = float(np.mean(mag_db[high_band])) if np.any(high_band) else -120.0
+    ratio = high_mean - low_mean
+    return ratio >= settings.lfe_high_ratio_db
+
+
+def _detect_limiting_segments(
+    y: np.ndarray, sr: int, settings: AnalysisSettings
+) -> tuple[list[float], list[tuple[float, float]]]:
+    if y.size == 0:
+        return [], []
+    window_samples = int(sr * settings.limiting_window_ms / 1000.0)
+    if window_samples <= 0:
+        return [], []
+    flat = np.max(np.abs(y), axis=0) if y.ndim > 1 else np.abs(y)
+    total_windows = max(1, flat.size // window_samples)
+    ratios = []
+    segments: list[tuple[float, float]] = []
+    for idx in range(total_windows):
+        start = idx * window_samples
+        end = start + window_samples
+        window = flat[start:end]
+        if window.size == 0:
+            ratios.append(0.0)
+            continue
+        ratio = float(np.mean(window >= settings.clip_threshold))
+        ratios.append(ratio)
+        if ratio >= settings.limiting_ratio:
+            segments.append((start / sr, end / sr))
+    return ratios, segments
+
+
+def _save_delta_eq_map(
+    freqs: np.ndarray,
+    times: np.ndarray,
+    delta_db: np.ndarray,
+    out_path: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 3), dpi=200)
+    extent = [times[0], times[-1], freqs[0], freqs[-1]]
+    ax.imshow(delta_db, aspect="auto", origin="lower", extent=extent, cmap="coolwarm", vmin=-6, vmax=6)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Hz")
+    ax.set_title("Delta EQ Map (Candidate - Reference)")
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _save_limiting_heatmap(
+    ratios: list[float], window_seconds: float, out_path: str
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 2.2), dpi=200)
+    times = np.arange(len(ratios)) * window_seconds
+    ax.bar(times, ratios, width=window_seconds, color="#b22222", alpha=0.7)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Limited ratio")
+    ax.set_title("Limiting Heatmap")
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _save_waveform_zoom(
+    y: np.ndarray, sr: int, segment: tuple[float, float], out_path: str
+) -> None:
+    start, end = segment
+    start_idx = int(start * sr)
+    end_idx = int(end * sr)
+    segment_audio = y[:, start_idx:end_idx] if y.ndim > 1 else y[start_idx:end_idx]
+    if segment_audio.size == 0:
+        return
+    fig, ax = plt.subplots(figsize=(7, 2.2), dpi=200)
+    if segment_audio.ndim > 1:
+        mono = np.mean(segment_audio, axis=0)
+    else:
+        mono = segment_audio
+    times = np.linspace(start, end, mono.size)
+    ax.plot(times, mono, color="#1f77b4", linewidth=0.8)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+    ax.set_title(f"Waveform Zoom {start:.2f}s-{end:.2f}s")
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def _scan_glitches(y: np.ndarray, sr: int, settings: AnalysisSettings) -> list[float]:
@@ -611,6 +828,8 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
         parts.append(f"Spectral shelf detected near {int(result.freq_cutoff_hz)} Hz")
     else:
         parts.append(f"Frequency response up to {int(result.freq_cutoff_hz)} Hz")
+    if result.eq_warnings:
+        parts.append(", ".join(result.eq_warnings))
     parts.append(f"True DR {result.dr_db:.1f} dB")
     if result.loudness_range_db > 0:
         parts.append(f"Loudness range {result.loudness_range_db:.1f} dB")
@@ -627,6 +846,10 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
             parts.append("Presence boost (dialog recessed)")
         else:
             parts.append("Dialog-heavy balance")
+    if result.surround_swap_detected:
+        parts.append("Surround channel swap detected")
+    if result.lfe_rolloff_error:
+        parts.append("LFE roll-off error")
     if result.center_nr_filtered or result.nr_filtered:
         parts.append("Excessive NR/Filtered highs")
     if result.phase_inversion:
@@ -637,6 +860,12 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
         parts.append("Possible bitrate bloat")
     if result.glitch_timestamps:
         parts.append(f"Transient spikes: {len(result.glitch_timestamps)}")
+    if result.speed_shift_detected:
+        parts.append("PAL speed shift")
+    if result.pitch_shift_detected:
+        parts.append("Pitch shift")
+    if result.limiting_segments:
+        parts.append(f"Limiting hot spots: {len(result.limiting_segments)}")
     return "; ".join(parts)
 
 
@@ -688,10 +917,16 @@ def analyze_files(
     results: list[AudioAnalysisResult] = []
     ref_freqs = None
     ref_mag_db = None
+    ref_power_db = None
+    ref_times = None
+    ref_audio = None
+    ref_f0 = None
     if reference_path:
         ref_audio, ref_sr = _load_audio(reference_path, settings.target_sample_rate)
         ref_mono = np.mean(ref_audio, axis=0) if ref_audio.shape[0] > 1 else ref_audio[0]
         ref_freqs, ref_mag_db = _mean_spectrum_db(ref_mono, ref_sr, settings)
+        ref_freqs, ref_times, ref_power_db = _log_power_spectrogram(ref_mono, ref_sr, settings)
+        ref_f0 = _estimate_f0(ref_mono, ref_sr, settings)
     for path in file_paths:
         y, sr = _load_audio(path, settings.target_sample_rate)
         duration_s = float(librosa.get_duration(y=y, sr=sr))
@@ -702,11 +937,14 @@ def analyze_files(
         true_peak_db = _true_peak_db(y)
         cutoff_hz, shelf_detected, reencode_detected = _spectral_cutoff(y_mono, sr, settings)
         freqs, mag_db = _mean_spectrum_db(y_mono, sr, settings)
+        spec_freqs, spec_times, power_db = _log_power_spectrogram(y_mono, sr, settings)
         dialog_balance_db = _dialog_balance_db(y_mono, sr, settings)
         reference_mag = ref_mag_db if ref_mag_db is not None and ref_mag_db.shape == mag_db.shape else None
         nr_filtered = _detect_nr_filtered(mag_db, freqs, settings, reference_mag)
         glitch_timestamps = _scan_glitches(y, sr, settings)
         fake_multichannel = _detect_fake_multichannel(y, settings)
+        surround_swap_detected = _detect_surround_swaps(ref_audio, y, settings)
+        lfe_rolloff_error = _detect_lfe_rolloff(y, sr, settings)
         center_channel = y[2] if y.shape[0] >= 3 else y_mono
         center_clipping_ratio = float(np.mean(np.abs(center_channel) >= settings.clip_threshold))
         center_clipping_detected = center_clipping_ratio >= settings.clip_ratio_warn
@@ -722,6 +960,10 @@ def analyze_files(
         bitrate_kbps = _estimate_bitrate(path, duration_s)
         bitrate_bloat = _detect_bitrate_bloat(path, bitrate_kbps, cutoff_hz, sr, settings)
         size_mb = _file_size_mb(path)
+        f0_candidate = _estimate_f0(y_mono, sr, settings)
+        pitch_ratio, speed_shift_detected, pitch_shift_detected = _detect_pitch_speed_shift(
+            ref_f0, f0_candidate, settings
+        )
 
         freq_score = _score_metric(cutoff_hz, sr / 2)
         if shelf_detected:
@@ -747,6 +989,12 @@ def analyze_files(
         )
         mastering_score = 100.0
         diff_spectrum_path = None
+        delta_eq_path = None
+        eq_muffle_db = 0.0
+        eq_boom_db = 0.0
+        eq_warnings: list[str] = []
+        limiting_heatmap_path = None
+        limiting_waveform_paths: list[str] = []
         if reference_path and reference_mag is not None and ref_freqs is not None and path != reference_path:
             diff_db = mag_db - reference_mag
             band_mask = (freqs >= 20.0) & (freqs <= settings.shelf_high_hz)
@@ -756,6 +1004,16 @@ def analyze_files(
                 base = os.path.splitext(os.path.basename(path))[0]
                 diff_spectrum_path = os.path.join(output_dir, f"{base}_diff_spectrum.png")
                 _save_difference_spectrum(freqs, diff_db, diff_spectrum_path)
+        if reference_path and ref_power_db is not None and ref_freqs is not None and path != reference_path:
+            if ref_power_db.shape == power_db.shape:
+                delta_db = power_db - ref_power_db
+                eq_muffle_db, eq_boom_db, eq_warnings = _evaluate_eq_delta(
+                    spec_freqs, delta_db, settings
+                )
+                if output_dir:
+                    base = os.path.splitext(os.path.basename(path))[0]
+                    delta_eq_path = os.path.join(output_dir, f"{base}_delta_eq.png")
+                    _save_delta_eq_map(spec_freqs, spec_times, delta_db, delta_eq_path)
         weighted_score = _weighted_score(
             freq_score,
             dr_score,
@@ -769,6 +1027,7 @@ def analyze_files(
 
         spectrogram_path = None
         clipping_heatmap_path = None
+        limiting_segments: list[tuple[float, float]] = []
         if output_dir:
             base = os.path.splitext(os.path.basename(path))[0]
             spectrogram_path = os.path.join(output_dir, f"{base}_spectrogram.png")
@@ -790,6 +1049,31 @@ def analyze_files(
                 _save_clipping_heatmap(
                     clipping_series, settings.clip_heatmap_block_seconds, clipping_heatmap_path
                 )
+            limit_ratios, limiting_segments = _detect_limiting_segments(y, sr, settings)
+            if limit_ratios:
+                window_seconds = settings.limiting_window_ms / 1000.0
+                block_seconds = settings.limiting_heatmap_block_seconds
+                if block_seconds > window_seconds:
+                    block_len = max(1, int(block_seconds / window_seconds))
+                    block_ratios = [
+                        max(limit_ratios[i : i + block_len])
+                        for i in range(0, len(limit_ratios), block_len)
+                    ]
+                    heatmap_ratios = block_ratios
+                    heatmap_seconds = block_len * window_seconds
+                else:
+                    heatmap_ratios = limit_ratios
+                    heatmap_seconds = window_seconds
+                limiting_heatmap_path = os.path.join(output_dir, f"{base}_limiting_heatmap.png")
+                _save_limiting_heatmap(
+                    heatmap_ratios,
+                    heatmap_seconds,
+                    limiting_heatmap_path,
+                )
+                for idx, segment in enumerate(limiting_segments[: settings.limiting_waveform_segments]):
+                    zoom_path = os.path.join(output_dir, f"{base}_limit_zoom_{idx + 1}.png")
+                    _save_waveform_zoom(y, sr, segment, zoom_path)
+                    limiting_waveform_paths.append(zoom_path)
 
         result = AudioAnalysisResult(
             path=path,
@@ -812,6 +1096,9 @@ def analyze_files(
             shelf_detected=shelf_detected,
             reencode_detected=reencode_detected and (bitrate_kbps or 0.0) >= 128.0,
             nr_filtered=nr_filtered,
+            eq_muffle_db=eq_muffle_db,
+            eq_boom_db=eq_boom_db,
+            eq_warnings=eq_warnings,
             clipping_ratio=clipping_ratio,
             clipping_detected=clipping_detected,
             center_clipping_ratio=center_clipping_ratio,
@@ -819,6 +1106,11 @@ def analyze_files(
             center_nr_filtered=center_nr_filtered,
             phase_inversion=phase_inversion,
             fake_multichannel=fake_multichannel,
+            surround_swap_detected=surround_swap_detected,
+            lfe_rolloff_error=lfe_rolloff_error,
+            pitch_ratio=pitch_ratio,
+            speed_shift_detected=speed_shift_detected,
+            pitch_shift_detected=pitch_shift_detected,
             bitrate_kbps=bitrate_kbps,
             bitrate_bloat=bitrate_bloat,
             file_size_mb=size_mb,
@@ -835,7 +1127,11 @@ def analyze_files(
             spectrogram_path=spectrogram_path,
             diff_spectrum_path=diff_spectrum_path,
             clipping_heatmap_path=clipping_heatmap_path,
+            delta_eq_path=delta_eq_path,
+            limiting_heatmap_path=limiting_heatmap_path,
+            limiting_waveform_paths=limiting_waveform_paths,
             glitch_timestamps=glitch_timestamps,
+            limiting_segments=limiting_segments,
             reference_path=reference_path,
         )
         result.quality_grade = _grade_score(result.score)

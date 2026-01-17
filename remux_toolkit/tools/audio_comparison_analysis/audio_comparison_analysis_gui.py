@@ -37,6 +37,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.spectrogram_labels: list[QtWidgets.QLabel] = []
         self.diff_spectrum_labels: list[QtWidgets.QLabel] = []
         self.clipping_heatmap_labels: list[QtWidgets.QLabel] = []
+        self.delta_eq_labels: list[QtWidgets.QLabel] = []
+        self.limiting_heatmap_labels: list[QtWidgets.QLabel] = []
+        self.limiting_waveform_labels: list[QtWidgets.QLabel] = []
         self.file_cards: list[dict[str, QtWidgets.QLabel]] = []
         self.reference_index: int | None = None
         self.setAcceptDrops(True)
@@ -157,8 +160,12 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 "balance": QtWidgets.QLabel("-"),
                 "dialogue": QtWidgets.QLabel("-"),
                 "mastering": QtWidgets.QLabel("-"),
+                "eq": QtWidgets.QLabel("-"),
+                "pitch": QtWidgets.QLabel("-"),
+                "channel": QtWidgets.QLabel("-"),
                 "scores": QtWidgets.QLabel("-"),
                 "glitches": QtWidgets.QLabel("-"),
+                "limiting": QtWidgets.QLabel("-"),
                 "cutoff": QtWidgets.QLabel("-"),
                 "grade": QtWidgets.QLabel("-"),
                 "score": QtWidgets.QLabel("-"),
@@ -179,6 +186,11 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Policy.Expanding,
                 QtWidgets.QSizePolicy.Policy.Preferred,
             )
+            labels["limiting"].setWordWrap(True)
+            labels["limiting"].setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
             card_layout.addRow("File Info", labels["name"])
             card_layout.addRow("Stream", labels["info"])
             card_layout.addRow("True DR14", labels["dr"])
@@ -187,8 +199,12 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             card_layout.addRow("Dialog Balance", labels["balance"])
             card_layout.addRow("Dialogue Score", labels["dialogue"])
             card_layout.addRow("Mastering Score", labels["mastering"])
+            card_layout.addRow("EQ Delta", labels["eq"])
+            card_layout.addRow("Pitch/Speed", labels["pitch"])
+            card_layout.addRow("Channel Integrity", labels["channel"])
             card_layout.addRow("Score Breakdown", labels["scores"])
             card_layout.addRow("Pops/Crackles", labels["glitches"])
+            card_layout.addRow("Limiting Hot Spots", labels["limiting"])
             card_layout.addRow("Cutoff (kHz)", labels["cutoff"])
             card_layout.addRow("Quality Grade", labels["grade"])
             card_layout.addRow("Score", labels["score"])
@@ -314,11 +330,32 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             heat_label.setMinimumHeight(120)
             heat_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
 
+            delta_label = QtWidgets.QLabel("Delta EQ map unavailable")
+            delta_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            delta_label.setMinimumHeight(180)
+            delta_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
+
+            limiting_label = QtWidgets.QLabel("Limiting heatmap unavailable")
+            limiting_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            limiting_label.setMinimumHeight(120)
+            limiting_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
+
+            zoom_label = QtWidgets.QLabel("Waveform zoom unavailable")
+            zoom_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            zoom_label.setMinimumHeight(120)
+            zoom_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
+
             self.diff_spectrum_labels.append(diff_label)
             self.clipping_heatmap_labels.append(heat_label)
+            self.delta_eq_labels.append(delta_label)
+            self.limiting_heatmap_labels.append(limiting_label)
+            self.limiting_waveform_labels.append(zoom_label)
 
             card_layout.addWidget(diff_label)
+            card_layout.addWidget(delta_label)
             card_layout.addWidget(heat_label)
+            card_layout.addWidget(limiting_label)
+            card_layout.addWidget(zoom_label)
             forensic_layout.addWidget(card, idx // 2, idx % 2)
 
         content_layout.addWidget(forensic_group, 1)
@@ -416,6 +453,89 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.lra_high_penalty_db.setRange(0.5, 5.0)
         self.lra_high_penalty_db.setSingleStep(0.5)
         layout.addRow("Loudness Range High Penalty", self.lra_high_penalty_db)
+
+        self.eq_muffle_drop_db = QtWidgets.QDoubleSpinBox()
+        self.eq_muffle_drop_db.setRange(1.0, 12.0)
+        self.eq_muffle_drop_db.setSingleStep(0.5)
+        layout.addRow("EQ Muffle Drop (dB)", self.eq_muffle_drop_db)
+
+        self.eq_boom_boost_db = QtWidgets.QDoubleSpinBox()
+        self.eq_boom_boost_db.setRange(1.0, 12.0)
+        self.eq_boom_boost_db.setSingleStep(0.5)
+        layout.addRow("EQ Boom Boost (dB)", self.eq_boom_boost_db)
+
+        self.eq_muffle_low_hz = QtWidgets.QSpinBox()
+        self.eq_muffle_low_hz.setRange(500, 8000)
+        layout.addRow("EQ Muffle Low (Hz)", self.eq_muffle_low_hz)
+
+        self.eq_muffle_high_hz = QtWidgets.QSpinBox()
+        self.eq_muffle_high_hz.setRange(1000, 12000)
+        layout.addRow("EQ Muffle High (Hz)", self.eq_muffle_high_hz)
+
+        self.eq_boom_center_hz = QtWidgets.QSpinBox()
+        self.eq_boom_center_hz.setRange(40, 300)
+        layout.addRow("EQ Boom Center (Hz)", self.eq_boom_center_hz)
+
+        self.eq_boom_band_hz = QtWidgets.QSpinBox()
+        self.eq_boom_band_hz.setRange(10, 120)
+        layout.addRow("EQ Boom Band (Hz)", self.eq_boom_band_hz)
+
+        self.f0_segment_seconds = QtWidgets.QDoubleSpinBox()
+        self.f0_segment_seconds.setRange(2.0, 30.0)
+        self.f0_segment_seconds.setSingleStep(1.0)
+        layout.addRow("F0 Segment (s)", self.f0_segment_seconds)
+
+        self.f0_segment_offset_ratio = QtWidgets.QDoubleSpinBox()
+        self.f0_segment_offset_ratio.setRange(0.0, 0.9)
+        self.f0_segment_offset_ratio.setSingleStep(0.05)
+        layout.addRow("F0 Segment Offset", self.f0_segment_offset_ratio)
+
+        self.pal_speed_ratio = QtWidgets.QDoubleSpinBox()
+        self.pal_speed_ratio.setRange(1.0, 1.1)
+        self.pal_speed_ratio.setSingleStep(0.001)
+        layout.addRow("PAL Speed Ratio", self.pal_speed_ratio)
+
+        self.pitch_semitone_shift = QtWidgets.QDoubleSpinBox()
+        self.pitch_semitone_shift.setRange(0.1, 2.0)
+        self.pitch_semitone_shift.setSingleStep(0.1)
+        layout.addRow("Pitch Shift (semitones)", self.pitch_semitone_shift)
+
+        self.pitch_tolerance_ratio = QtWidgets.QDoubleSpinBox()
+        self.pitch_tolerance_ratio.setRange(0.001, 0.02)
+        self.pitch_tolerance_ratio.setSingleStep(0.001)
+        layout.addRow("Pitch/Speed Tolerance", self.pitch_tolerance_ratio)
+
+        self.channel_swap_corr_threshold = QtWidgets.QDoubleSpinBox()
+        self.channel_swap_corr_threshold.setRange(0.5, 0.99)
+        self.channel_swap_corr_threshold.setSingleStep(0.05)
+        layout.addRow("Channel Swap Corr Threshold", self.channel_swap_corr_threshold)
+
+        self.lfe_rolloff_hz = QtWidgets.QSpinBox()
+        self.lfe_rolloff_hz.setRange(80, 200)
+        layout.addRow("LFE Rolloff Hz", self.lfe_rolloff_hz)
+
+        self.lfe_high_ratio_db = QtWidgets.QDoubleSpinBox()
+        self.lfe_high_ratio_db.setRange(-30.0, 0.0)
+        self.lfe_high_ratio_db.setSingleStep(1.0)
+        layout.addRow("LFE High Ratio (dB)", self.lfe_high_ratio_db)
+
+        self.limiting_window_ms = QtWidgets.QSpinBox()
+        self.limiting_window_ms.setRange(50, 500)
+        layout.addRow("Limiting Window (ms)", self.limiting_window_ms)
+
+        self.limiting_ratio = QtWidgets.QDoubleSpinBox()
+        self.limiting_ratio.setRange(0.0001, 0.01)
+        self.limiting_ratio.setSingleStep(0.0001)
+        layout.addRow("Limiting Ratio", self.limiting_ratio)
+
+        self.limiting_heatmap_block_seconds = QtWidgets.QDoubleSpinBox()
+        self.limiting_heatmap_block_seconds.setRange(0.5, 5.0)
+        self.limiting_heatmap_block_seconds.setSingleStep(0.5)
+        layout.addRow("Limiting Heatmap Block (s)", self.limiting_heatmap_block_seconds)
+
+        self.limiting_waveform_segments = QtWidgets.QSpinBox()
+        self.limiting_waveform_segments.setRange(1, 6)
+        layout.addRow("Limiting Zoom Segments", self.limiting_waveform_segments)
 
         self.nr_cutoff_hz = QtWidgets.QDoubleSpinBox()
         self.nr_cutoff_hz.setRange(1000.0, 8000.0)
@@ -580,6 +700,44 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.lra_high_penalty_db.setValue(
             settings.get("lra_high_penalty_db", DEFAULTS["lra_high_penalty_db"])
         )
+        self.eq_muffle_drop_db.setValue(settings.get("eq_muffle_drop_db", DEFAULTS["eq_muffle_drop_db"]))
+        self.eq_boom_boost_db.setValue(settings.get("eq_boom_boost_db", DEFAULTS["eq_boom_boost_db"]))
+        self.eq_muffle_low_hz.setValue(int(settings.get("eq_muffle_low_hz", DEFAULTS["eq_muffle_low_hz"])))
+        self.eq_muffle_high_hz.setValue(
+            int(settings.get("eq_muffle_high_hz", DEFAULTS["eq_muffle_high_hz"]))
+        )
+        self.eq_boom_center_hz.setValue(
+            int(settings.get("eq_boom_center_hz", DEFAULTS["eq_boom_center_hz"]))
+        )
+        self.eq_boom_band_hz.setValue(int(settings.get("eq_boom_band_hz", DEFAULTS["eq_boom_band_hz"])))
+        self.f0_segment_seconds.setValue(
+            settings.get("f0_segment_seconds", DEFAULTS["f0_segment_seconds"])
+        )
+        self.f0_segment_offset_ratio.setValue(
+            settings.get("f0_segment_offset_ratio", DEFAULTS["f0_segment_offset_ratio"])
+        )
+        self.pal_speed_ratio.setValue(settings.get("pal_speed_ratio", DEFAULTS["pal_speed_ratio"]))
+        self.pitch_semitone_shift.setValue(
+            settings.get("pitch_semitone_shift", DEFAULTS["pitch_semitone_shift"])
+        )
+        self.pitch_tolerance_ratio.setValue(
+            settings.get("pitch_tolerance_ratio", DEFAULTS["pitch_tolerance_ratio"])
+        )
+        self.channel_swap_corr_threshold.setValue(
+            settings.get("channel_swap_corr_threshold", DEFAULTS["channel_swap_corr_threshold"])
+        )
+        self.lfe_rolloff_hz.setValue(int(settings.get("lfe_rolloff_hz", DEFAULTS["lfe_rolloff_hz"])))
+        self.lfe_high_ratio_db.setValue(settings.get("lfe_high_ratio_db", DEFAULTS["lfe_high_ratio_db"]))
+        self.limiting_window_ms.setValue(
+            int(settings.get("limiting_window_ms", DEFAULTS["limiting_window_ms"]))
+        )
+        self.limiting_ratio.setValue(settings.get("limiting_ratio", DEFAULTS["limiting_ratio"]))
+        self.limiting_heatmap_block_seconds.setValue(
+            settings.get("limiting_heatmap_block_seconds", DEFAULTS["limiting_heatmap_block_seconds"])
+        )
+        self.limiting_waveform_segments.setValue(
+            int(settings.get("limiting_waveform_segments", DEFAULTS["limiting_waveform_segments"]))
+        )
         self.nr_cutoff_hz.setValue(settings.get("nr_cutoff_hz", DEFAULTS["nr_cutoff_hz"]))
         self.nr_drop_db.setValue(settings.get("nr_drop_db", DEFAULTS["nr_drop_db"]))
         self.nr_ratio_db.setValue(settings.get("nr_ratio_db", DEFAULTS["nr_ratio_db"]))
@@ -661,6 +819,24 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             "lra_target_min": self.lra_target_min.value(),
             "lra_target_max": self.lra_target_max.value(),
             "lra_high_penalty_db": self.lra_high_penalty_db.value(),
+            "eq_muffle_drop_db": self.eq_muffle_drop_db.value(),
+            "eq_boom_boost_db": self.eq_boom_boost_db.value(),
+            "eq_muffle_low_hz": self.eq_muffle_low_hz.value(),
+            "eq_muffle_high_hz": self.eq_muffle_high_hz.value(),
+            "eq_boom_center_hz": self.eq_boom_center_hz.value(),
+            "eq_boom_band_hz": self.eq_boom_band_hz.value(),
+            "f0_segment_seconds": self.f0_segment_seconds.value(),
+            "f0_segment_offset_ratio": self.f0_segment_offset_ratio.value(),
+            "pal_speed_ratio": self.pal_speed_ratio.value(),
+            "pitch_semitone_shift": self.pitch_semitone_shift.value(),
+            "pitch_tolerance_ratio": self.pitch_tolerance_ratio.value(),
+            "channel_swap_corr_threshold": self.channel_swap_corr_threshold.value(),
+            "lfe_rolloff_hz": self.lfe_rolloff_hz.value(),
+            "lfe_high_ratio_db": self.lfe_high_ratio_db.value(),
+            "limiting_window_ms": self.limiting_window_ms.value(),
+            "limiting_ratio": self.limiting_ratio.value(),
+            "limiting_heatmap_block_seconds": self.limiting_heatmap_block_seconds.value(),
+            "limiting_waveform_segments": self.limiting_waveform_segments.value(),
             "nr_cutoff_hz": self.nr_cutoff_hz.value(),
             "nr_drop_db": self.nr_drop_db.value(),
             "nr_ratio_db": self.nr_ratio_db.value(),
@@ -737,6 +913,15 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         for label in self.clipping_heatmap_labels:
             label.setText("Clipping heatmap unavailable")
             label.setPixmap(QtGui.QPixmap())
+        for label in self.delta_eq_labels:
+            label.setText("Delta EQ map unavailable")
+            label.setPixmap(QtGui.QPixmap())
+        for label in self.limiting_heatmap_labels:
+            label.setText("Limiting heatmap unavailable")
+            label.setPixmap(QtGui.QPixmap())
+        for label in self.limiting_waveform_labels:
+            label.setText("Waveform zoom unavailable")
+            label.setPixmap(QtGui.QPixmap())
 
     def _collect_files(self) -> list[str]:
         paths = [edit.text().strip() for edit in self.file_inputs if edit.text().strip()]
@@ -790,6 +975,8 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 flags.append("Spectral shelf")
             if result.get("nr_filtered") or result.get("center_nr_filtered"):
                 flags.append("Excessive NR/Filtered")
+            if result.get("eq_warnings"):
+                flags.append("EQ delta warning")
             if abs(result.get("dialog_balance_db", 0.0)) >= self.dialog_balance_warn_db.value():
                 if result.get("dialog_balance_db", 0.0) < 0:
                     flags.append("Presence boost")
@@ -801,6 +988,10 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 flags.append("Phase inversion")
             if result.get("fake_multichannel"):
                 flags.append("Fake multichannel")
+            if result.get("surround_swap_detected"):
+                flags.append("Surround swap")
+            if result.get("lfe_rolloff_error"):
+                flags.append("LFE roll-off")
             if result.get("bitrate_bloat"):
                 flags.append("Bitrate bloat")
             if result.get("is_lossless") is True:
@@ -811,6 +1002,12 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 flags.append("Loudness offset")
             if result.get("glitch_timestamps"):
                 flags.append("Transient spikes")
+            if result.get("speed_shift_detected"):
+                flags.append("PAL speed shift")
+            if result.get("pitch_shift_detected"):
+                flags.append("Pitch shift")
+            if result.get("limiting_segments"):
+                flags.append("Limiting hotspots")
 
             labels["name"].setText(os.path.basename(result["path"]))
             codec_name = result.get("codec_name")
@@ -830,6 +1027,23 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 labels["mastering"].setText(f"{result.get('mastering_score', 0.0):.1f}")
             else:
                 labels["mastering"].setText("N/A")
+            eq_text = "None"
+            if result.get("eq_warnings"):
+                eq_text = ", ".join(result.get("eq_warnings"))
+            eq_text += f" (Δ2-7k {result.get('eq_muffle_db', 0.0):+.1f} dB, "
+            eq_text += f"Δ120 {result.get('eq_boom_db', 0.0):+.1f} dB)"
+            labels["eq"].setText(eq_text)
+            pitch_ratio = result.get("pitch_ratio")
+            if pitch_ratio:
+                labels["pitch"].setText(f"{pitch_ratio:.4f}x")
+            else:
+                labels["pitch"].setText("N/A")
+            channel_text = "OK"
+            if result.get("surround_swap_detected"):
+                channel_text = "Surround swap"
+            if result.get("lfe_rolloff_error"):
+                channel_text = f"{channel_text}, LFE roll-off" if channel_text != "OK" else "LFE roll-off"
+            labels["channel"].setText(channel_text)
             breakdown = (
                 f"Freq {result.get('freq_score', 0.0):.1f} | "
                 f"Clean {result.get('cleanliness_score', 0.0):.1f} | "
@@ -844,6 +1058,13 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 labels["glitches"].setText(f"{sample}{more}")
             else:
                 labels["glitches"].setText("None")
+            limiting_segments = result.get("limiting_segments") or []
+            if limiting_segments:
+                sample = ", ".join(f"{start:.1f}-{end:.1f}s" for start, end in limiting_segments[:3])
+                more = "…" if len(limiting_segments) > 3 else ""
+                labels["limiting"].setText(f"{sample}{more}")
+            else:
+                labels["limiting"].setText("None")
             labels["cutoff"].setText(f"{result['freq_cutoff_hz'] / 1000:.1f}")
             labels["grade"].setText(result.get("quality_grade", "-"))
             labels["score"].setText(f"{result['score']:.1f}")
@@ -889,6 +1110,15 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         for label in self.clipping_heatmap_labels:
             label.setText("Clipping heatmap unavailable")
             label.setPixmap(QtGui.QPixmap())
+        for label in self.delta_eq_labels:
+            label.setText("Delta EQ map unavailable")
+            label.setPixmap(QtGui.QPixmap())
+        for label in self.limiting_heatmap_labels:
+            label.setText("Limiting heatmap unavailable")
+            label.setPixmap(QtGui.QPixmap())
+        for label in self.limiting_waveform_labels:
+            label.setText("Waveform zoom unavailable")
+            label.setPixmap(QtGui.QPixmap())
 
         for idx, result in enumerate(results[:4]):
             diff_path = result.get("diff_spectrum_path")
@@ -908,6 +1138,32 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                     scaled = pixmap.scaled(400, 140, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
                     self.clipping_heatmap_labels[idx].setPixmap(scaled)
                     self.clipping_heatmap_labels[idx].setText("")
+
+            delta_path = result.get("delta_eq_path")
+            if delta_path and os.path.exists(delta_path):
+                pixmap = QtGui.QPixmap(delta_path)
+                if not pixmap.isNull():
+                    scaled = pixmap.scaled(400, 200, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+                    self.delta_eq_labels[idx].setPixmap(scaled)
+                    self.delta_eq_labels[idx].setText("")
+
+            limiting_path = result.get("limiting_heatmap_path")
+            if limiting_path and os.path.exists(limiting_path):
+                pixmap = QtGui.QPixmap(limiting_path)
+                if not pixmap.isNull():
+                    scaled = pixmap.scaled(400, 140, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+                    self.limiting_heatmap_labels[idx].setPixmap(scaled)
+                    self.limiting_heatmap_labels[idx].setText("")
+
+            zoom_paths = result.get("limiting_waveform_paths") or []
+            if zoom_paths:
+                zoom_path = zoom_paths[0]
+                if os.path.exists(zoom_path):
+                    pixmap = QtGui.QPixmap(zoom_path)
+                    if not pixmap.isNull():
+                        scaled = pixmap.scaled(400, 140, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+                        self.limiting_waveform_labels[idx].setPixmap(scaled)
+                        self.limiting_waveform_labels[idx].setText("")
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
