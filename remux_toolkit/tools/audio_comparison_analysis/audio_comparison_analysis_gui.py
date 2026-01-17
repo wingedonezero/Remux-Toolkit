@@ -594,15 +594,17 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.brickwall_dr_db.setValue(settings.get("brickwall_dr_db", DEFAULTS["brickwall_dr_db"]))
         self.target_dr_min.setValue(settings.get("target_dr_min", DEFAULTS["target_dr_min"]))
         self.target_dr_max.setValue(settings.get("target_dr_max", DEFAULTS["target_dr_max"]))
-        self.dialog_band_low_hz.setValue(settings.get("dialog_band_low_hz", DEFAULTS["dialog_band_low_hz"]))
+        self.dialog_band_low_hz.setValue(
+            int(settings.get("dialog_band_low_hz", DEFAULTS["dialog_band_low_hz"]))
+        )
         self.dialog_band_high_hz.setValue(
-            settings.get("dialog_band_high_hz", DEFAULTS["dialog_band_high_hz"])
+            int(settings.get("dialog_band_high_hz", DEFAULTS["dialog_band_high_hz"]))
         )
         self.presence_band_low_hz.setValue(
-            settings.get("presence_band_low_hz", DEFAULTS["presence_band_low_hz"])
+            int(settings.get("presence_band_low_hz", DEFAULTS["presence_band_low_hz"]))
         )
         self.presence_band_high_hz.setValue(
-            settings.get("presence_band_high_hz", DEFAULTS["presence_band_high_hz"])
+            int(settings.get("presence_band_high_hz", DEFAULTS["presence_band_high_hz"]))
         )
         self.dialog_balance_warn_db.setValue(
             settings.get("dialog_balance_warn_db", DEFAULTS["dialog_balance_warn_db"])
