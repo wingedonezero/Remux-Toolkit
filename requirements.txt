@@ -15,4 +15,3 @@ videohash
 VideoTimestamps
 av
 matplotlib
-ffmpeg-python

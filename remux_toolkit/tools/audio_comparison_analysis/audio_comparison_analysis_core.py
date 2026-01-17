@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 import math
 import os
+import subprocess
 from typing import Iterable
 
-import ffmpeg
 import librosa
 import numpy as np
 import scipy.signal
@@ -174,18 +175,40 @@ def _detect_phase_inversion(y: np.ndarray, settings: AnalysisSettings) -> bool:
     return bool(corr <= settings.phase_inversion_threshold)
 
 
+def _probe_audio_bitrate(path: str) -> float | None:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=bit_rate",
+        "-of",
+        "json",
+        path,
+    ]
+    try:
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    try:
+        data = json.loads(output)
+        streams = data.get("streams", [])
+        if not streams:
+            return None
+        bit_rate = streams[0].get("bit_rate")
+        return float(bit_rate) if bit_rate else None
+    except (ValueError, TypeError):
+        return None
+
+
 def _estimate_bitrate(path: str, duration_s: float) -> float | None:
     if duration_s <= 0:
         return None
-    try:
-        probe = ffmpeg.probe(path)
-        audio_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
-        if audio_streams:
-            bit_rate = audio_streams[0].get("bit_rate")
-            if bit_rate:
-                return float(bit_rate) / 1000.0
-    except ffmpeg.Error:
-        pass
+    bit_rate = _probe_audio_bitrate(path)
+    if bit_rate is not None:
+        return bit_rate / 1000.0
     try:
         size_bytes = os.path.getsize(path)
     except OSError:
@@ -199,7 +222,7 @@ def _detect_bitrate_bloat(
     if bitrate_kbps is None:
         return False
     ext = os.path.splitext(path)[1].lower()
-    if ext in {\".flac\", \".wav\", \".aiff\", \".alac\"}:
+    if ext in {".flac", ".wav", ".aiff", ".alac"}:
         return False
     nyquist = sr / 2
     if nyquist <= 0:
