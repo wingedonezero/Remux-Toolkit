@@ -101,6 +101,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         analysis_tabs.addTab(self._create_results_panel(), "Results")
         analysis_tabs.addTab(self._create_spectrogram_panel(), "Spectrograms")
         analysis_tabs.addTab(self._create_forensic_panel(), "Forensic")
+        analysis_tabs.addTab(self._create_log_panel(), "Log")
         analysis_tabs.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Expanding,
@@ -243,6 +244,22 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
 
         return panel
 
+    def _create_log_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.log_box = QtWidgets.QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("Analysis log will appear here...")
+        layout.addWidget(self.log_box, 1)
+
+        return panel
+
     def _create_spectrogram_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         panel_layout = QtWidgets.QVBoxLayout(panel)
@@ -362,6 +379,22 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
 
         content_layout.addWidget(forensic_group, 1)
         scroll_area.setWidget(content)
+
+        return panel
+
+    def _create_log_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.log_box = QtWidgets.QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("Analysis log will appear here...")
+        layout.addWidget(self.log_box, 1)
 
         return panel
 
@@ -996,6 +1029,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             line_edit.clear()
         self.summary_box.clear()
         self.verdict_box.clear()
+        self.log_box.clear()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
         self._set_reference_index(None)
         for labels in self.file_cards:
             for label in labels.values():
@@ -1030,6 +1066,8 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             return
         self.run_button.setEnabled(False)
         self.summary_box.setText("Analyzing audio files...")
+        self.log_box.append("Starting analysis...")
+        self.progress_bar.setRange(0, 0)
         temp_dir = self.app_manager.get_temp_dir(self.tool_name)
         reference_path = None
         if self.reference_index is not None and self.reference_index < len(self.file_inputs):
@@ -1046,6 +1084,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
 
     def _on_analysis_complete(self, results: list[dict]):
         self.run_button.setEnabled(True)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+        self.log_box.append("Analysis complete.")
         self._populate_results(results)
         self._update_summary(results)
         self._load_spectrograms(results)
@@ -1053,6 +1094,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
 
     def _on_error(self, message: str):
         self.run_button.setEnabled(True)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.log_box.append(f"Error: {message}")
         self.summary_box.setText(f"Error: {message}")
 
     def _populate_results(self, results: list[dict]):
