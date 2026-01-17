@@ -172,6 +172,10 @@ class AudioAnalysisResult:
     limiting_segments: list[tuple[float, float]]
     reference_path: str | None
     stereo_width: float
+    lr_level_imbalance_db: float
+    lr_noise_floor_diff_db: float
+    lr_imbalance_detected: bool
+    center_bass_loss_db: float
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -482,37 +486,55 @@ def _detect_nr_filtered(
 ) -> float:
     """
     Returns NR severity as a float from 0.0 (no NR) to 1.0 (heavy NR).
+    Remuxer thresholds: 0-3 dB = mild, 4-7 dB = moderate, ≥8 dB = severe
     Takes into account reference if provided - only penalizes if worse than reference.
     """
-    high_band = freqs >= settings.nr_cutoff_hz
+    # Check critical frequency ranges where NR is most audible
+    critical_band = (freqs >= 6000) & (freqs <= 12000)  # 6-12 kHz where NR is most noticeable
+    low_nr_band = (freqs >= 2000) & (freqs <= 4000)  # Low-freq NR starting here is severe
     mid_band = (freqs >= settings.dialog_band_low_hz) & (freqs <= settings.dialog_band_high_hz)
-    high_mean = float(np.mean(mag_db[high_band])) if np.any(high_band) else -120.0
+
+    critical_mean = float(np.mean(mag_db[critical_band])) if np.any(critical_band) else -120.0
+    low_nr_mean = float(np.mean(mag_db[low_nr_band])) if np.any(low_nr_band) else -120.0
     mid_mean = float(np.mean(mag_db[mid_band])) if np.any(mid_band) else -120.0
-    ratio_db = mid_mean - high_mean
 
     # If we have a reference, compare relative to it
     if reference_mag_db is not None:
-        ref_high = float(np.mean(reference_mag_db[high_band])) if np.any(high_band) else -120.0
-        ref_mid = float(np.mean(reference_mag_db[mid_band])) if np.any(mid_band) else -120.0
-        ref_ratio_db = ref_mid - ref_high
+        ref_critical = float(np.mean(reference_mag_db[critical_band])) if np.any(critical_band) else -120.0
+        ref_low_nr = float(np.mean(reference_mag_db[low_nr_band])) if np.any(low_nr_band) else -120.0
 
-        # Calculate how much worse this file is than reference
-        high_drop_vs_ref = ref_high - high_mean
+        # Calculate HF loss vs reference (6-12 kHz range)
+        hf_drop_db = ref_critical - critical_mean
+        # Check if NR starts low (2-4 kHz range)
+        low_drop_db = ref_low_nr - low_nr_mean
 
-        # Only consider it NR if it's worse than reference
-        if high_drop_vs_ref > 0:
-            # Severity based on how much worse (0-1 range, clamped)
-            severity = min(1.0, high_drop_vs_ref / 20.0)  # 20 dB = max severity
-            return severity
-        else:
-            # Not worse than reference - no penalty
+        # Only consider it NR if worse than reference
+        if hf_drop_db <= 0 and low_drop_db <= 0:
             return 0.0
 
-    # No reference: use absolute threshold
+        # Map to remuxer severity scale
+        # 0-3 dB = mild (0.2), 4-7 dB = moderate (0.5), 8+ dB = severe (0.8-1.0)
+        max_drop = max(hf_drop_db, low_drop_db)
+
+        if max_drop < 3.0:
+            severity = max_drop / 15.0  # 0-3 dB → 0.0-0.2
+        elif max_drop < 7.0:
+            severity = 0.2 + (max_drop - 3.0) / 8.0  # 4-7 dB → 0.2-0.7
+        else:
+            severity = 0.7 + min(0.3, (max_drop - 7.0) / 20.0)  # 8+ dB → 0.7-1.0
+
+        # Extra penalty if NR starts low (≤3 kHz)
+        if low_drop_db >= 4.0:
+            severity = min(1.0, severity + 0.2)
+
+        return min(1.0, severity)
+
+    # No reference: use absolute threshold (mid-to-critical ratio)
+    ratio_db = mid_mean - critical_mean
     if ratio_db < settings.nr_ratio_db:
         return 0.0
 
-    # Scale severity: 12 dB ratio = 0.5, 24+ dB = 1.0
+    # Scale severity based on ratio
     severity = min(1.0, (ratio_db - settings.nr_ratio_db) / 12.0)
     return severity
 
@@ -747,6 +769,118 @@ def _measure_stereo_width(y: np.ndarray) -> float:
     normalized_width = min(1.0, width_ratio / 0.8)
 
     return normalized_width
+
+
+def _detect_lr_imbalance(y: np.ndarray, sr: int) -> tuple[float, float, bool]:
+    """
+    Detect L/R channel imbalance issues (remuxer issue #7).
+    Returns: (level_imbalance_db, noise_floor_diff_db, has_imbalance)
+
+    Detection signals:
+    - RMS level mismatch between L/R
+    - Noise floor mismatch (one channel noisier)
+    - Spectral asymmetry
+    """
+    if y.shape[0] < 2:
+        return 0.0, 0.0, False
+
+    left = y[0, :]
+    right = y[1, :]
+
+    # Check RMS level balance
+    left_rms = float(np.sqrt(np.mean(left**2)))
+    right_rms = float(np.sqrt(np.mean(right**2)))
+
+    if left_rms < 1e-12 or right_rms < 1e-12:
+        return 0.0, 0.0, False
+
+    level_imbalance_db = 20 * math.log10(max(left_rms, right_rms) / min(left_rms, right_rms))
+
+    # Check noise floor difference (bottom 10% of signal)
+    left_sorted = np.sort(np.abs(left))
+    right_sorted = np.sort(np.abs(right))
+
+    percentile_10 = int(left_sorted.size * 0.1)
+    if percentile_10 > 0:
+        left_noise = float(np.mean(left_sorted[:percentile_10]))
+        right_noise = float(np.mean(right_sorted[:percentile_10]))
+
+        if left_noise > 1e-12 and right_noise > 1e-12:
+            noise_floor_diff_db = 20 * math.log10(max(left_noise, right_noise) / min(left_noise, right_noise))
+        else:
+            noise_floor_diff_db = 0.0
+    else:
+        noise_floor_diff_db = 0.0
+
+    # Flag as imbalanced if either metric exceeds threshold
+    has_imbalance = level_imbalance_db > 1.5 or noise_floor_diff_db > 3.0
+
+    return level_imbalance_db, noise_floor_diff_db, has_imbalance
+
+
+def _detect_center_bass_loss(y: np.ndarray, sr: int, center_idx: int | None, reference_y: np.ndarray | None) -> float:
+    """
+    Detect bass stripping in center channel (remuxer issue #5).
+    Returns bass attenuation in dB (0 = no loss, positive values = loss).
+
+    Checks for 6-10 dB bass loss in 20-100 Hz range vs reference or vs L/R channels.
+    """
+    if center_idx is None or center_idx >= y.shape[0]:
+        return 0.0
+
+    center = y[center_idx, :]
+
+    # Get bass energy in center channel (20-100 Hz)
+    from scipy import signal as scipy_signal
+
+    # Bandpass 20-100 Hz
+    nyq = sr / 2.0
+    low = 20.0 / nyq
+    high = min(100.0 / nyq, 0.99)
+
+    if low >= high or low <= 0 or high >= 1.0:
+        return 0.0
+
+    try:
+        sos = scipy_signal.butter(4, [low, high], btype='band', output='sos')
+        center_bass = scipy_signal.sosfilt(sos, center)
+    except:
+        return 0.0
+
+    center_bass_rms = float(np.sqrt(np.mean(center_bass**2)))
+
+    # Compare to reference if available
+    if reference_y is not None and center_idx < reference_y.shape[0]:
+        ref_center = reference_y[center_idx, :]
+        try:
+            ref_bass = scipy_signal.sosfilt(sos, ref_center)
+            ref_bass_rms = float(np.sqrt(np.mean(ref_bass**2)))
+
+            if ref_bass_rms > 1e-12 and center_bass_rms > 1e-12:
+                bass_loss_db = 20 * math.log10(ref_bass_rms / center_bass_rms)
+                return max(0.0, bass_loss_db)
+        except:
+            pass
+
+    # No reference: compare center bass to L/R bass average
+    if y.shape[0] >= 2:
+        left = y[0, :]
+        right = y[1, :]
+
+        try:
+            left_bass = scipy_signal.sosfilt(sos, left)
+            right_bass = scipy_signal.sosfilt(sos, right)
+
+            lr_bass_rms = float(np.sqrt(np.mean((left_bass**2 + right_bass**2) / 2.0)))
+
+            if lr_bass_rms > 1e-12 and center_bass_rms > 1e-12:
+                bass_loss_db = 20 * math.log10(lr_bass_rms / center_bass_rms)
+                # Only flag if significantly lower (center naturally has less bass)
+                return max(0.0, bass_loss_db - 3.0)  # -3 dB tolerance
+        except:
+            pass
+
+    return 0.0
 
 
 def _detect_fake_multichannel(y: np.ndarray, settings: AnalysisSettings) -> bool:
@@ -1037,16 +1171,25 @@ def _score_metric(value: float, max_value: float) -> float:
 
 
 def _score_dynamic_range(dr_db: float, settings: AnalysisSettings) -> float:
+    """
+    Score crest factor DR based on remuxer standards:
+    - ≥16 dB = good (100)
+    - 13-15 dB = compromised (70-90)
+    - ≤12 dB = severe (0-60)
+    Higher DR is always better, no penalty for very dynamic content.
+    """
     if dr_db <= 0:
         return 0.0
-    if dr_db < settings.brickwall_dr_db:
+    if dr_db < settings.brickwall_dr_db:  # <8 dB = brickwalled
         return 0.0
-    if dr_db < settings.target_dr_min:
+    if dr_db < settings.target_dr_min:  # 8-13 dB = poor
         span = settings.target_dr_min - settings.brickwall_dr_db
-        return 50.0 + (dr_db - settings.brickwall_dr_db) / span * 40.0
-    if dr_db <= settings.target_dr_max:
-        return 100.0
-    return max(70.0, 100.0 - (dr_db - settings.target_dr_max) * 2.0)
+        return (dr_db - settings.brickwall_dr_db) / span * 60.0
+    if dr_db < settings.target_dr_max:  # 13-16 dB = compromised
+        span = settings.target_dr_max - settings.target_dr_min
+        return 60.0 + (dr_db - settings.target_dr_min) / span * 40.0
+    # ≥16 dB = excellent, no penalty for high DR
+    return 100.0
 
 
 def _score_loudness_range(lra_db: float, settings: AnalysisSettings) -> float:
@@ -1147,6 +1290,21 @@ def _weighted_score_with_penalties(
         penalties["true_peak"] = p
         total_penalty += p
 
+    # L/R channel imbalance penalty (remuxer issue #7)
+    if result.lr_imbalance_detected:
+        # Minor: 1.5-3 dB = 2-5 pts, Major: 3+ dB = 5-10 pts
+        imbalance_penalty = min(10.0, result.lr_level_imbalance_db * 2.0)
+        if imbalance_penalty > 1.0:
+            penalties["lr_imbalance"] = imbalance_penalty
+            total_penalty += imbalance_penalty
+
+    # Center bass loss penalty (remuxer issue #5)
+    if result.center_bass_loss_db >= 6.0:
+        # 6-10 dB = moderate, >10 dB = severe
+        bass_penalty = min(15.0, (result.center_bass_loss_db - 5.0) * 1.5)
+        penalties["center_bass_loss"] = bass_penalty
+        total_penalty += bass_penalty
+
     final_score = max(0.0, base_score - total_penalty)
     explanation = {
         "base_score": base_score,
@@ -1209,6 +1367,10 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
             parts.append("Narrow soundstage")
         elif result.stereo_width > 0.7:
             parts.append("Wide soundstage")
+    if result.lr_imbalance_detected:
+        parts.append(f"L/R imbalance ({result.lr_level_imbalance_db:.1f} dB)")
+    if result.center_bass_loss_db >= 6.0:
+        parts.append(f"Center bass loss ({result.center_bass_loss_db:.1f} dB)")
     return "; ".join(parts)
 
 
@@ -1287,9 +1449,11 @@ def analyze_files(
         nr_filtered = _detect_nr_filtered(mag_db, freqs, settings, reference_mag)
         glitch_timestamps = _scan_glitches(y, sr, settings)
         stereo_width = _measure_stereo_width(y)
+        lr_level_imbalance, lr_noise_floor_diff, lr_imbalance = _detect_lr_imbalance(y, sr)
         fake_multichannel = _detect_fake_multichannel(y, settings)
         center_idx = _channel_index(metadata.get("channel_layout"), "FC", y.shape[0])
         lfe_idx = _channel_index(metadata.get("channel_layout"), "LFE", y.shape[0])
+        center_bass_loss = _detect_center_bass_loss(y, sr, center_idx, ref_audio)
         surround_swap_detected = _detect_surround_swaps(ref_audio, y, settings)
         lfe_rolloff_error = _detect_lfe_rolloff(y, sr, settings, lfe_idx)
         center_channel = y[center_idx] if center_idx is not None else y_mono
@@ -1351,7 +1515,8 @@ def analyze_files(
         freq_score = _score_metric(cutoff_hz, sr / 2)
         if shelf_detected:
             freq_score = max(0.0, freq_score - 50.0)
-        dr_score = _score_loudness_range(loudness_range_db, settings)
+        # Use crest factor DR (not LRA) - matches remuxer DR meter standards
+        dr_score = _score_dynamic_range(dr_db, settings)
 
         # Cleanliness score: focus on actual limiting/clipping, not just hot levels
         # Start with clipping penalty based on actual clipping ratio
@@ -1559,6 +1724,10 @@ def analyze_files(
             limiting_segments=limiting_segments,
             reference_path=reference_path,
             stereo_width=stereo_width,
+            lr_level_imbalance_db=lr_level_imbalance,
+            lr_noise_floor_diff_db=lr_noise_floor_diff,
+            lr_imbalance_detected=lr_imbalance,
+            center_bass_loss_db=center_bass_loss,
         )
         result.score, result.score_explain = _weighted_score_with_penalties(
             result.score, result, settings
