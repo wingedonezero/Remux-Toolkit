@@ -75,6 +75,17 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         action_layout.addStretch()
         panel_layout.addLayout(action_layout)
 
+        analysis_tabs = QtWidgets.QTabWidget()
+        analysis_tabs.addTab(self._create_results_panel(), "Results")
+        analysis_tabs.addTab(self._create_spectrogram_panel(), "Spectrograms")
+        panel_layout.addWidget(analysis_tabs, 1)
+
+        return panel
+
+    def _create_results_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+
         cards_group = QtWidgets.QGroupBox("File Comparison")
         cards_layout = QtWidgets.QGridLayout(cards_group)
         for idx in range(4):
@@ -111,18 +122,24 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.summary_box = QtWidgets.QTextEdit()
         self.summary_box.setReadOnly(True)
         self.summary_box.setPlaceholderText("Detailed analysis will appear here...")
-        panel_layout.addWidget(self.summary_box)
+        panel_layout.addWidget(self.summary_box, 1)
+
+        return panel
+
+    def _create_spectrogram_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QVBoxLayout(panel)
 
         spectrogram_group = QtWidgets.QGroupBox("Spectrogram Comparison")
         spectrogram_layout = QtWidgets.QGridLayout(spectrogram_group)
         for idx in range(4):
             label = QtWidgets.QLabel("No spectrogram")
             label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            label.setMinimumHeight(150)
+            label.setMinimumHeight(220)
             label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
             self.spectrogram_labels.append(label)
             spectrogram_layout.addWidget(label, idx // 2, idx % 2)
-        panel_layout.addWidget(spectrogram_group)
+        panel_layout.addWidget(spectrogram_group, 1)
 
         return panel
 
