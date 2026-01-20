@@ -20,24 +20,26 @@ def check_tool_available(tool_path: str) -> tuple[bool, str]:
     Check if a tool is available and return version info.
     Returns (available, version_or_error).
     """
-    try:
-        result = subprocess.run(
-            [tool_path, "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            # Extract first line of version info
-            version = result.stdout.split('\n')[0] if result.stdout else "available"
-            return True, version
-        return False, f"Exit code {result.returncode}"
-    except FileNotFoundError:
-        return False, "Not found in PATH"
-    except subprocess.TimeoutExpired:
-        return False, "Timed out"
-    except Exception as e:
-        return False, str(e)
+    # Try both -version (FFmpeg style) and --version (GNU/mkvtoolnix style)
+    for flag in ["-version", "--version"]:
+        try:
+            result = subprocess.run(
+                [tool_path, flag],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                # Extract first line of version info
+                version = result.stdout.split('\n')[0] if result.stdout else "available"
+                return True, version
+        except FileNotFoundError:
+            return False, "Not found in PATH"
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            continue
+    return False, "Version check failed"
 
 
 @dataclass
