@@ -115,9 +115,9 @@ def rename_chapters_with_mkvpropedit(mkv_path: Path, mkvpropedit_path: str) -> t
         with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as tmp:
             tmp_path = tmp.name
 
-        # Extract chapters
+        # Extract chapters (no -s flag = XML format, -s = simple/OGM format)
         extract_cmd = [
-            "mkvextract", str(mkv_path), "chapters", "-s", tmp_path
+            "mkvextract", str(mkv_path), "chapters", tmp_path
         ]
         result = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=30)
 
