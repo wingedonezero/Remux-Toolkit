@@ -2,6 +2,8 @@
 """
 DVD title probing using FFprobe's dvdvideo demuxer.
 """
+from pathlib import Path
+
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from ..utils.paths import get_dvd_input_path
@@ -43,7 +45,7 @@ class DVDProbeWorker(QObject):
                 return
 
             # Get the correct DVD input path
-            dvd_path = get_dvd_input_path(job.source_path)
+            dvd_path = get_dvd_input_path(Path(job.source_path))
 
             # Probe all titles
             titles = probe_all_dvd_titles(ffprobe_path, dvd_path)
