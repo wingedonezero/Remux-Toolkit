@@ -422,6 +422,10 @@ def measure_frame_offset_quality(
         # (matches Video-Sync-GUI: positive offset means target is ahead)
         target_frame_idx = source_frame_idx + frame_offset
 
+        # Debug: show frame indices for first checkpoint of each candidate
+        if idx == 0 and log:
+            log(f"    Checkpoint 1: source_frame={source_frame_idx}, target_frame={target_frame_idx}")
+
         # Skip if target would be negative
         if target_frame_idx < 0:
             continue
@@ -546,7 +550,9 @@ def video_verified_frame_sync(
     log("Video-Verified Frame Sync")
     log("=" * 60)
     log(f"Source A: {Path(source_a_path).name}")
+    log(f"  Full path: {source_a_path}")
     log(f"Source B: {Path(source_b_path).name}")
+    log(f"  Full path: {source_b_path}")
     log(f"Audio offset: {audio_offset_ms:.3f}ms")
 
     if progress_callback:
