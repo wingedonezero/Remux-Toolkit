@@ -173,7 +173,8 @@ def compare_frames(
     method: str = 'hash',
     hash_algorithm: str = 'dhash',
     hash_size: int = 8,
-    hash_threshold: int = 5
+    hash_threshold: int = 5,
+    debug: bool = False
 ) -> tuple[float, bool]:
     """
     Compare two frames using specified method.
@@ -185,12 +186,17 @@ def compare_frames(
         hash_algorithm: Hash algorithm if method='hash'
         hash_size: Hash size if method='hash'
         hash_threshold: Max hamming distance to consider match
+        debug: Print debug info
 
     Returns:
         (distance, is_match) - distance and whether frames match
         For hash: distance is hamming distance (lower = more similar)
         For ssim: distance is 1-ssim (lower = more similar)
     """
+    if debug:
+        print(f"[DEBUG] Frame1: mode={frame1.mode}, size={frame1.size}")
+        print(f"[DEBUG] Frame2: mode={frame2.mode}, size={frame2.size}")
+
     if method == 'ssim':
         ssim_score = compute_ssim(frame1, frame2)
         # Scale to ~0-100 range to match hash distance scale (Video-Sync-GUI convention)
@@ -206,6 +212,12 @@ def compare_frames(
             return float('inf'), False
 
         distance = float(hash1 - hash2)  # Hamming distance
+
+        if debug:
+            print(f"[DEBUG] Hash1: {hash1}")
+            print(f"[DEBUG] Hash2: {hash2}")
+            print(f"[DEBUG] Distance: {distance}")
+
         is_match = distance <= hash_threshold
         return distance, is_match
 
@@ -451,12 +463,16 @@ def measure_frame_offset_quality(
         if source_frame is None or target_frame is None:
             continue
 
+        # Enable debug for first checkpoint of first candidate
+        debug_this = (idx == 0 and frame_offset != 0 and log is not None)
+
         initial_distance, initial_match = compare_frames(
             source_frame, target_frame,
             method=comparison_method,
             hash_algorithm=hash_algorithm,
             hash_size=hash_size,
-            hash_threshold=hash_threshold
+            hash_threshold=hash_threshold,
+            debug=debug_this
         )
         distances.append(initial_distance)
 
