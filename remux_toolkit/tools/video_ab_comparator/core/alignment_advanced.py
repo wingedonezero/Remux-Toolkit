@@ -49,15 +49,16 @@ class AlignmentConfig:
     # Language selection (None = use first audio track)
     audio_lang: Optional[str] = None
 
-    # Visual verification (audio-correlation-anchored frame sync)
+    # Video-verified frame sync (consecutive frame matching)
     visual_verification: bool = True  # Fine-tune with visual frame matching
-    visual_num_checkpoints: int = 3  # Number of checkpoints (at 5%, 50%, 95%)
-    visual_window_radius: int = 5  # Frames before/after center (5 = 11 frame window)
-    visual_search_range_frames: int = 48  # Search ±N frames around audio offset (~2s at 24fps)
+    visual_num_checkpoints: int = 5  # Checkpoints at 15%, 30%, 50%, 70%, 85%
+    visual_sequence_length: int = 10  # Consecutive frames to verify per checkpoint
+    visual_candidate_range: int = 3  # Search ±N frames around audio correlation
+    visual_comparison_method: str = "hash"  # Comparison method ('hash' or 'ssim')
+    visual_hash_algorithm: str = "dhash"  # Hash method ('dhash', 'phash', 'average_hash', 'whash')
     visual_hash_size: int = 8  # Hash size (8x8 = 64 bits)
-    visual_hash_algorithm: str = "dhash"  # Hash method ('dhash', 'phash', 'average_hash')
     visual_hash_threshold: int = 5  # Max hamming distance per frame
-    visual_agreement_tolerance_ms: float = 100.0  # Max deviation between checkpoints
+    visual_match_threshold_pct: float = 70.0  # % of sequence that must match
 
 
 @dataclass
@@ -363,76 +364,72 @@ def advanced_align(source_a_path: str, source_b_path: str,
     print(f"\nAudio alignment: offset={final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms), "
           f"confidence={final_confidence:.2%}, accepted={len(accepted_chunks)}/{chunk_count_int}")
 
-    # Visual frame verification for frame-perfect accuracy
-    # Uses audio-correlation-anchored frame sync (3 checkpoints with sliding window matching)
+    # Video-verified frame sync for frame-perfect accuracy
+    # Uses consecutive frame matching at multiple checkpoints (no sliding window)
     if config.visual_verification and final_offset_sec != 0.0:
         if progress_callback:
-            progress_callback("Visual frame verification...", 92)
+            progress_callback("Video-verified frame sync...", 92)
 
         try:
-            from .audio_correlation_frame_sync import audio_correlation_frame_sync
-            from pathlib import Path
+            from .video_verified_frame_sync import video_verified_frame_sync
 
             # Use a temp directory for FFMS2 index caching
             import tempfile
             temp_dir = Path(tempfile.gettempdir()) / "remux_toolkit_frame_sync"
             temp_dir.mkdir(parents=True, exist_ok=True)
 
-            print(f"\n{'='*70}")
-            print(f"Audio-Correlation-Anchored Frame Sync")
-            print(f"{'='*70}")
+            # Convert audio offset to milliseconds for the frame sync
+            audio_offset_ms = final_offset_sec * 1000.0
 
-            frame_sync_result = audio_correlation_frame_sync(
+            frame_sync_result = video_verified_frame_sync(
                 source_a_path,
                 source_b_path,
-                final_offset_sec,
+                audio_offset_ms,
                 fps_a,
                 fps_b,
                 num_checkpoints=config.visual_num_checkpoints,
-                window_radius=config.visual_window_radius,
-                search_range_frames=config.visual_search_range_frames,
-                hash_size=config.visual_hash_size,
+                sequence_length=config.visual_sequence_length,
+                candidate_range=config.visual_candidate_range,
+                comparison_method=config.visual_comparison_method,
                 hash_algorithm=config.visual_hash_algorithm,
+                hash_size=config.visual_hash_size,
                 hash_threshold=config.visual_hash_threshold,
-                agreement_tolerance_ms=config.visual_agreement_tolerance_ms,
+                match_threshold_pct=config.visual_match_threshold_pct,
                 temp_dir=temp_dir,
                 progress_callback=progress_callback
             )
 
             if frame_sync_result.success:
-                # Checkpoints agreed - use frame-corrected offset
-                print(f"\n✓ Frame sync successful!")
-                print(f"  Audio offset: {final_offset_sec:.6f}s")
-                print(f"  Frame-corrected offset: {frame_sync_result.offset_sec:.6f}s")
-                print(f"  Correction: {(frame_sync_result.offset_sec - final_offset_sec)*1000:.3f}ms")
-                print(f"  Confidence: {frame_sync_result.confidence:.2%}")
-                print(f"  Agreement: {frame_sync_result.agreement_status}")
+                # Frame verification passed - use verified offset
+                frame_corrected_offset_sec = frame_sync_result.offset_ms / 1000.0
 
-                # Use frame-corrected offset
-                final_offset_sec = frame_sync_result.offset_sec
+                print(f"\n✓ Video-verified frame sync successful!")
+                print(f"  Audio offset: {final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms)")
+                print(f"  Frame-verified offset: {frame_corrected_offset_sec:.6f}s ({frame_sync_result.offset_ms:.3f}ms)")
+                print(f"  Correction: {frame_sync_result.offset_ms - audio_offset_ms:+.3f}ms ({frame_sync_result.offset_frames:+d} frames)")
+                print(f"  Verified: {frame_sync_result.best_candidate.checkpoints_verified}/{frame_sync_result.best_candidate.checkpoints_total} checkpoints")
+                print(f"  Confidence: {frame_sync_result.confidence:.1%}")
+
+                # Use frame-verified offset
+                final_offset_sec = frame_corrected_offset_sec
 
                 # Combine confidences (weighted average: audio 40%, visual 60%)
                 final_confidence = (final_confidence * 0.4) + (frame_sync_result.confidence * 0.6)
 
-            elif frame_sync_result.agreement_status == 'insufficient':
-                # Only 1 checkpoint matched - use it but with reduced confidence
-                print(f"\n⚠ Frame sync: insufficient checkpoints")
-                print(f"  Using single checkpoint result: {frame_sync_result.offset_sec:.6f}s")
-                print(f"  Confidence: {frame_sync_result.confidence:.2%} (reduced)")
-
-                final_offset_sec = frame_sync_result.offset_sec
-                final_confidence = (final_confidence * 0.5) + (frame_sync_result.confidence * 0.5)
-
             else:
-                # Checkpoints disagreed or failed
-                print(f"\n✗ Frame sync failed: {frame_sync_result.error}")
-                print(f"  Keeping audio-only offset: {final_offset_sec:.6f}s")
+                # Frame verification failed - keep audio offset
+                print(f"\n⚠ Video-verified frame sync: {frame_sync_result.method}")
+                if frame_sync_result.error:
+                    print(f"  Reason: {frame_sync_result.error}")
+                print(f"  Keeping audio offset: {final_offset_sec:.6f}s")
 
         except ImportError as e:
-            print(f"Frame sync unavailable: {e}")
+            print(f"Video-verified frame sync unavailable: {e}")
             print(f"Keeping audio-only offset: {final_offset_sec:.6f}s")
         except Exception as e:
-            print(f"Frame sync error: {e}")
+            print(f"Video-verified frame sync error: {e}")
+            import traceback
+            traceback.print_exc()
             print(f"Keeping audio-only offset: {final_offset_sec:.6f}s")
 
     if progress_callback:
