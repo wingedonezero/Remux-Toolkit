@@ -187,8 +187,9 @@ def compare_frames(
     """
     if method == 'ssim':
         ssim_score = compute_ssim(frame1, frame2)
-        distance = 1.0 - ssim_score  # Convert to distance (lower = better)
-        is_match = ssim_score >= 0.85  # 85% similarity threshold for SSIM
+        # Scale to ~0-100 range to match hash distance scale (Video-Sync-GUI convention)
+        distance = (1.0 - ssim_score) * 100
+        is_match = ssim_score > 0.90  # 90% similarity threshold (stricter)
         return distance, is_match
     else:
         # Hash-based comparison
