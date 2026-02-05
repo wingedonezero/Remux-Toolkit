@@ -283,17 +283,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.tabs.addTab(scroll, "Alignment")
 
     def _create_frame_sync_tab(self):
-        """Frame sync settings (audio-correlation-anchored)."""
+        """Frame sync settings (video-verified)."""
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QFormLayout(tab)
 
         # Header
-        header = QtWidgets.QLabel("<b>Frame Sync Settings</b>")
+        header = QtWidgets.QLabel("<b>Video-Verified Frame Sync</b>")
         layout.addRow(header)
 
         info = QtWidgets.QLabel(
-            "Audio-correlation-anchored frame sync provides frame-perfect alignment.\n"
-            "Uses perceptual hashing at multiple checkpoints to verify alignment."
+            "Verifies frame alignment using consecutive frame matching.\n"
+            "Tests candidate offsets at multiple checkpoints for accuracy."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: gray;")
@@ -314,56 +314,86 @@ class SettingsDialog(QtWidgets.QDialog):
         layout.addRow(QtWidgets.QLabel(""))  # Spacer
 
         # Number of checkpoints
-        checkpoints_label = QtWidgets.QLabel("Number of Checkpoints:")
+        checkpoints_label = QtWidgets.QLabel("Checkpoints:")
         checkpoints_spin = QtWidgets.QSpinBox()
-        checkpoints_spin.setRange(2, 5)
-        checkpoints_spin.setValue(self.settings.get('align_visual_num_checkpoints', 3))
+        checkpoints_spin.setRange(3, 7)
+        checkpoints_spin.setValue(self.settings.get('align_visual_num_checkpoints', 5))
         checkpoints_spin.setToolTip(
-            "Number of verification points (at 5%, 50%, 95% of duration).\n"
+            "Verification points at 15%, 30%, 50%, 70%, 85%.\n"
             "More = better verification but slower.\n"
-            "Default: 3"
+            "Default: 5"
         )
         layout.addRow(checkpoints_label, checkpoints_spin)
         self.controls['align_visual_num_checkpoints'] = checkpoints_spin
 
-        # Window radius
-        window_label = QtWidgets.QLabel("Window Radius (frames):")
-        window_spin = QtWidgets.QSpinBox()
-        window_spin.setRange(3, 10)
-        window_spin.setValue(self.settings.get('align_visual_window_radius', 5))
-        window_spin.setToolTip(
-            "Frames before/after center to compare.\n"
-            "5 = 11 frame window (center ±5)\n"
-            "Default: 5"
+        # Sequence length
+        sequence_label = QtWidgets.QLabel("Sequence Length:")
+        sequence_spin = QtWidgets.QSpinBox()
+        sequence_spin.setRange(5, 20)
+        sequence_spin.setValue(self.settings.get('align_visual_sequence_length', 10))
+        sequence_spin.setToolTip(
+            "Consecutive frames to verify at each checkpoint.\n"
+            "Higher = more strict verification.\n"
+            "Default: 10"
         )
-        layout.addRow(window_label, window_spin)
-        self.controls['align_visual_window_radius'] = window_spin
+        layout.addRow(sequence_label, sequence_spin)
+        self.controls['align_visual_sequence_length'] = sequence_spin
 
-        # Search range
-        search_label = QtWidgets.QLabel("Search Range (frames):")
-        search_spin = QtWidgets.QSpinBox()
-        search_spin.setRange(10, 120)
-        search_spin.setSingleStep(12)  # ~0.5s at 24fps
-        search_spin.setValue(self.settings.get('align_visual_search_frames', 48))
-        search_spin.setToolTip(
-            "Search ±N frames around audio offset.\n"
-            "48 frames = ±2 seconds at 24fps\n"
-            "Increase if audio correlation is imprecise."
+        # Candidate range
+        candidate_label = QtWidgets.QLabel("Candidate Range:")
+        candidate_spin = QtWidgets.QSpinBox()
+        candidate_spin.setRange(1, 10)
+        candidate_spin.setValue(self.settings.get('align_visual_candidate_range', 3))
+        candidate_spin.setToolTip(
+            "Search ±N frames around audio correlation.\n"
+            "Default: 3 (tests 7 candidates)"
         )
-        layout.addRow(search_label, search_spin)
-        self.controls['align_visual_search_frames'] = search_spin
+        layout.addRow(candidate_label, candidate_spin)
+        self.controls['align_visual_candidate_range'] = candidate_spin
+
+        # Match threshold
+        match_label = QtWidgets.QLabel("Match Threshold:")
+        match_spin = QtWidgets.QSpinBox()
+        match_spin.setRange(50, 90)
+        match_spin.setSingleStep(5)
+        match_spin.setValue(int(self.settings.get('align_visual_match_threshold_pct', 70.0)))
+        match_spin.setSuffix("%")
+        match_spin.setToolTip(
+            "Percentage of sequence frames that must match.\n"
+            "Default: 70% (7 of 10 frames)"
+        )
+        layout.addRow(match_label, match_spin)
+        self.controls['align_visual_match_threshold_pct'] = match_spin
 
         layout.addRow(QtWidgets.QLabel(""))  # Spacer
+
+        # Comparison method
+        method_label = QtWidgets.QLabel("Comparison Method:")
+        method_combo = QtWidgets.QComboBox()
+        method_combo.addItems(["hash (perceptual hashing)", "ssim (structural similarity)"])
+
+        current_method = self.settings.get('align_visual_comparison_method', 'hash')
+        method_combo.setCurrentIndex(0 if current_method == 'hash' else 1)
+        method_combo.setToolTip(
+            "hash: Fast perceptual hashing (recommended)\n"
+            "ssim: Structural similarity (slower, more precise)"
+        )
+
+        layout.addRow(method_label, method_combo)
+        self.controls['align_visual_comparison_method_combo'] = method_combo
 
         # Hash algorithm
         hash_algo_label = QtWidgets.QLabel("Hash Algorithm:")
         hash_algo_combo = QtWidgets.QComboBox()
-        hash_algo_combo.addItems(["dhash (fast, good for similar encodes)",
-                                    "phash (robust to scaling/filtering)",
-                                    "average_hash (fastest, less accurate)"])
+        hash_algo_combo.addItems([
+            "dhash (difference hash)",
+            "phash (perceptual hash)",
+            "average_hash (mean hash)",
+            "whash (wavelet hash)"
+        ])
 
         current_algo = self.settings.get('align_visual_hash_algorithm', 'dhash')
-        algo_map = {'dhash': 0, 'phash': 1, 'average_hash': 2}
+        algo_map = {'dhash': 0, 'phash': 1, 'average_hash': 2, 'whash': 3}
         hash_algo_combo.setCurrentIndex(algo_map.get(current_algo, 0))
 
         layout.addRow(hash_algo_label, hash_algo_combo)
@@ -372,7 +402,7 @@ class SettingsDialog(QtWidgets.QDialog):
         # Hash size
         hash_size_label = QtWidgets.QLabel("Hash Size:")
         hash_size_combo = QtWidgets.QComboBox()
-        hash_size_combo.addItems(["8x8 (64-bit, fast)", "16x16 (256-bit, precise)"])
+        hash_size_combo.addItems(["8x8 (64-bit)", "16x16 (256-bit)"])
 
         current_size = self.settings.get('align_visual_hash_size', 8)
         hash_size_combo.setCurrentIndex(0 if current_size == 8 else 1)
@@ -386,25 +416,12 @@ class SettingsDialog(QtWidgets.QDialog):
         threshold_spin.setRange(1, 15)
         threshold_spin.setValue(self.settings.get('align_visual_hash_threshold', 5))
         threshold_spin.setToolTip(
-            "Maximum hamming distance per frame to accept match.\n"
-            "Lower = stricter matching\n"
-            "Default: 5 bits"
+            "Max hamming distance per frame.\n"
+            "Lower = stricter matching.\n"
+            "Default: 5"
         )
         layout.addRow(threshold_label, threshold_spin)
         self.controls['align_visual_hash_threshold'] = threshold_spin
-
-        # Agreement tolerance
-        tolerance_label = QtWidgets.QLabel("Agreement Tolerance (ms):")
-        tolerance_spin = QtWidgets.QDoubleSpinBox()
-        tolerance_spin.setRange(10.0, 500.0)
-        tolerance_spin.setSingleStep(10.0)
-        tolerance_spin.setValue(self.settings.get('align_visual_agreement_tolerance_ms', 100.0))
-        tolerance_spin.setToolTip(
-            "Max deviation between checkpoints to accept result.\n"
-            "Default: 100ms (~2-3 frames at 24fps)"
-        )
-        layout.addRow(tolerance_label, tolerance_spin)
-        self.controls['align_visual_agreement_tolerance_ms'] = tolerance_spin
 
         self.tabs.addTab(tab, "Frame Sync")
 
@@ -551,14 +568,20 @@ class SettingsDialog(QtWidgets.QDialog):
             self.settings['align_visual_verification'] = self.controls['align_visual_verification'].isChecked()
         if 'align_visual_num_checkpoints' in self.controls:
             self.settings['align_visual_num_checkpoints'] = self.controls['align_visual_num_checkpoints'].value()
-        if 'align_visual_window_radius' in self.controls:
-            self.settings['align_visual_window_radius'] = self.controls['align_visual_window_radius'].value()
-        if 'align_visual_search_frames' in self.controls:
-            self.settings['align_visual_search_frames'] = self.controls['align_visual_search_frames'].value()
+        if 'align_visual_sequence_length' in self.controls:
+            self.settings['align_visual_sequence_length'] = self.controls['align_visual_sequence_length'].value()
+        if 'align_visual_candidate_range' in self.controls:
+            self.settings['align_visual_candidate_range'] = self.controls['align_visual_candidate_range'].value()
+        if 'align_visual_match_threshold_pct' in self.controls:
+            self.settings['align_visual_match_threshold_pct'] = float(self.controls['align_visual_match_threshold_pct'].value())
+
+        if 'align_visual_comparison_method_combo' in self.controls:
+            idx = self.controls['align_visual_comparison_method_combo'].currentIndex()
+            self.settings['align_visual_comparison_method'] = 'hash' if idx == 0 else 'ssim'
 
         if 'align_visual_hash_algorithm_combo' in self.controls:
             idx = self.controls['align_visual_hash_algorithm_combo'].currentIndex()
-            algo_map = {0: 'dhash', 1: 'phash', 2: 'average_hash'}
+            algo_map = {0: 'dhash', 1: 'phash', 2: 'average_hash', 3: 'whash'}
             self.settings['align_visual_hash_algorithm'] = algo_map.get(idx, 'dhash')
 
         if 'align_visual_hash_size_combo' in self.controls:
@@ -567,8 +590,6 @@ class SettingsDialog(QtWidgets.QDialog):
 
         if 'align_visual_hash_threshold' in self.controls:
             self.settings['align_visual_hash_threshold'] = self.controls['align_visual_hash_threshold'].value()
-        if 'align_visual_agreement_tolerance_ms' in self.controls:
-            self.settings['align_visual_agreement_tolerance_ms'] = self.controls['align_visual_agreement_tolerance_ms'].value()
 
         # Detectors tab
         if 'enable_audio_analysis' in self.controls:

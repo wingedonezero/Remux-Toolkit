@@ -292,8 +292,16 @@ class ComparisonPipeline(QObject):
                     'peak_fit': self.settings.get('align_peak_fit', True),
                     'delay_selection': self.settings.get('align_delay_selection', 'first'),
                     'audio_lang': self.settings.get('align_audio_lang', None),
+                    # Video-verified frame sync settings
                     'visual_verification': self.settings.get('align_visual_verification', True),
-                    'visual_search_range_frames': self.settings.get('align_visual_search_frames', 20)
+                    'visual_num_checkpoints': self.settings.get('align_visual_num_checkpoints', 5),
+                    'visual_sequence_length': self.settings.get('align_visual_sequence_length', 10),
+                    'visual_candidate_range': self.settings.get('align_visual_candidate_range', 3),
+                    'visual_comparison_method': self.settings.get('align_visual_comparison_method', 'hash'),
+                    'visual_hash_algorithm': self.settings.get('align_visual_hash_algorithm', 'dhash'),
+                    'visual_hash_size': self.settings.get('align_visual_hash_size', 8),
+                    'visual_hash_threshold': self.settings.get('align_visual_hash_threshold', 5),
+                    'visual_match_threshold_pct': self.settings.get('align_visual_match_threshold_pct', 70.0),
                 }
 
                 align = robust_align(

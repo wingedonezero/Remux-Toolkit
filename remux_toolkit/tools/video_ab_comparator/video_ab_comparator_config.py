@@ -29,15 +29,16 @@ DEFAULTS = {
     "align_delay_selection": "first",  # Delay selection strategy: first/median/mean
     "align_audio_lang": "jpn",  # Audio language to use for alignment (None = first track)
 
-    # Audio-Correlation-Anchored Frame Sync Settings (NEW)
+    # Video-Verified Frame Sync Settings (matches Video-Sync-GUI defaults)
     "align_visual_verification": True,  # Enable frame-perfect visual verification
-    "align_visual_num_checkpoints": 3,  # Number of checkpoints (at 5%, 50%, 95%)
-    "align_visual_window_radius": 5,  # Frames before/after center (5 = 11 frame window)
-    "align_visual_search_frames": 48,  # Search ±N frames around audio offset (~2s at 24fps)
+    "align_visual_num_checkpoints": 5,  # Checkpoints at 15%, 30%, 50%, 70%, 85%
+    "align_visual_sequence_length": 10,  # Consecutive frames to verify per checkpoint
+    "align_visual_candidate_range": 3,  # Search ±N frames around audio correlation
+    "align_visual_comparison_method": "hash",  # Comparison method: hash or ssim
+    "align_visual_hash_algorithm": "dhash",  # Hash method: dhash/phash/average_hash/whash
     "align_visual_hash_size": 8,  # Hash size (8x8 = 64 bits)
-    "align_visual_hash_algorithm": "dhash",  # Hash method: dhash/phash/average_hash
     "align_visual_hash_threshold": 5,  # Max hamming distance per frame
-    "align_visual_agreement_tolerance_ms": 100.0,  # Max deviation between checkpoints
+    "align_visual_match_threshold_pct": 70.0,  # % of sequence that must match
 
     # Frame Mapping Settings
     "use_frame_mapper": True,  # Use VideoTimestamps for frame-perfect mapping

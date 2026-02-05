@@ -320,8 +320,16 @@ def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
             peak_fit=align_config.get('peak_fit', True),
             delay_selection=align_config.get('delay_selection', 'first'),
             audio_lang=align_config.get('audio_lang', None),
+            # Video-verified frame sync settings
             visual_verification=align_config.get('visual_verification', True),
-            visual_search_range_frames=align_config.get('visual_search_range_frames', 20)
+            visual_num_checkpoints=align_config.get('visual_num_checkpoints', 5),
+            visual_sequence_length=align_config.get('visual_sequence_length', 10),
+            visual_candidate_range=align_config.get('visual_candidate_range', 3),
+            visual_comparison_method=align_config.get('visual_comparison_method', 'hash'),
+            visual_hash_algorithm=align_config.get('visual_hash_algorithm', 'dhash'),
+            visual_hash_size=align_config.get('visual_hash_size', 8),
+            visual_hash_threshold=align_config.get('visual_hash_threshold', 5),
+            visual_match_threshold_pct=align_config.get('visual_match_threshold_pct', 70.0),
         )
 
         advanced_result = advanced_align(
