@@ -17,3 +17,7 @@ videohash
 VideoTimestamps
 av
 matplotlib
+
+# Frame-accurate video access (video-verified frame sync)
+vapoursynth
+scikit-image  # For SSIM comparison method
