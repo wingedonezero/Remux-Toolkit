@@ -599,9 +599,13 @@ def video_verified_frame_sync(
     log(f"FPS: A={fps_a:.3f}, B={fps_b:.3f}")
     log(f"Frame duration: {frame_duration_ms:.3f}ms")
 
-    # Get duration
+    # Get duration from both videos and use the maximum
+    # This matches Video-Sync-GUI behavior which uses subtitle duration + buffer
+    # when available, which is typically longer than the video itself
     duration_a = get_video_duration(source_a_path)
-    if duration_a == 0.0:
+    duration_b = get_video_duration(source_b_path)
+
+    if duration_a == 0.0 and duration_b == 0.0:
         return VideoVerifiedResult(
             success=False,
             offset_ms=audio_offset_ms,
@@ -613,7 +617,12 @@ def video_verified_frame_sync(
             error='Failed to detect video duration'
         )
 
-    log(f"Duration: {duration_a:.1f}s ({duration_a/60:.1f} min)")
+    # Use maximum duration for checkpoint selection
+    # This ensures checkpoints align better with content that exists in both videos
+    duration = max(duration_a, duration_b) if duration_b > 0 else duration_a
+
+    log(f"Duration A: {duration_a:.1f}s, Duration B: {duration_b:.1f}s")
+    log(f"Using duration: {duration:.1f}s ({duration/60:.1f} min) for checkpoints")
 
     # Convert audio offset to frames
     correlation_frames = audio_offset_ms / frame_duration_ms
@@ -623,8 +632,8 @@ def video_verified_frame_sync(
     candidates = generate_frame_candidates(correlation_frames, candidate_range)
     log(f"Testing {len(candidates)} candidates: {candidates}")
 
-    # Select checkpoints
-    checkpoint_times = select_checkpoints_video_verified(duration_a, num_checkpoints)
+    # Select checkpoints using the maximum duration
+    checkpoint_times = select_checkpoints_video_verified(duration, num_checkpoints)
     log(f"Checkpoints: {[f'{t:.1f}s' for t in checkpoint_times]}")
 
     if progress_callback:
