@@ -426,7 +426,8 @@ def measure_frame_offset_quality(
     for idx, checkpoint_sec in enumerate(checkpoint_times):
         checkpoint_ms = checkpoint_sec * 1000.0
         source_frame_idx = time_to_frame_floor(checkpoint_ms, fps)
-        target_frame_idx = source_frame_idx + frame_offset
+        # Convention: ts_b = ts_a - offset, so frame_b = frame_a - frame_offset
+        target_frame_idx = source_frame_idx - frame_offset
 
         # Skip if target would be negative
         if target_frame_idx < 0:
