@@ -214,7 +214,7 @@ def select_checkpoints_video_verified(
     """
     Select checkpoint times at strategic positions.
 
-    Uses 15%, 30%, 50%, 70%, 85% positions (avoiding edges).
+    Uses 15%, 30%, 50%, 70%, 85% positions (matching Video-Sync-GUI).
 
     Args:
         duration_sec: Video duration in seconds
@@ -223,27 +223,19 @@ def select_checkpoints_video_verified(
     Returns:
         List of checkpoint times in seconds
     """
-    # Avoid first/last 2 minutes
-    safe_margin = 120.0
-    safe_start = min(safe_margin, duration_sec * 0.05)
-    safe_end = max(duration_sec - safe_margin, duration_sec * 0.95)
-
-    if safe_end <= safe_start:
-        # Very short video, just use middle
-        return [duration_sec / 2]
-
-    safe_duration = safe_end - safe_start
-
+    # Use percentage-based positions (matching Video-Sync-GUI)
+    # Video-Sync-GUI uses: positions = [15, 30, 50, 70, 85][:num_checkpoints]
+    # and calculates: time_ms = duration_ms * pos / 100
     if num_checkpoints == 5:
-        # Standard positions: 15%, 30%, 50%, 70%, 85%
-        positions = [0.15, 0.30, 0.50, 0.70, 0.85]
+        positions = [15, 30, 50, 70, 85]
     elif num_checkpoints == 3:
-        positions = [0.20, 0.50, 0.80]
+        positions = [20, 50, 80]
     else:
         # Evenly distributed
-        positions = [(i + 1) / (num_checkpoints + 1) for i in range(num_checkpoints)]
+        positions = [int(100 * (i + 1) / (num_checkpoints + 1)) for i in range(num_checkpoints)]
 
-    checkpoints = [safe_start + pos * safe_duration for pos in positions]
+    # Calculate checkpoint times as percentage of total duration
+    checkpoints = [duration_sec * pos / 100.0 for pos in positions]
     return checkpoints
 
 
@@ -335,6 +327,15 @@ def verify_frame_sequence(
             distances.append(float('inf'))
             continue
 
+        # Debug: show first frame comparison details
+        if i == 0:
+            import numpy as np
+            src_arr = np.array(source_frame)
+            tgt_arr = np.array(target_frame)
+            # Show mean pixel values to verify frames are different
+            print(f"[FrameDebug] Source frame {source_idx}: size={source_frame.size}, mean={src_arr.mean():.1f}")
+            print(f"[FrameDebug] Target frame {target_idx}: size={target_frame.size}, mean={tgt_arr.mean():.1f}")
+
         # Compare frames
         distance, is_match = compare_frames(
             source_frame, target_frame,
@@ -343,6 +344,10 @@ def verify_frame_sequence(
             hash_size=hash_size,
             hash_threshold=hash_threshold
         )
+
+        # Debug: show first comparison result
+        if i == 0:
+            print(f"[FrameDebug] Distance={distance}, is_match={is_match}")
 
         distances.append(distance)
         if is_match:
@@ -429,6 +434,10 @@ def measure_frame_offset_quality(
         # Convention: target_frame = source_frame + frame_offset
         # (matches Video-Sync-GUI: positive offset means target is ahead)
         target_frame_idx = source_frame_idx + frame_offset
+
+        # Debug: show frame indices for first checkpoint of each candidate
+        if idx == 0 and log:
+            log(f"    Checkpoint 1: source_frame={source_frame_idx}, target_frame={target_frame_idx}")
 
         # Skip if target would be negative
         if target_frame_idx < 0:
@@ -554,7 +563,9 @@ def video_verified_frame_sync(
     log("Video-Verified Frame Sync")
     log("=" * 60)
     log(f"Source A: {Path(source_a_path).name}")
+    log(f"  Full path: {source_a_path}")
     log(f"Source B: {Path(source_b_path).name}")
+    log(f"  Full path: {source_b_path}")
     log(f"Audio offset: {audio_offset_ms:.3f}ms")
 
     if progress_callback:

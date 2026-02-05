@@ -264,6 +264,10 @@ class VideoReader:
             # Generate cache path
             index_path = self._get_index_cache_path()
 
+            # Debug: show cache path being used
+            print(f"[VideoReader] Video: {self.video_path}")
+            print(f"[VideoReader] Cache key: {index_path.name}")
+
             if index_path.exists():
                 print(f"[VideoReader] Reusing FFMS2 index: {index_path.name}")
             else:
