@@ -327,6 +327,15 @@ def verify_frame_sequence(
             distances.append(float('inf'))
             continue
 
+        # Debug: show first frame comparison details
+        if i == 0:
+            import numpy as np
+            src_arr = np.array(source_frame)
+            tgt_arr = np.array(target_frame)
+            # Show mean pixel values to verify frames are different
+            print(f"[FrameDebug] Source frame {source_idx}: size={source_frame.size}, mean={src_arr.mean():.1f}")
+            print(f"[FrameDebug] Target frame {target_idx}: size={target_frame.size}, mean={tgt_arr.mean():.1f}")
+
         # Compare frames
         distance, is_match = compare_frames(
             source_frame, target_frame,
@@ -335,6 +344,10 @@ def verify_frame_sequence(
             hash_size=hash_size,
             hash_threshold=hash_threshold
         )
+
+        # Debug: show first comparison result
+        if i == 0:
+            print(f"[FrameDebug] Distance={distance}, is_match={is_match}")
 
         distances.append(distance)
         if is_match:
