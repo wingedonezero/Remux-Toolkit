@@ -120,7 +120,7 @@ class DetailedComparisonWidget(QtWidgets.QWidget):
         a_label.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
         self.frame_a_viewer = QtWidgets.QLabel("Select a chunk to begin")
         self.frame_a_viewer.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.frame_a_viewer.setMinimumSize(400, 225)
+        self.frame_a_viewer.setMinimumSize(320, 180)
         self.frame_a_viewer.setStyleSheet("border: 1px solid #555; background: #1a1a1a;")
         a_frame_container.addWidget(a_label)
         a_frame_container.addWidget(self.frame_a_viewer, 1)
@@ -132,7 +132,7 @@ class DetailedComparisonWidget(QtWidgets.QWidget):
         b_label.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
         self.frame_b_viewer = QtWidgets.QLabel("Select a chunk to begin")
         self.frame_b_viewer.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.frame_b_viewer.setMinimumSize(400, 225)
+        self.frame_b_viewer.setMinimumSize(320, 180)
         self.frame_b_viewer.setStyleSheet("border: 1px solid #555; background: #1a1a1a;")
         b_frame_container.addWidget(b_label)
         b_frame_container.addWidget(self.frame_b_viewer, 1)
@@ -165,7 +165,7 @@ class DetailedComparisonWidget(QtWidgets.QWidget):
         details_layout.addWidget(metrics_group)
 
         splitter.addWidget(details_widget)
-        splitter.setSizes([250, 950])
+        splitter.setSizes([200, 750])
 
         main_layout.addWidget(splitter, 1)
 
