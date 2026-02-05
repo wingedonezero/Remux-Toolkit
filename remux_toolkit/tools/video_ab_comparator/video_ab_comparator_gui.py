@@ -406,22 +406,36 @@ class VideoABComparatorWidget(QtWidgets.QWidget):
 
     def shutdown(self):
         """Called when tab is closed - clean up all resources."""
-        print(f"Closing tab for {self.tool_name}. Shutting down worker...")
-
-        # Restore stdout if it was redirected
+        # Restore stdout FIRST before any print statements
+        # This prevents blocking on a destroyed log widget
         if self.original_stdout:
             sys.stdout = self.original_stdout
             self.original_stdout = None
+
+        print(f"Closing tab for {self.tool_name}. Shutting down worker...")
 
         # Stop pipeline if running
         if self.pipeline_thread and self.pipeline_thread.isRunning():
             if self.pipeline:
                 self.pipeline.stop()
             self.pipeline_thread.quit()
-            self.pipeline_thread.wait()
+            self.pipeline_thread.wait(3000)  # Wait max 3 seconds
+
+        # Stop frame loader threads
+        if self.frame_loader_thread and self.frame_loader_thread.isRunning():
+            self.frame_loader_thread.quit()
+            self.frame_loader_thread.wait(1000)
+
+        if self.chunk_frame_loader_thread and self.chunk_frame_loader_thread.isRunning():
+            self.chunk_frame_loader_thread.quit()
+            self.chunk_frame_loader_thread.wait(1000)
 
         # Clean up all resources
         self._cleanup_previous_run()
+
+        # Force garbage collection to release VapourSynth/FFMS2 resources
+        import gc
+        gc.collect()
 
         print(f"Tab {self.tool_name} closed successfully.")
 
