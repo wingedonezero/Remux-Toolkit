@@ -398,7 +398,7 @@ class VideoReader:
             return None
 
     def _get_frame_ffmpeg(self, time_ms: float) -> Optional[Image.Image]:
-        """Extract frame using FFmpeg (slow fallback)."""
+        """Extract frame using FFmpeg (slow fallback with accurate seek)."""
         import tempfile
         import os
 
@@ -408,10 +408,12 @@ class VideoReader:
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                 tmp_path = tmp.name
 
+            # Use -ss AFTER -i for accurate (but slower) frame-accurate seeking
+            # -ss before -i does fast seek to nearest keyframe (can be off by seconds)
             cmd = [
                 'ffmpeg', '-v', 'error',
-                '-ss', f'{time_sec:.3f}',
                 '-i', self.video_path,
+                '-ss', f'{time_sec:.3f}',  # Accurate seek (after -i)
                 '-vframes', '1',
                 '-pix_fmt', 'gray',  # Grayscale
                 '-q:v', '2',
@@ -419,7 +421,7 @@ class VideoReader:
                 tmp_path
             ]
 
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            result = subprocess.run(cmd, capture_output=True, timeout=60)  # Longer timeout for accurate seek
 
             if result.returncode != 0:
                 if os.path.exists(tmp_path):
