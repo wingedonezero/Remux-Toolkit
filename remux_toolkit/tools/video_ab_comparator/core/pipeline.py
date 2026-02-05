@@ -341,18 +341,29 @@ class ComparisonPipeline(QObject):
             if use_frame_mapper:
                 try:
                     self._emit("Loading frame timestamps for precise mapping...", 27)
+
+                    # Use frame offset from video-verified sync if available
+                    # This provides direct frame-to-frame mapping (more accurate)
+                    frame_offset = getattr(align, 'offset_frames', None)
+                    if frame_offset is not None:
+                        print(f"Using video-verified frame offset: {frame_offset:+d} frames")
+
                     self.frame_mapper = FrameMapper(
                         str(self.source_a.path),
                         str(self.source_b.path),
                         align.offset_sec,
-                        align.drift_ratio
+                        align.drift_ratio,
+                        offset_frames=frame_offset  # Direct frame mapping from video-verified sync
                     )
 
                     if self.frame_mapper.is_available():
-                        # Generate sync quality report
-                        quality = self.frame_mapper.get_sync_quality_report(sample_points=10)
-                        print(f"Frame mapping quality: {quality['exact_match_rate']:.1%} exact matches, "
-                              f"avg drift {quality['avg_drift_ms']:.2f}ms, max drift {quality['max_drift_ms']:.2f}ms")
+                        if frame_offset is not None:
+                            print(f"Frame mapping: Using direct frame offset ({frame_offset:+d} frames)")
+                        else:
+                            # Generate sync quality report for timestamp-based mapping
+                            quality = self.frame_mapper.get_sync_quality_report(sample_points=10)
+                            print(f"Frame mapping quality: {quality['exact_match_rate']:.1%} exact matches, "
+                                  f"avg drift {quality['avg_drift_ms']:.2f}ms, max drift {quality['max_drift_ms']:.2f}ms")
                     else:
                         print("Note: Using time-based frame seeking (VideoTimestamps not detected)")
                         self.frame_mapper = None

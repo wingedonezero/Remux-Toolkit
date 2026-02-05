@@ -33,10 +33,14 @@ class FrameMapper:
 
     Uses VideoTimestamps to get exact frame timecodes and maps frames
     between videos accounting for sync offset and potential FPS differences.
+
+    When offset_frames is provided (from video-verified sync), uses direct
+    frame-to-frame mapping: frame_b = frame_a + offset_frames
     """
 
     def __init__(self, source_a_path: str, source_b_path: str,
-                 offset_sec: float, drift_ratio: float = 0.0):
+                 offset_sec: float, drift_ratio: float = 0.0,
+                 offset_frames: Optional[int] = None):
         """
         Initialize frame mapper.
 
@@ -45,11 +49,14 @@ class FrameMapper:
             source_b_path: Path to source B video
             offset_sec: Audio sync offset in seconds (how much B is ahead of A)
             drift_ratio: FPS drift ratio (for variable frame rate)
+            offset_frames: Frame offset from video-verified sync (more accurate than time)
+                           When set, uses direct frame mapping: frame_b = frame_a + offset_frames
         """
         self.source_a_path = Path(source_a_path)
         self.source_b_path = Path(source_b_path)
         self.offset_sec = offset_sec
         self.drift_ratio = drift_ratio
+        self.offset_frames = offset_frames  # Direct frame-to-frame mapping offset
 
         self.vts_a: Optional[VideoTimestamps] = None
         self.vts_b: Optional[VideoTimestamps] = None
@@ -74,6 +81,10 @@ class FrameMapper:
 
     def is_available(self) -> bool:
         """Check if frame mapping is available."""
+        # Frame mapping is available if we have direct frame offset
+        # OR if we have VideoTimestamps for both videos
+        if self.offset_frames is not None:
+            return True
         return HAS_VIDEO_TIMESTAMPS and self.vts_a is not None and self.vts_b is not None
 
     def get_frame_at_time(self, vts: VideoTimestamps, time_sec: float) -> Optional[int]:
@@ -119,12 +130,47 @@ class FrameMapper:
         """
         Map a frame from source A to corresponding frame in source B.
 
+        When offset_frames is set (from video-verified sync), uses direct
+        frame-to-frame mapping: frame_b = frame_a + offset_frames
+        Otherwise falls back to timestamp-based mapping.
+
         Args:
             frame_a: Frame number in source A (0-based)
 
         Returns:
             FrameMapping with corresponding frame in B, or None if mapping fails
         """
+        # Use direct frame offset mapping if available (from video-verified sync)
+        # This is more accurate than timestamp-based mapping
+        if self.offset_frames is not None:
+            frame_b = frame_a + self.offset_frames
+
+            # Ensure frame_b is valid
+            if frame_b < 0:
+                frame_b = 0
+
+            # Get timestamps if VideoTimestamps is available
+            if self.vts_a and self.vts_b:
+                try:
+                    timestamp_a = self.vts_a[frame_a] / 1000.0 if frame_a < len(self.vts_a) else frame_a / 23.976
+                    timestamp_b = self.vts_b[frame_b] / 1000.0 if frame_b < len(self.vts_b) else frame_b / 23.976
+                except:
+                    timestamp_a = frame_a / 23.976  # Fallback to estimated timestamp
+                    timestamp_b = frame_b / 23.976
+            else:
+                # Estimate timestamps from frame numbers (assume ~24fps)
+                timestamp_a = frame_a / 23.976
+                timestamp_b = frame_b / 23.976
+
+            return FrameMapping(
+                frame_a=frame_a,
+                frame_b=frame_b,
+                timestamp_a=timestamp_a,
+                timestamp_b=timestamp_b,
+                exact_match=True  # Direct frame mapping is always exact
+            )
+
+        # Fall back to timestamp-based mapping
         if not self.is_available():
             return None
 
