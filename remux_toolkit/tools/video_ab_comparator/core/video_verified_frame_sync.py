@@ -130,14 +130,20 @@ def compute_ssim(frame1: Image.Image, frame2: Image.Image) -> float:
     Compute Structural Similarity Index between two frames.
 
     Args:
-        frame1: First PIL Image (grayscale)
-        frame2: Second PIL Image (grayscale)
+        frame1: First PIL Image (RGB or grayscale)
+        frame2: Second PIL Image (RGB or grayscale)
 
     Returns:
         SSIM value (0-1, higher = more similar)
     """
     try:
         from skimage.metrics import structural_similarity as ssim
+
+        # Convert to grayscale if RGB (SSIM works best on grayscale)
+        if frame1.mode == 'RGB':
+            frame1 = frame1.convert('L')
+        if frame2.mode == 'RGB':
+            frame2 = frame2.convert('L')
 
         # Convert to numpy arrays
         arr1 = np.array(frame1)
@@ -149,8 +155,8 @@ def compute_ssim(frame1: Image.Image, frame2: Image.Image) -> float:
             frame2_resized = frame2.resize(frame1.size, Image.Resampling.LANCZOS)
             arr2 = np.array(frame2_resized)
 
-        # Compute SSIM
-        score = ssim(arr1, arr2)
+        # Compute SSIM with explicit data_range for 8-bit images
+        score = ssim(arr1, arr2, data_range=255)
         return float(score)
 
     except ImportError:
