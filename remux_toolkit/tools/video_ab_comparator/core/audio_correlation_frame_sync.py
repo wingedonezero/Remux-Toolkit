@@ -346,35 +346,59 @@ class VideoReader:
             return self._get_frame_ffmpeg(time_ms)
 
     def _get_frame_vapoursynth_by_index(self, frame_num: int) -> Optional[Image.Image]:
-        """Extract frame using VapourSynth (frame-accurate)."""
+        """Extract frame using VapourSynth (frame-accurate).
+
+        Converts to RGB24 to match Video-Sync-GUI behavior, which produces
+        consistent hash values with imagehash library.
+        """
         try:
+            import vapoursynth as vs
+
             # Clamp to valid range
             frame_num = max(0, min(frame_num, len(self.vs_clip) - 1))
 
+            # Convert to RGB24 if needed (matching Video-Sync-GUI)
+            clip = self.vs_clip
+            if clip.format.color_family == vs.YUV:
+                core = vs.core
+                clip = core.resize.Bicubic(clip, format=vs.RGB24, matrix_in_s="709")
+            elif clip.format.color_family == vs.GRAY:
+                # Convert grayscale to RGB
+                core = vs.core
+                clip = core.resize.Bicubic(clip, format=vs.RGB24)
+
             # Get frame directly by index
-            frame = self.vs_clip.get_frame(frame_num)
+            frame = clip.get_frame(frame_num)
 
-            # Extract Y (luma) plane as grayscale
-            y_plane = np.asarray(frame[0])
+            # Extract R, G, B planes and stack into RGB array
+            r_plane = np.asarray(frame[0])
+            g_plane = np.asarray(frame[1])
+            b_plane = np.asarray(frame[2])
 
-            # Normalize bit depth to 8-bit
-            if y_plane.dtype == np.uint16:
-                max_val = y_plane.max()
-                if max_val <= 1023:  # 10-bit
-                    y_plane = (y_plane >> 2).astype(np.uint8)
-                else:  # 12-bit or 16-bit
-                    y_plane = (y_plane >> 8).astype(np.uint8)
-            elif y_plane.dtype != np.uint8:
-                y_plane = y_plane.astype(np.uint8)
+            # Normalize bit depth to 8-bit if needed
+            if r_plane.dtype == np.uint16:
+                r_plane = (r_plane >> 8).astype(np.uint8)
+                g_plane = (g_plane >> 8).astype(np.uint8)
+                b_plane = (b_plane >> 8).astype(np.uint8)
+            elif r_plane.dtype != np.uint8:
+                r_plane = r_plane.astype(np.uint8)
+                g_plane = g_plane.astype(np.uint8)
+                b_plane = b_plane.astype(np.uint8)
 
-            return Image.fromarray(y_plane, 'L')
+            # Stack into RGB array (height, width, 3)
+            rgb_array = np.stack([r_plane, g_plane, b_plane], axis=2)
+
+            return Image.fromarray(rgb_array, 'RGB')
 
         except Exception as e:
             print(f"[VideoReader] VapourSynth frame extraction failed: {e}")
             return None
 
     def _get_frame_ffms2_by_index(self, frame_num: int) -> Optional[Image.Image]:
-        """Extract frame using pyffms2 (frame-accurate)."""
+        """Extract frame using pyffms2 (frame-accurate).
+
+        Extracts RGB data to match Video-Sync-GUI behavior.
+        """
         try:
             # Clamp to valid range
             frame_num = max(0, min(frame_num, self.ffms2_source.properties.NumFrames - 1))
@@ -382,20 +406,37 @@ class VideoReader:
             # Get frame directly by index
             frame = self.ffms2_source.get_frame(frame_num)
 
-            # Get Y plane
-            frame_array = frame.planes[0]
+            # Check if we have RGB or YUV data
+            # pyffms2 typically provides YUV, so we need to handle both cases
+            if len(frame.planes) >= 3:
+                # Try to get RGB planes
+                r_plane = frame.planes[0]
+                g_plane = frame.planes[1]
+                b_plane = frame.planes[2]
 
-            # Normalize bit depth
-            if frame_array.dtype == np.uint16:
-                max_val = frame_array.max()
-                if max_val <= 1023:  # 10-bit
-                    frame_array = (frame_array >> 2).astype(np.uint8)
-                else:  # 12-bit or 16-bit
+                # Normalize bit depth
+                if r_plane.dtype == np.uint16:
+                    r_plane = (r_plane >> 8).astype(np.uint8)
+                    g_plane = (g_plane >> 8).astype(np.uint8)
+                    b_plane = (b_plane >> 8).astype(np.uint8)
+                elif r_plane.dtype != np.uint8:
+                    r_plane = r_plane.astype(np.uint8)
+                    g_plane = g_plane.astype(np.uint8)
+                    b_plane = b_plane.astype(np.uint8)
+
+                # Stack into RGB array
+                rgb_array = np.stack([r_plane, g_plane, b_plane], axis=2)
+                return Image.fromarray(rgb_array, 'RGB')
+            else:
+                # Fallback to grayscale if only one plane
+                frame_array = frame.planes[0]
+
+                if frame_array.dtype == np.uint16:
                     frame_array = (frame_array >> 8).astype(np.uint8)
-            elif frame_array.dtype != np.uint8:
-                frame_array = frame_array.astype(np.uint8)
+                elif frame_array.dtype != np.uint8:
+                    frame_array = frame_array.astype(np.uint8)
 
-            return Image.fromarray(frame_array, 'L')
+                return Image.fromarray(frame_array, 'L')
 
         except Exception as e:
             print(f"[VideoReader] FFMS2 frame extraction failed: {e}")
