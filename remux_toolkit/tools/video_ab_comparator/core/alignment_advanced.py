@@ -70,6 +70,7 @@ class AlignResult:
     chunk_results: List[Dict]  # Individual chunk results
     accepted_count: int  # Number of accepted chunks
     method: str = "SCC"  # Correlation method used
+    offset_frames: Optional[int] = None  # Frame offset from video-verified sync (more accurate than time)
 
 
 def _normalize_lang(lang: Optional[str]) -> Optional[str]:
@@ -364,6 +365,9 @@ def advanced_align(source_a_path: str, source_b_path: str,
     print(f"\nAudio alignment: offset={final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms), "
           f"confidence={final_confidence:.2%}, accepted={len(accepted_chunks)}/{chunk_count_int}")
 
+    # Track verified frame offset for frame-to-frame mapping
+    verified_frame_offset = None
+
     # Video-verified frame sync for frame-perfect accuracy
     # Uses consecutive frame matching at multiple checkpoints (no sliding window)
     if config.visual_verification and final_offset_sec != 0.0:
@@ -402,6 +406,7 @@ def advanced_align(source_a_path: str, source_b_path: str,
             if frame_sync_result.success:
                 # Frame verification passed - use verified offset
                 frame_corrected_offset_sec = frame_sync_result.offset_ms / 1000.0
+                verified_frame_offset = frame_sync_result.offset_frames  # Store for frame-to-frame mapping
 
                 print(f"\n✓ Video-verified frame sync successful!")
                 print(f"  Audio offset: {final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms)")
@@ -447,5 +452,6 @@ def advanced_align(source_a_path: str, source_b_path: str,
         confidence=final_confidence,
         chunk_results=chunk_results,
         accepted_count=len(accepted_chunks),
-        method=method_str
+        method=method_str,
+        offset_frames=verified_frame_offset  # Frame offset for direct frame-to-frame mapping
     )
