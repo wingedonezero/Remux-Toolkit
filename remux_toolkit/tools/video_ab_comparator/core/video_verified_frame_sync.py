@@ -328,15 +328,6 @@ def verify_frame_sequence(
             distances.append(float('inf'))
             continue
 
-        # Debug: show first frame comparison details
-        if i == 0:
-            import numpy as np
-            src_arr = np.array(source_frame)
-            tgt_arr = np.array(target_frame)
-            # Show mean pixel values to verify frames are different
-            print(f"[FrameDebug] Source frame {source_idx}: size={source_frame.size}, mean={src_arr.mean():.1f}")
-            print(f"[FrameDebug] Target frame {target_idx}: size={target_frame.size}, mean={tgt_arr.mean():.1f}")
-
         # Compare frames
         distance, is_match = compare_frames(
             source_frame, target_frame,
@@ -345,10 +336,6 @@ def verify_frame_sequence(
             hash_size=hash_size,
             hash_threshold=hash_threshold
         )
-
-        # Debug: show first comparison result
-        if i == 0:
-            print(f"[FrameDebug] Distance={distance}, is_match={is_match}")
 
         distances.append(distance)
         if is_match:
@@ -365,7 +352,9 @@ def verify_frame_sequence(
             verified=False
         )
 
-    min_matches = int(valid_count * match_threshold_pct / 100.0)
+    # Use sequence_length (not valid_count) for threshold calculation
+    # This matches Video-Sync-GUI: min_sequence_matches = int(sequence_verify_length * 0.7)
+    min_matches = int(sequence_length * match_threshold_pct / 100.0)
     verified = matched >= min_matches
 
     avg_dist = sum(d for d in distances if d != float('inf')) / valid_count
@@ -403,8 +392,12 @@ def measure_frame_offset_quality(
     For each checkpoint:
     1. Calculate source frame index from checkpoint time
     2. Calculate target frame index = source + offset
-    3. Verify sequence of consecutive frames at exact positions
-    4. Track how many checkpoints have verified sequences
+    3. Compare initial frame to get initial_match
+    4. Verify sequence of consecutive frames at exact positions
+    5. Score using 3-tier system (matching Video-Sync-GUI):
+       - sequence_verified: 2.0 * (matched/total)
+       - initial_match only: 0.3 (flat)
+       - no match: max(0, 0.1 - (distance / (threshold * 4)))
 
     Args:
         frame_offset: Candidate frame offset to test
@@ -428,6 +421,7 @@ def measure_frame_offset_quality(
     total_score = 0.0
     total_distance = 0.0
     verified_count = 0
+    distances = []
 
     for idx, checkpoint_sec in enumerate(checkpoint_times):
         checkpoint_ms = checkpoint_sec * 1000.0
@@ -444,7 +438,23 @@ def measure_frame_offset_quality(
         if target_frame_idx < 0:
             continue
 
-        # Verify sequence at this checkpoint
+        # Step 1: Compare initial frame to get initial_match (matching Video-Sync-GUI)
+        source_frame = source_reader.get_frame_at_index(source_frame_idx)
+        target_frame = target_reader.get_frame_at_index(target_frame_idx)
+
+        if source_frame is None or target_frame is None:
+            continue
+
+        initial_distance, initial_match = compare_frames(
+            source_frame, target_frame,
+            method=comparison_method,
+            hash_algorithm=hash_algorithm,
+            hash_size=hash_size,
+            hash_threshold=hash_threshold
+        )
+        distances.append(initial_distance)
+
+        # Step 2: Verify sequence at this checkpoint
         result = verify_frame_sequence(
             source_reader,
             target_reader,
@@ -470,20 +480,24 @@ def measure_frame_offset_quality(
         )
         checkpoint_details.append(checkpoint_quality)
 
+        # Step 3: 3-tier scoring (matching Video-Sync-GUI exactly)
         if result.verified:
+            # Sequence verified - highest score
             verified_count += 1
-            # Score: 2.0 for verified, scaled by match ratio
-            total_score += 2.0 * (result.matched_count / result.total_count)
+            seq_ratio = result.matched_count / result.total_count
+            total_score += 2.0 * seq_ratio
+        elif initial_match:
+            # Initial frame matches but sequence not verified - partial score
+            total_score += 0.3  # Flat 0.3 (Video-Sync-GUI convention)
         else:
-            # Partial score for partial matches
-            total_score += 0.3 * (result.matched_count / max(result.total_count, 1))
+            # No match - small score based on distance
+            total_score += max(0, 0.1 - (initial_distance / (hash_threshold * 4)))
 
         if result.avg_distance != float('inf'):
             total_distance += result.avg_distance
 
-    # Calculate average distance
-    valid_checkpoints = len([c for c in checkpoint_details if c.avg_distance != float('inf')])
-    avg_distance = total_distance / valid_checkpoints if valid_checkpoints > 0 else float('inf')
+    # Calculate average distance (from initial frame comparisons, matching Video-Sync-GUI)
+    avg_distance = sum(distances) / len(distances) if distances else float('inf')
 
     offset_ms = frame_offset * frame_duration_ms
 
