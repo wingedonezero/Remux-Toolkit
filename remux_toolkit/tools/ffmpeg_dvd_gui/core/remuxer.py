@@ -351,6 +351,14 @@ class FFmpegDVDWorker(QObject):
                         cmd.extend(["-map", "0"])
                         cmd.extend(["-c", "copy"])
 
+                        # DVD cell boundaries can cause timestamp
+                        # discontinuities that lead to audio packet loss:
+                        # - Queue overflow when muxer buffers fill during
+                        #   large PTS gaps between cells
+                        # - Negative PTS from cell boundary timestamp resets
+                        cmd.extend(["-max_muxing_queue_size", "9999"])
+                        cmd.extend(["-avoid_negative_ts", "make_zero"])
+
                         # Extra args
                         if extra := self.settings.get("extra_args", "").strip():
                             cmd.extend(shlex.split(extra))
