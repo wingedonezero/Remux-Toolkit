@@ -90,6 +90,14 @@ class PrefsDialog(QDialog):
         self.region_spin.setSpecialValueText("Auto (0)")
         dvd_form.addRow("Region code:", self.region_spin)
 
+        self.chk_max_mux_queue = QCheckBox("Increase muxer queue size (-max_muxing_queue_size 9999)")
+        self.chk_max_mux_queue.setChecked(self.settings.get("max_muxing_queue_size", False))
+        dvd_form.addRow("", self.chk_max_mux_queue)
+
+        self.chk_avoid_neg_ts = QCheckBox("Shift timestamps to zero (-avoid_negative_ts make_zero)")
+        self.chk_avoid_neg_ts.setChecked(self.settings.get("avoid_negative_ts", False))
+        dvd_form.addRow("", self.chk_avoid_neg_ts)
+
         dvd_group.setLayout(dvd_form)
         layout.addWidget(dvd_group)
 
@@ -168,6 +176,8 @@ class PrefsDialog(QDialog):
             "enable_preindex": self.chk_preindex.isChecked(),
             "trim_padding": self.chk_trim.isChecked(),
             "default_region": int(self.region_spin.value()),
+            "max_muxing_queue_size": self.chk_max_mux_queue.isChecked(),
+            "avoid_negative_ts": self.chk_avoid_neg_ts.isChecked(),
             "chapter_naming": self.chapter_combo.currentData(),
             "extra_args": self.extra_args.text().strip(),
         }
