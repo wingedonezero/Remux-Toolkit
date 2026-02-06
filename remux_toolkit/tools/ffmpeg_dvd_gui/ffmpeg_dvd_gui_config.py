@@ -10,6 +10,8 @@ DEFAULTS = {
     "trim_padding": True,  # Use -trim option
     "default_region": 0,  # 0 = world/auto
     "chapter_naming": "numbered",  # "numbered" or "unnamed"
+    "max_muxing_queue_size": False,  # -max_muxing_queue_size 9999
+    "avoid_negative_ts": False,  # -avoid_negative_ts make_zero
     "extra_args": "",
     "preserve_structure": True,
     "col_widths": [],
