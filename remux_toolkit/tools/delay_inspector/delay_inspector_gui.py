@@ -220,6 +220,12 @@ class DelayInspectorWidget(QtWidgets.QWidget):
         if r != -1:
             self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(text))
 
+    def save_settings(self):
+        pass
+
+    def shutdown(self):
+        self.threadpool.waitForDone(3000)
+
 def format_result_text(res: core.FileResult) -> str:
     def row(kind, idx, start_s, relative_ms, lang, codec, title):
         apply_ms = -relative_ms
