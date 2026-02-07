@@ -44,11 +44,23 @@ class ExecutionWorker(QtCore.QThread):
     def __init__(self, command, parent=None):
         super().__init__(parent)
         self.command = command
+        self._process = None
+        self._stopped = False
+
+    def stop(self):
+        """Request the worker to stop and kill the mkvmerge subprocess."""
+        self._stopped = True
+        proc = self._process
+        if proc:
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
     def run(self):
         try:
             # Popen with settings for real-time text output
-            proc = subprocess.Popen(
+            self._process = subprocess.Popen(
                 shlex.split(self.command),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -58,15 +70,24 @@ class ExecutionWorker(QtCore.QThread):
                 bufsize=1
             )
             # Read output line by line as it comes in
-            for line in iter(proc.stdout.readline, ''):
+            for line in iter(self._process.stdout.readline, ''):
+                if self._stopped:
+                    break
                 self.line_ready.emit(line.strip())
 
-            proc.stdout.close()
-            return_code = proc.wait()
+            self._process.stdout.close()
+            if self._stopped:
+                self._process.kill()
+                self._process.wait()
+                return
+            return_code = self._process.wait()
             self.finished.emit(return_code)
         except Exception as e:
-            self.line_ready.emit(f"FATAL EXECUTION ERROR: {e}")
-            self.finished.emit(-1)
+            if not self._stopped:
+                self.line_ready.emit(f"FATAL EXECUTION ERROR: {e}")
+                self.finished.emit(-1)
+        finally:
+            self._process = None
 
 class MKVSplitterWidget(QtWidgets.QWidget):
     def __init__(self, app_manager, parent=None):
@@ -318,11 +339,16 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.app_manager.save_config(self.tool_name, settings)
 
     def shutdown(self):
-        # --- FIX: Use a graceful shutdown instead of terminate() ---
-        # Wait for any running workers to finish before shutting down.
         if self.analysis_worker and self.analysis_worker.isRunning():
             self.analysis_worker.quit()
-            self.analysis_worker.wait()
+            if not self.analysis_worker.wait(3000):
+                self.analysis_worker.terminate()
+                self.analysis_worker.wait()
         if self.execution_worker and self.execution_worker.isRunning():
+            self.execution_worker.stop()
             self.execution_worker.quit()
-            self.execution_worker.wait()
+            if not self.execution_worker.wait(3000):
+                self.execution_worker.terminate()
+                self.execution_worker.wait()
+        self.analysis_worker = None
+        self.execution_worker = None
