@@ -138,13 +138,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         tool_name_to_remove = next((name for name, widget in self.open_tools.items() if widget == widget_to_close), None)
 
-        if hasattr(widget_to_close, 'save_settings'):
-            print(f"Saving settings for {tool_name_to_remove}...")
-            widget_to_close.save_settings()
+        try:
+            if hasattr(widget_to_close, 'save_settings'):
+                print(f"Saving settings for {tool_name_to_remove}...")
+                widget_to_close.save_settings()
+        except Exception as e:
+            print(f"Error saving settings for {tool_name_to_remove}: {e}")
 
-        if hasattr(widget_to_close, 'shutdown'):
-            print(f"Closing tab for {tool_name_to_remove}. Shutting down worker...")
-            widget_to_close.shutdown()
+        try:
+            if hasattr(widget_to_close, 'shutdown'):
+                print(f"Closing tab for {tool_name_to_remove}. Shutting down worker...")
+                widget_to_close.shutdown()
+        except Exception as e:
+            print(f"Error shutting down {tool_name_to_remove}: {e}")
 
         self.tab_widget.removeTab(index)
         if tool_name_to_remove:
@@ -153,9 +159,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         print("Main window is closing. Saving all settings and shutting down threads...")
-        for tool_widget in list(self.open_tools.values()):
-            if hasattr(tool_widget, 'save_settings'):
-                tool_widget.save_settings()
-            if hasattr(tool_widget, 'shutdown'):
-                tool_widget.shutdown()
+        # Close all tabs properly - iterate in reverse to avoid index shifting
+        while self.tab_widget.count() > 0:
+            widget = self.tab_widget.widget(0)
+            tool_name = next((name for name, w in self.open_tools.items() if w == widget), None)
+            try:
+                if hasattr(widget, 'save_settings'):
+                    widget.save_settings()
+            except Exception as e:
+                print(f"Error saving settings for {tool_name}: {e}")
+            try:
+                if hasattr(widget, 'shutdown'):
+                    widget.shutdown()
+            except Exception as e:
+                print(f"Error shutting down {tool_name}: {e}")
+            self.tab_widget.removeTab(0)
+            if tool_name:
+                self.open_tools.pop(tool_name, None)
+            widget.deleteLater()
+        self.open_tools.clear()
         event.accept()

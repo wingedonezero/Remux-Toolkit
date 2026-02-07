@@ -159,4 +159,11 @@ class SilenceCheckerWidget(QtWidgets.QWidget):
     def _apply_result(self, row: int, res: core.SilenceResult, target_ms: int, tol_ms: int):
         leading = int(round(res.leading_silence_ms)); self.table.item(row, 8).setText(str(leading)); verdict = "n/a" if target_ms <= 0 else ("SAFE" if leading + tol_ms >= target_ms else "RISK"); self.table.item(row, 9).setText(verdict)
         snippet = "\n".join(res.details.splitlines()[-20:]); self.append_log(f"Row {row}: leading={leading} ms, target={target_ms} ms -> {verdict}\n{snippet}\n")
-    def shutdown(self): self.thread.quit(); self.thread.wait(2000)
+    def shutdown(self):
+        if self.thread and self.thread.isRunning():
+            self.thread.quit()
+            if not self.thread.wait(3000):
+                self.thread.terminate()
+                self.thread.wait()
+        self.thread = None
+        self.worker = None

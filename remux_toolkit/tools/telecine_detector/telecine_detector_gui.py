@@ -15,6 +15,7 @@ class TelecineDetectorWidget(QtWidgets.QWidget):
         self.tool_name = 'telecine_detector'
         self.setAcceptDrops(True)
         self.results: Dict[str, core.IdetResult] = {}
+        self.worker = None
         self.worker_thread = None
 
         # --- NEW: Queue for sequential analysis ---
@@ -167,7 +168,6 @@ class TelecineDetectorWidget(QtWidgets.QWidget):
         self.worker.moveToThread(self.worker_thread)
         self.worker.finished.connect(self.on_analysis_finished)
         self.worker_thread.started.connect(lambda p=file_path: self.worker.analyze(p))
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
         self.worker_thread.start()
 
     @QtCore.pyqtSlot(str, core.IdetResult)
@@ -185,8 +185,11 @@ class TelecineDetectorWidget(QtWidgets.QWidget):
                 if self.table.currentRow() == row: self.update_detail_view()
                 break
 
-        self.worker_thread.quit()
-        self.worker_thread.wait()
+        if self.worker_thread:
+            self.worker_thread.quit()
+            self.worker_thread.wait()
+            self.worker_thread = None
+        self.worker = None
 
         # --- NEW: Trigger the next item in the queue ---
         self._start_next_in_queue()
@@ -220,6 +223,24 @@ class TelecineDetectorWidget(QtWidgets.QWidget):
         self.analyze_selected_btn.setEnabled(enabled)
 
     def shutdown(self):
+        # Clear the queue so no new analyses start
+        self.analysis_queue.clear()
+        self.is_analyzing = False
+
+        # Stop the worker (kills the FFmpeg subprocess)
+        if self.worker:
+            try:
+                self.worker.finished.disconnect(self.on_analysis_finished)
+            except (TypeError, RuntimeError):
+                pass
+            self.worker.stop()
+
+        # Wait for the thread to finish, with a terminate fallback
         if self.worker_thread and self.worker_thread.isRunning():
             self.worker_thread.quit()
-            self.worker_thread.wait(2000)
+            if not self.worker_thread.wait(3000):
+                self.worker_thread.terminate()
+                self.worker_thread.wait()
+
+        self.worker_thread = None
+        self.worker = None

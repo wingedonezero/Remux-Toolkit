@@ -102,15 +102,47 @@ class IdetResult:
 
 class Worker(QObject):
     finished = pyqtSignal(str, IdetResult)
-    def __init__(self, settings: dict): super().__init__(); self.settings = settings
+
+    def __init__(self, settings: dict):
+        super().__init__()
+        self.settings = settings
+        self._process: Optional[subprocess.Popen] = None
+        self._stopped = False
+
+    def stop(self):
+        """Request the worker to stop and kill any running subprocess."""
+        self._stopped = True
+        proc = self._process
+        if proc:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
     @pyqtSlot(str)
     def analyze(self, file_path: str):
         result = IdetResult()
+        if self._stopped:
+            return
         try:
             duration = self.settings.get('scan_duration_s', DEFAULTS['scan_duration_s'])
             cmd = ["ffmpeg", "-nostdin", "-t", str(duration), "-i", file_path, "-vf", "idet", "-an", "-sn", "-dn", "-f", "null", "-"]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
-            _, stderr = proc.communicate(timeout=duration + 15)
+            self._process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+            try:
+                _, stderr = self._process.communicate(timeout=duration + 15)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait()
+                result.error = "Analysis timed out."
+                if not self._stopped:
+                    self.finished.emit(file_path, result)
+                return
+            finally:
+                self._process = None
+
+            if self._stopped:
+                return
+
             result.raw_output = stderr
 
             for line in stderr.splitlines():
@@ -126,6 +158,7 @@ class Worker(QObject):
                     parts = line.split("Multi frame detection:")[-1]
                     m = re.search(r'TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)', parts)
                     if m: result.multi_tff, result.multi_bff, result.multi_prog, result.multi_und = map(int, m.groups())
-        except subprocess.TimeoutExpired: result.error = "Analysis timed out."
-        except Exception as e: result.error = f"An unexpected error occurred: {e}"
-        self.finished.emit(file_path, result)
+        except Exception as e:
+            result.error = f"An unexpected error occurred: {e}"
+        if not self._stopped:
+            self.finished.emit(file_path, result)
