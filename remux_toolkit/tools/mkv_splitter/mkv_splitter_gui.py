@@ -89,6 +89,114 @@ class ExecutionWorker(QtCore.QThread):
         finally:
             self._process = None
 
+class BatchAnalysisWorker(QtCore.QThread):
+    """Worker to analyze multiple MKV files for batch mode."""
+    result = QtCore.pyqtSignal(str, list)  # log, list of (file_path, command) tuples
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, file_paths, chapters_to_remove):
+        super().__init__()
+        self.file_paths = file_paths
+        self.chapters_to_remove = chapters_to_remove
+
+    def run(self):
+        try:
+            log_lines = []
+            commands = []
+            for file_path in self.file_paths:
+                fname = os.path.basename(file_path)
+                log_lines.append(f"--- Analyzing: {fname} ---")
+                mkv_info, err = core.get_mkv_info(file_path)
+                if err:
+                    log_lines.append(f"  ❌ Error: {err}")
+                    continue
+
+                analysis_log, split_points = core.analyze_chapters(
+                    mkv_info, 15.0, self.chapters_to_remove,
+                    "Remove Chapters from End", 23.0
+                )
+                log_lines.append(analysis_log)
+
+                if split_points:
+                    cmd = core.generate_mkvmerge_command(file_path, split_points, [])
+                    commands.append((file_path, cmd))
+                    log_lines.append(f"  ✅ Command generated")
+                else:
+                    log_lines.append(f"  ⚠️ No split points generated")
+                log_lines.append("")
+
+            log_lines.append(f"\n--- BATCH SUMMARY: {len(commands)}/{len(self.file_paths)} files ready ---")
+            self.result.emit("\n".join(log_lines), commands)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class BatchExecutionWorker(QtCore.QThread):
+    """Worker to execute multiple mkvmerge commands sequentially for batch mode."""
+    line_ready = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal(int)
+
+    def __init__(self, commands, parent=None):
+        super().__init__(parent)
+        self.commands = commands  # list of (file_path, command_string) tuples
+        self._process = None
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+        proc = self._process
+        if proc:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def run(self):
+        total = len(self.commands)
+        failed = 0
+        for idx, (file_path, command) in enumerate(self.commands, 1):
+            if self._stopped:
+                break
+            self.line_ready.emit(f"\n--- [{idx}/{total}] Processing: {os.path.basename(file_path)} ---")
+            self.line_ready.emit(f"Command: {command}\n")
+            try:
+                self._process = subprocess.Popen(
+                    shlex.split(command),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    bufsize=1
+                )
+                for line in iter(self._process.stdout.readline, ''):
+                    if self._stopped:
+                        break
+                    self.line_ready.emit(line.strip())
+
+                self._process.stdout.close()
+                if self._stopped:
+                    self._process.kill()
+                    self._process.wait()
+                    return
+                return_code = self._process.wait()
+                if return_code != 0:
+                    failed += 1
+                    self.line_ready.emit(f"  ⚠️ Exit code: {return_code}")
+                else:
+                    self.line_ready.emit(f"  ✅ Done")
+            except Exception as e:
+                if not self._stopped:
+                    self.line_ready.emit(f"  FATAL ERROR: {e}")
+                    failed += 1
+            finally:
+                self._process = None
+
+        if not self._stopped:
+            self.line_ready.emit(f"\n--- BATCH COMPLETE: {total - failed}/{total} succeeded ---")
+            self.finished.emit(0 if failed == 0 else 1)
+
+
 class MKVSplitterWidget(QtWidgets.QWidget):
     def __init__(self, app_manager, parent=None):
         super().__init__(parent)
@@ -97,6 +205,7 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.analysis_worker = None
         self.execution_worker = None
         self.analysis_results = {}
+        self._batch_commands = []  # for batch mode
         self._init_ui()
         self._load_settings()
 
@@ -108,20 +217,24 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         top_pane = QtWidgets.QWidget()
         top_layout = QtWidgets.QVBoxLayout(top_pane)
 
-        input_group = QtWidgets.QGroupBox("Input File")
+        input_group = QtWidgets.QGroupBox("Input")
         input_layout = QtWidgets.QHBoxLayout(input_group)
         self.file_path_input = QtWidgets.QLineEdit()
         self.file_path_input.setPlaceholderText("Select or paste MKV file path...")
-        browse_btn = QtWidgets.QPushButton("Browse...")
+        browse_btn = QtWidgets.QPushButton("Browse File...")
         browse_btn.clicked.connect(self._select_file)
+        self.browse_folder_btn = QtWidgets.QPushButton("Browse Folder...")
+        self.browse_folder_btn.clicked.connect(self._select_folder)
+        self.browse_folder_btn.setVisible(False)
         input_layout.addWidget(self.file_path_input)
         input_layout.addWidget(browse_btn)
+        input_layout.addWidget(self.browse_folder_btn)
         top_layout.addWidget(input_group)
 
         analysis_group = QtWidgets.QGroupBox("Analysis Configuration")
         analysis_layout = QtWidgets.QFormLayout(analysis_group)
         self.analysis_mode_combo = QtWidgets.QComboBox()
-        self.analysis_modes = ["Time-based Grouping", "Pattern Recognition", "Statistical Gap Analysis", "Shortest Chapter Analysis", "Manual Episode Count"]
+        self.analysis_modes = ["Time-based Grouping", "Pattern Recognition", "Statistical Gap Analysis", "Shortest Chapter Analysis", "Manual Episode Count", "Remove Chapters from End"]
         self.analysis_mode_combo.addItems(self.analysis_modes)
         self.analysis_mode_combo.currentTextChanged.connect(self._on_mode_changed)
         analysis_layout.addRow("Analysis Mode:", self.analysis_mode_combo)
@@ -130,12 +243,14 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.target_duration_input = QtWidgets.QDoubleSpinBox(); self.target_duration_input.setSuffix(" min"); self.target_duration_input.setRange(1, 240)
         self.min_duration_input = QtWidgets.QDoubleSpinBox(); self.min_duration_input.setSuffix(" min"); self.min_duration_input.setRange(0.1, 240)
         self.num_episodes_input = QtWidgets.QSpinBox(); self.num_episodes_input.setRange(2, 100)
+        self.chapters_from_end_input = QtWidgets.QSpinBox(); self.chapters_from_end_input.setRange(1, 100)
 
         param_layout1 = QtWidgets.QFormLayout(); param_layout1.addRow("Target Episode Duration:", self.target_duration_input); w1 = QtWidgets.QWidget(); w1.setLayout(param_layout1)
         param_layout2 = QtWidgets.QFormLayout(); param_layout2.addRow("Min Content Duration:", self.min_duration_input); w2 = QtWidgets.QWidget(); w2.setLayout(param_layout2)
         param_layout3 = QtWidgets.QFormLayout(); param_layout3.addRow("Expected # of Episodes:", self.num_episodes_input); w3 = QtWidgets.QWidget(); w3.setLayout(param_layout3)
+        param_layout4 = QtWidgets.QFormLayout(); param_layout4.addRow("Chapters to Remove from End:", self.chapters_from_end_input); w4 = QtWidgets.QWidget(); w4.setLayout(param_layout4)
 
-        self.params_stack.addWidget(w1); self.params_stack.addWidget(w2); self.params_stack.addWidget(w3)
+        self.params_stack.addWidget(w1); self.params_stack.addWidget(w2); self.params_stack.addWidget(w3); self.params_stack.addWidget(w4)
         analysis_layout.addRow(self.params_stack)
 
         self.analyze_button = QtWidgets.QPushButton("Analyze File")
@@ -209,27 +324,63 @@ class MKVSplitterWidget(QtWidgets.QWidget):
     def _on_mode_changed(self, mode):
         if mode == "Time-based Grouping": self.params_stack.setCurrentIndex(0)
         elif mode == "Manual Episode Count": self.params_stack.setCurrentIndex(2)
+        elif mode == "Remove Chapters from End": self.params_stack.setCurrentIndex(3)
         else: self.params_stack.setCurrentIndex(1)
+
+        # Show/hide folder browse and update placeholder based on mode
+        is_remove_mode = mode == "Remove Chapters from End"
+        self.browse_folder_btn.setVisible(is_remove_mode)
+        if is_remove_mode:
+            self.file_path_input.setPlaceholderText("Select MKV file or folder of MKV files...")
+            self.analyze_button.setText("Analyze")
+        else:
+            self.file_path_input.setPlaceholderText("Select or paste MKV file path...")
+            self.analyze_button.setText("Analyze File")
 
     def _select_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select MKV File", "", "MKV Files (*.mkv)")
         if path: self.file_path_input.setText(path)
 
+    def _select_folder(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder of MKV Files")
+        if path: self.file_path_input.setText(path)
+
     def start_analysis(self):
         path = self.file_path_input.text()
         if not path or not os.path.exists(path):
-            self.log_output.setPlainText("Error: Please select a valid MKV file.")
+            self.log_output.setPlainText("Error: Please select a valid path.")
+            return
+
+        current_mode = self.analysis_mode_combo.currentText()
+
+        # Handle folder input for "Remove Chapters from End" mode
+        if os.path.isdir(path):
+            if current_mode != "Remove Chapters from End":
+                self.log_output.setPlainText("Error: Folder input is only supported in 'Remove Chapters from End' mode.")
+                return
+            mkv_files = sorted([
+                os.path.join(path, f) for f in os.listdir(path)
+                if f.lower().endswith('.mkv')
+            ])
+            if not mkv_files:
+                self.log_output.setPlainText("Error: No MKV files found in the selected folder.")
+                return
+            self._start_batch_analysis(mkv_files)
             return
 
         self.log_output.setPlainText("Analyzing, please wait...")
         self.final_command_output.clear()
         self.track_table.setRowCount(0)
+        self._batch_commands = []
         self._set_controls_enabled(False)
+
+        # Pass chapters_from_end via num_episodes slot for the new mode
+        num_episodes_val = self.chapters_from_end_input.value() if current_mode == "Remove Chapters from End" else self.num_episodes_input.value()
 
         self.analysis_worker = AnalysisWorker(
             path, self.min_duration_input.value(),
-            self.num_episodes_input.value(),
-            self.analysis_mode_combo.currentText(),
+            num_episodes_val,
+            current_mode,
             self.target_duration_input.value()
         )
         self.analysis_worker.result.connect(self._on_analysis_result)
@@ -245,8 +396,33 @@ class MKVSplitterWidget(QtWidgets.QWidget):
             self.analysis_worker.quit()
             self.analysis_worker.wait()
 
+    def _start_batch_analysis(self, mkv_files):
+        self.log_output.setPlainText(f"Analyzing {len(mkv_files)} MKV files, please wait...")
+        self.final_command_output.clear()
+        self.track_table.setRowCount(0)
+        self._batch_commands = []
+        self.analysis_results = {}
+        self._set_controls_enabled(False)
+
+        self.analysis_worker = BatchAnalysisWorker(
+            mkv_files, self.chapters_from_end_input.value()
+        )
+        self.analysis_worker.result.connect(self._on_batch_analysis_result)
+        self.analysis_worker.error.connect(self._on_analysis_error)
+        self.analysis_worker.finished.connect(self._on_analysis_finished)
+        self.analysis_worker.start()
+
+    def _on_batch_analysis_result(self, log, commands):
+        self._batch_commands = commands
+        self.log_output.setPlainText(log)
+        if commands:
+            self.final_command_output.setText(f"[Batch: {len(commands)} commands ready — click Execute to run all]")
+        else:
+            self.final_command_output.setText("")
+
     def _on_analysis_result(self, mkv_info, log, split_points):
         self.analysis_results = {'mkv_info': mkv_info, 'split_points': split_points}
+        self._batch_commands = []
         self.log_output.setPlainText(log)
         self._populate_track_table(mkv_info.get('tracks', []))
         self._generate_command()
@@ -295,6 +471,18 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.final_command_output.setText(command)
 
     def _execute_command(self):
+        # Batch mode execution
+        if self._batch_commands:
+            self.log_output.setPlainText(f"--- EXECUTING BATCH ({len(self._batch_commands)} files) ---\n")
+            self._set_controls_enabled(False)
+
+            self.execution_worker = BatchExecutionWorker(self._batch_commands)
+            self.execution_worker.line_ready.connect(lambda line: self.log_output.appendPlainText(line))
+            self.execution_worker.finished.connect(self._on_execution_finished)
+            self.execution_worker.start()
+            return
+
+        # Single file execution
         command = self.final_command_output.text()
         if not command:
             self.log_output.setPlainText("No command to execute. Please analyze a file and generate a command first.")
@@ -327,6 +515,7 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.target_duration_input.setValue(settings.get('target_duration', config.DEFAULTS['target_duration']))
         self.min_duration_input.setValue(settings.get('min_duration', config.DEFAULTS['min_duration']))
         self.num_episodes_input.setValue(settings.get('num_episodes', config.DEFAULTS['num_episodes']))
+        self.chapters_from_end_input.setValue(settings.get('chapters_from_end', config.DEFAULTS['chapters_from_end']))
 
     def save_settings(self):
         settings = {
@@ -335,11 +524,14 @@ class MKVSplitterWidget(QtWidgets.QWidget):
             'target_duration': self.target_duration_input.value(),
             'min_duration': self.min_duration_input.value(),
             'num_episodes': self.num_episodes_input.value(),
+            'chapters_from_end': self.chapters_from_end_input.value(),
         }
         self.app_manager.save_config(self.tool_name, settings)
 
     def shutdown(self):
         if self.analysis_worker and self.analysis_worker.isRunning():
+            if hasattr(self.analysis_worker, 'stop'):
+                self.analysis_worker.stop()
             self.analysis_worker.quit()
             if not self.analysis_worker.wait(3000):
                 self.analysis_worker.terminate()

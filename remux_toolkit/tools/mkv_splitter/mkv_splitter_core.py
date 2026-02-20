@@ -417,6 +417,20 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                 analysis_log.append(f"  Shortest chapter in gap is Chapter {min_duration_chapter['num']}")
                 split_points.append(min_duration_chapter['num'] + 1)
 
+    elif analysis_mode == "Remove Chapters from End":
+        chapters_to_remove = num_episodes  # reusing the param slot
+        total_chapters = len(chapter_durations)
+        analysis_log.append(f"\n--- Step 2 (Remove from End): Removing last {chapters_to_remove} chapter(s) ---")
+        analysis_log.append(f"  Total chapters: {total_chapters}")
+
+        if chapters_to_remove >= total_chapters:
+            analysis_log.append(f"❌ Cannot remove {chapters_to_remove} chapters from a file with only {total_chapters} chapters.")
+            return "\n".join(analysis_log), []
+
+        split_before = total_chapters - chapters_to_remove + 1
+        analysis_log.append(f"  Splitting before chapter {split_before} to keep chapters 1-{split_before - 1}")
+        split_points.append(split_before)
+
     elif analysis_mode == "Manual Episode Count":
         analysis_log.append(f"\n--- Step 2: Finding Main Content (Min Duration > {min_duration} min) ---")
         long_chapters = [ch for ch in chapter_durations if ch["duration_min"] > min_duration]

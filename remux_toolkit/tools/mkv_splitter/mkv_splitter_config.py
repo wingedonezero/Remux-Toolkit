@@ -6,4 +6,5 @@ DEFAULTS = {
     'target_duration': 23.0,
     'min_duration': 15.0,
     'num_episodes': 2,
+    'chapters_from_end': 1,
 }
