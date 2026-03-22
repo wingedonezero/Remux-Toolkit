@@ -18,6 +18,11 @@ VideoTimestamps
 av
 matplotlib
 
-# Frame-accurate video access (video-verified frame sync)
+# GPU-accelerated correlation + neural frame matching
+torch
+torchaudio
+isc-feature-extractor  # ISC neural frame matching (Meta ISC21 model)
+
+# Frame-accurate video access
 vapoursynth
-scikit-image  # For SSIM comparison method
+scikit-image
