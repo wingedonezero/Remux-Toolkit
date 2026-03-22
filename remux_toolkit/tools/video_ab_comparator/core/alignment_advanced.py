@@ -1,7 +1,11 @@
 # remux_toolkit/tools/video_ab_comparator/core/alignment_advanced.py
 """
-Advanced audio-based alignment using SCC correlation with configurable parameters.
-Based on Video-Sync-GUI audio_corr.py methodology.
+Advanced audio-based alignment using GPU-accelerated SCC correlation
+with ISC neural frame matching for frame-perfect accuracy.
+
+Based on Video-Sync-GUI methodology:
+- GPU PyTorch FFT for audio cross-correlation (with parabolic peak fit)
+- ISC neural feature matching for frame-level alignment verification
 """
 
 from __future__ import annotations
@@ -10,7 +14,6 @@ import numpy as np
 import subprocess
 import json
 from typing import Optional, List, Tuple, Dict
-from scipy.signal import correlate
 from pathlib import Path
 
 # Language normalization mapping (2-letter to 3-letter ISO codes)
@@ -49,16 +52,12 @@ class AlignmentConfig:
     # Language selection (None = use first audio track)
     audio_lang: Optional[str] = None
 
-    # Video-verified frame sync (consecutive frame matching)
-    visual_verification: bool = True  # Fine-tune with visual frame matching
-    visual_num_checkpoints: int = 5  # Checkpoints at 15%, 30%, 50%, 70%, 85%
-    visual_sequence_length: int = 10  # Consecutive frames to verify per checkpoint
-    visual_candidate_range: int = 3  # Search ±N frames around audio correlation
-    visual_comparison_method: str = "hash"  # Comparison method ('hash' or 'ssim')
-    visual_hash_algorithm: str = "dhash"  # Hash method ('dhash', 'phash', 'average_hash', 'whash')
-    visual_hash_size: int = 8  # Hash size (8x8 = 64 bits)
-    visual_hash_threshold: int = 5  # Max hamming distance per frame
-    visual_match_threshold_pct: float = 70.0  # % of sequence that must match
+    # Neural frame matching (ISC model)
+    visual_verification: bool = True  # Fine-tune with ISC neural frame matching
+    neural_num_positions: int = 3  # Test positions across video (at 20%, 50%, 80%)
+    neural_window_seconds: int = 10  # Duration of frame window per position
+    neural_slide_range_seconds: int = 5  # ±N seconds sliding range
+    neural_batch_size: int = 32  # GPU batch size for ISC feature extraction
 
 
 @dataclass
@@ -167,7 +166,9 @@ def decode_audio_to_memory(file_path: str, stream_index: int, sample_rate: int,
 def find_delay_scc(ref_chunk: np.ndarray, tgt_chunk: np.ndarray,
                    sample_rate: int, peak_fit: bool = True) -> Tuple[float, float]:
     """
-    Calculate delay using Standard Cross-Correlation (SCC).
+    Calculate delay using GPU-accelerated Standard Cross-Correlation (SCC).
+
+    Uses PyTorch FFT for GPU acceleration with automatic CPU fallback.
 
     Args:
         ref_chunk: Reference audio chunk
@@ -178,37 +179,55 @@ def find_delay_scc(ref_chunk: np.ndarray, tgt_chunk: np.ndarray,
     Returns:
         (delay_ms, match_pct): Delay in milliseconds and match percentage (0-100)
     """
-    # Normalize chunks (zero mean, unit variance)
-    ref_norm = (ref_chunk - np.mean(ref_chunk)) / (np.std(ref_chunk) + 1e-9)
-    tgt_norm = (tgt_chunk - np.mean(tgt_chunk)) / (np.std(tgt_chunk) + 1e-9)
+    try:
+        import torch
+        from .gpu_backend import get_device, to_torch
+        from .gpu_correlation import extract_peak, scc_confidence
 
-    # Compute cross-correlation using FFT method
-    corr = correlate(ref_norm, tgt_norm, mode='full', method='fft')
+        device = get_device()
+        ref = to_torch(ref_chunk, device)
+        tgt = to_torch(tgt_chunk, device)
 
-    # Find peak
-    peak_idx = np.argmax(np.abs(corr))
-    lag_samples = float(peak_idx - (len(tgt_norm) - 1))
+        # Normalize (zero-mean, unit-variance)
+        ref_n = (ref - torch.mean(ref)) / (torch.std(ref) + 1e-9)
+        tgt_n = (tgt - torch.mean(tgt)) / (torch.std(tgt) + 1e-9)
 
-    # Sub-sample peak fitting using parabolic interpolation
-    if peak_fit and 0 < peak_idx < len(corr) - 1:
-        y1, y2, y3 = np.abs(corr[peak_idx-1:peak_idx+2])
-        # Parabolic interpolation formula
-        delta = 0.5 * (y1 - y3) / (y1 - 2*y2 + y3 + 1e-9)
-        if -1 < delta < 1:
-            lag_samples += delta
+        # Cross-correlation via FFT
+        n = ref_n.shape[0] + tgt_n.shape[0] - 1
+        n_fft = 1 << (n - 1).bit_length()
 
-    # Convert to milliseconds
-    delay_ms = (lag_samples / float(sample_rate)) * 1000.0
+        R = torch.fft.rfft(ref_n, n=n_fft)
+        T = torch.fft.rfft(tgt_n, n=n_fft)
+        G = R * torch.conj(T)
+        corr = torch.fft.irfft(G, n=n_fft)
 
-    # Calculate match percentage (normalized correlation coefficient)
-    match_pct = (np.abs(corr[peak_idx]) / (np.sqrt(np.sum(ref_norm**2) * np.sum(tgt_norm**2)) + 1e-9)) * 100.0
+        delay_ms, peak_idx = extract_peak(corr, n_fft, sample_rate, peak_fit=peak_fit)
+        match_pct = scc_confidence(corr, peak_idx, ref_n, tgt_n)
 
-    return delay_ms, match_pct
+        return delay_ms, match_pct
 
+    except ImportError:
+        # Fallback to CPU scipy if torch not available
+        from scipy.signal import correlate
 
-# Note: Frame extraction and verification functions have been moved to
-# audio_correlation_frame_sync.py module, which provides comprehensive
-# 3-checkpoint verification with sliding window matching.
+        ref_norm = (ref_chunk - np.mean(ref_chunk)) / (np.std(ref_chunk) + 1e-9)
+        tgt_norm = (tgt_chunk - np.mean(tgt_chunk)) / (np.std(tgt_chunk) + 1e-9)
+
+        corr = correlate(ref_norm, tgt_norm, mode='full', method='fft')
+
+        peak_idx = np.argmax(np.abs(corr))
+        lag_samples = float(peak_idx - (len(tgt_norm) - 1))
+
+        if peak_fit and 0 < peak_idx < len(corr) - 1:
+            y1, y2, y3 = np.abs(corr[peak_idx-1:peak_idx+2])
+            delta = 0.5 * (y1 - y3) / (y1 - 2*y2 + y3 + 1e-9)
+            if -1 < delta < 1:
+                lag_samples += delta
+
+        delay_ms = (lag_samples / float(sample_rate)) * 1000.0
+        match_pct = (np.abs(corr[peak_idx]) / (np.sqrt(np.sum(ref_norm**2) * np.sum(tgt_norm**2)) + 1e-9)) * 100.0
+
+        return delay_ms, match_pct
 
 
 def advanced_align(source_a_path: str, source_b_path: str,
@@ -368,81 +387,80 @@ def advanced_align(source_a_path: str, source_b_path: str,
     # Track verified frame offset for frame-to-frame mapping
     verified_frame_offset = None
 
-    # Video-verified frame sync for frame-perfect accuracy
-    # Uses consecutive frame matching at multiple checkpoints (no sliding window)
+    # Neural frame matching for frame-perfect accuracy
+    # Uses ISC (Image Similarity Challenge) neural features to slide-match frame sequences
     if config.visual_verification and final_offset_sec != 0.0:
         if progress_callback:
-            progress_callback("Video-verified frame sync...", 92)
+            progress_callback("Neural frame matching (ISC)...", 92)
 
         try:
-            from .video_verified_frame_sync import video_verified_frame_sync
+            from .neural_matcher import calculate_neural_verified_offset
 
-            # Use a temp directory for FFMS2 index caching
             import tempfile
             temp_dir = Path(tempfile.gettempdir()) / "remux_toolkit_frame_sync"
             temp_dir.mkdir(parents=True, exist_ok=True)
 
-            # Convert audio offset to milliseconds for the frame sync
             audio_offset_ms = final_offset_sec * 1000.0
 
-            frame_sync_result = video_verified_frame_sync(
+            neural_result = calculate_neural_verified_offset(
                 source_a_path,
                 source_b_path,
                 audio_offset_ms,
                 fps_a,
                 fps_b,
-                num_checkpoints=config.visual_num_checkpoints,
-                sequence_length=config.visual_sequence_length,
-                candidate_range=config.visual_candidate_range,
-                comparison_method=config.visual_comparison_method,
-                hash_algorithm=config.visual_hash_algorithm,
-                hash_size=config.visual_hash_size,
-                hash_threshold=config.visual_hash_threshold,
-                match_threshold_pct=config.visual_match_threshold_pct,
+                duration,
+                num_positions=config.neural_num_positions,
+                window_seconds=config.neural_window_seconds,
+                slide_range_seconds=config.neural_slide_range_seconds,
+                batch_size=config.neural_batch_size,
                 temp_dir=temp_dir,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
             )
 
-            if frame_sync_result.success:
-                # Frame verification passed - use verified offset
-                frame_corrected_offset_sec = frame_sync_result.offset_ms / 1000.0
-                verified_frame_offset = frame_sync_result.offset_frames  # Store for frame-to-frame mapping
+            if neural_result["success"]:
+                frame_corrected_offset_sec = neural_result["offset_ms"] / 1000.0
+                verified_frame_offset = neural_result["offset_frames"]
 
-                print(f"\n✓ Video-verified frame sync successful!")
+                print(f"\n✓ Neural frame matching successful!")
                 print(f"  Audio offset: {final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms)")
-                print(f"  Frame-verified offset: {frame_corrected_offset_sec:.6f}s ({frame_sync_result.offset_ms:.3f}ms)")
-                print(f"  Correction: {frame_sync_result.offset_ms - audio_offset_ms:+.3f}ms ({frame_sync_result.offset_frames:+d} frames)")
-                print(f"  Verified: {frame_sync_result.best_candidate.checkpoints_verified}/{frame_sync_result.best_candidate.checkpoints_total} checkpoints")
-                print(f"  Confidence: {frame_sync_result.confidence:.1%}")
+                print(f"  Neural offset: {frame_corrected_offset_sec:.6f}s ({neural_result['offset_ms']:.3f}ms)")
+                print(f"  Frame offset: {neural_result['offset_frames']:+d} frames")
+                print(f"  Confidence: {neural_result['confidence_label']} ({neural_result['confidence']:.1%})")
+                print(f"  Consensus: {neural_result.get('consensus_count', 0)}/{neural_result.get('num_positions', 0)} positions")
 
-                # Use frame-verified offset
                 final_offset_sec = frame_corrected_offset_sec
-
-                # Combine confidences (weighted average: audio 40%, visual 60%)
-                final_confidence = (final_confidence * 0.4) + (frame_sync_result.confidence * 0.6)
+                final_confidence = (final_confidence * 0.4) + (neural_result["confidence"] * 0.6)
 
             else:
-                # Frame verification failed - keep audio offset
-                print(f"\n⚠ Video-verified frame sync: {frame_sync_result.method}")
-                if frame_sync_result.error:
-                    print(f"  Reason: {frame_sync_result.error}")
+                print(f"\n⚠ Neural frame matching: {neural_result['method']}")
+                if neural_result.get("error"):
+                    print(f"  Reason: {neural_result['error']}")
                 print(f"  Keeping audio offset: {final_offset_sec:.6f}s")
 
         except ImportError as e:
-            print(f"Video-verified frame sync unavailable: {e}")
+            print(f"Neural frame matching unavailable: {e}")
             print(f"Keeping audio-only offset: {final_offset_sec:.6f}s")
         except Exception as e:
-            print(f"Video-verified frame sync error: {e}")
+            print(f"Neural frame matching error: {e}")
             import traceback
             traceback.print_exc()
             print(f"Keeping audio-only offset: {final_offset_sec:.6f}s")
+
+    # Clean up GPU resources after correlation
+    try:
+        from .gpu_backend import cleanup_gpu
+        cleanup_gpu()
+    except ImportError:
+        pass
 
     if progress_callback:
         progress_callback("Alignment complete", 98)
 
     # Determine method string
-    if config.visual_verification:
-        method_str = "SCC+FrameSync"  # Audio correlation + frame-perfect sync
+    if config.visual_verification and verified_frame_offset is not None:
+        method_str = "SCC+NeuralISC"  # Audio correlation + ISC neural matching
+    elif config.visual_verification:
+        method_str = "SCC+NeuralFallback"  # Neural attempted but fell back
     else:
         method_str = "SCC"  # Audio-only
 

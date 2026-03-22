@@ -32,9 +32,10 @@ show_menu() {
     echo -e "  ${CYAN}2)${NC} Update Libraries - Check for and install updates"
     echo -e "  ${CYAN}3)${NC} Verify Dependencies - Check all packages are installed"
     echo -e "  ${CYAN}4)${NC} Rebuild PyAV (optional, for optimized decoding)"
-    echo -e "  ${CYAN}5)${NC} Exit"
+    echo -e "  ${CYAN}5)${NC} Install PyTorch with GPU support (ROCm/CUDA)"
+    echo -e "  ${CYAN}6)${NC} Exit"
     echo ""
-    echo -n "Enter your choice [1-5]: "
+    echo -n "Enter your choice [1-6]: "
 }
 
 # Function to check Python version and verify it works
@@ -358,6 +359,74 @@ rebuild_pyav_from_source() {
     fi
 }
 
+# Function to install PyTorch with GPU support
+install_pytorch_gpu() {
+    echo ""
+    echo "========================================="
+    echo "Install PyTorch with GPU Support"
+    echo "========================================="
+    echo ""
+
+    if ! ensure_venv; then
+        return 1
+    fi
+
+    echo "Select your GPU type:"
+    echo ""
+    echo -e "  ${CYAN}1)${NC} AMD (ROCm 6.2.4)"
+    echo -e "  ${CYAN}2)${NC} NVIDIA (CUDA 12.4)"
+    echo -e "  ${CYAN}3)${NC} Cancel"
+    echo ""
+    echo -n "Enter your choice [1-3]: "
+    read -r gpu_choice
+
+    case $gpu_choice in
+        1)
+            echo ""
+            echo -e "${BLUE}Installing PyTorch with ROCm support...${NC}"
+            echo -e "${YELLOW}This may take a few minutes (large download).${NC}"
+            echo ""
+            venv_pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2.4
+            ;;
+        2)
+            echo ""
+            echo -e "${BLUE}Installing PyTorch with CUDA support...${NC}"
+            echo -e "${YELLOW}This may take a few minutes (large download).${NC}"
+            echo ""
+            venv_pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+            ;;
+        3)
+            echo -e "${YELLOW}Cancelled${NC}"
+            return 0
+            ;;
+        *)
+            echo -e "${RED}Invalid choice${NC}"
+            return 1
+            ;;
+    esac
+
+    if [ $? -eq 0 ]; then
+        echo ""
+        echo -e "${GREEN}✓ PyTorch with GPU support installed${NC}"
+
+        # Verify GPU detection
+        echo ""
+        echo -e "${YELLOW}Verifying GPU detection...${NC}"
+        python -c "
+import torch
+if torch.cuda.is_available():
+    print(f'  GPU detected: {torch.cuda.get_device_name(0)}')
+    print(f'  CUDA/ROCm version: {torch.version.cuda or \"ROCm\"}')
+else:
+    print('  WARNING: No GPU detected by PyTorch')
+    print('  CPU fallback will be used (slower)')
+"
+    else
+        echo -e "${RED}Failed to install PyTorch with GPU support${NC}"
+        return 1
+    fi
+}
+
 # Function for full setup
 full_setup() {
     echo ""
@@ -565,6 +634,10 @@ main() {
             rebuild_pyav_from_source
             exit 0
             ;;
+        --install-gpu)
+            install_pytorch_gpu
+            exit 0
+            ;;
     esac
 
     # Interactive menu mode
@@ -586,6 +659,9 @@ main() {
                 rebuild_pyav_from_source
                 ;;
             5)
+                install_pytorch_gpu
+                ;;
+            6)
                 echo ""
                 echo -e "${GREEN}Goodbye!${NC}"
                 echo ""
@@ -593,7 +669,7 @@ main() {
                 ;;
             *)
                 echo ""
-                echo -e "${RED}Invalid choice. Please enter 1-5.${NC}"
+                echo -e "${RED}Invalid choice. Please enter 1-6.${NC}"
                 ;;
         esac
 

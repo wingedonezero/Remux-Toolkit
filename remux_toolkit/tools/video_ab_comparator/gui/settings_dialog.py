@@ -301,11 +301,12 @@ class SettingsDialog(QtWidgets.QDialog):
 
         layout.addRow(QtWidgets.QLabel(""))  # Spacer
 
-        # Enable frame sync
-        enable_checkbox = QtWidgets.QCheckBox("Enable Frame-Perfect Verification")
+        # Enable neural frame matching
+        enable_checkbox = QtWidgets.QCheckBox("Enable Neural Frame Matching (ISC)")
         enable_checkbox.setChecked(self.settings.get('align_visual_verification', True))
         enable_checkbox.setToolTip(
-            "Fine-tune audio offset with visual frame matching.\n"
+            "Fine-tune audio offset with ISC neural features.\n"
+            "Uses Meta's ISC model for robust frame matching.\n"
             "Recommended: ON"
         )
         layout.addRow(enable_checkbox)
@@ -313,115 +314,58 @@ class SettingsDialog(QtWidgets.QDialog):
 
         layout.addRow(QtWidgets.QLabel(""))  # Spacer
 
-        # Number of checkpoints
-        checkpoints_label = QtWidgets.QLabel("Checkpoints:")
-        checkpoints_spin = QtWidgets.QSpinBox()
-        checkpoints_spin.setRange(3, 7)
-        checkpoints_spin.setValue(self.settings.get('align_visual_num_checkpoints', 5))
-        checkpoints_spin.setToolTip(
-            "Verification points at 15%, 30%, 50%, 70%, 85%.\n"
-            "More = better verification but slower.\n"
-            "Default: 5"
+        # Number of positions
+        positions_label = QtWidgets.QLabel("Test Positions:")
+        positions_spin = QtWidgets.QSpinBox()
+        positions_spin.setRange(1, 9)
+        positions_spin.setValue(self.settings.get('align_neural_num_positions', 3))
+        positions_spin.setToolTip(
+            "Number of test positions across the video.\n"
+            "Consensus voting picks the most common offset.\n"
+            "Default: 3 (at 20%, 50%, 80% of video)"
         )
-        layout.addRow(checkpoints_label, checkpoints_spin)
-        self.controls['align_visual_num_checkpoints'] = checkpoints_spin
+        layout.addRow(positions_label, positions_spin)
+        self.controls['align_neural_num_positions'] = positions_spin
 
-        # Sequence length
-        sequence_label = QtWidgets.QLabel("Sequence Length:")
-        sequence_spin = QtWidgets.QSpinBox()
-        sequence_spin.setRange(5, 20)
-        sequence_spin.setValue(self.settings.get('align_visual_sequence_length', 10))
-        sequence_spin.setToolTip(
-            "Consecutive frames to verify at each checkpoint.\n"
-            "Higher = more strict verification.\n"
-            "Default: 10"
+        # Window duration
+        window_label = QtWidgets.QLabel("Window Duration:")
+        window_spin = QtWidgets.QSpinBox()
+        window_spin.setRange(5, 30)
+        window_spin.setValue(self.settings.get('align_neural_window_seconds', 10))
+        window_spin.setSuffix("s")
+        window_spin.setToolTip(
+            "Duration of frame window at each position.\n"
+            "Longer = more frames to compare (more reliable).\n"
+            "Default: 10s"
         )
-        layout.addRow(sequence_label, sequence_spin)
-        self.controls['align_visual_sequence_length'] = sequence_spin
+        layout.addRow(window_label, window_spin)
+        self.controls['align_neural_window_seconds'] = window_spin
 
-        # Candidate range
-        candidate_label = QtWidgets.QLabel("Candidate Range:")
-        candidate_spin = QtWidgets.QSpinBox()
-        candidate_spin.setRange(1, 10)
-        candidate_spin.setValue(self.settings.get('align_visual_candidate_range', 3))
-        candidate_spin.setToolTip(
-            "Search ±N frames around audio correlation.\n"
-            "Default: 3 (tests 7 candidates)"
+        # Slide range
+        slide_label = QtWidgets.QLabel("Slide Range:")
+        slide_spin = QtWidgets.QSpinBox()
+        slide_spin.setRange(1, 15)
+        slide_spin.setValue(self.settings.get('align_neural_slide_range_seconds', 5))
+        slide_spin.setSuffix("s")
+        slide_spin.setToolTip(
+            "Search range around audio offset (per side).\n"
+            "Default: 5s (slides ±5s around prediction)"
         )
-        layout.addRow(candidate_label, candidate_spin)
-        self.controls['align_visual_candidate_range'] = candidate_spin
+        layout.addRow(slide_label, slide_spin)
+        self.controls['align_neural_slide_range_seconds'] = slide_spin
 
-        # Match threshold
-        match_label = QtWidgets.QLabel("Match Threshold:")
-        match_spin = QtWidgets.QSpinBox()
-        match_spin.setRange(50, 90)
-        match_spin.setSingleStep(5)
-        match_spin.setValue(int(self.settings.get('align_visual_match_threshold_pct', 70.0)))
-        match_spin.setSuffix("%")
-        match_spin.setToolTip(
-            "Percentage of sequence frames that must match.\n"
-            "Default: 70% (7 of 10 frames)"
+        # Batch size
+        batch_label = QtWidgets.QLabel("GPU Batch Size:")
+        batch_spin = QtWidgets.QSpinBox()
+        batch_spin.setRange(1, 128)
+        batch_spin.setValue(self.settings.get('align_neural_batch_size', 32))
+        batch_spin.setToolTip(
+            "GPU batch size for ISC feature extraction.\n"
+            "Lower if running out of VRAM.\n"
+            "Default: 32"
         )
-        layout.addRow(match_label, match_spin)
-        self.controls['align_visual_match_threshold_pct'] = match_spin
-
-        layout.addRow(QtWidgets.QLabel(""))  # Spacer
-
-        # Comparison method
-        method_label = QtWidgets.QLabel("Comparison Method:")
-        method_combo = QtWidgets.QComboBox()
-        method_combo.addItems(["hash (perceptual hashing)", "ssim (structural similarity)"])
-
-        current_method = self.settings.get('align_visual_comparison_method', 'hash')
-        method_combo.setCurrentIndex(0 if current_method == 'hash' else 1)
-        method_combo.setToolTip(
-            "hash: Fast perceptual hashing (recommended)\n"
-            "ssim: Structural similarity (slower, more precise)"
-        )
-
-        layout.addRow(method_label, method_combo)
-        self.controls['align_visual_comparison_method_combo'] = method_combo
-
-        # Hash algorithm
-        hash_algo_label = QtWidgets.QLabel("Hash Algorithm:")
-        hash_algo_combo = QtWidgets.QComboBox()
-        hash_algo_combo.addItems([
-            "dhash (difference hash)",
-            "phash (perceptual hash)",
-            "average_hash (mean hash)",
-            "whash (wavelet hash)"
-        ])
-
-        current_algo = self.settings.get('align_visual_hash_algorithm', 'dhash')
-        algo_map = {'dhash': 0, 'phash': 1, 'average_hash': 2, 'whash': 3}
-        hash_algo_combo.setCurrentIndex(algo_map.get(current_algo, 0))
-
-        layout.addRow(hash_algo_label, hash_algo_combo)
-        self.controls['align_visual_hash_algorithm_combo'] = hash_algo_combo
-
-        # Hash size
-        hash_size_label = QtWidgets.QLabel("Hash Size:")
-        hash_size_combo = QtWidgets.QComboBox()
-        hash_size_combo.addItems(["8x8 (64-bit)", "16x16 (256-bit)"])
-
-        current_size = self.settings.get('align_visual_hash_size', 8)
-        hash_size_combo.setCurrentIndex(0 if current_size == 8 else 1)
-
-        layout.addRow(hash_size_label, hash_size_combo)
-        self.controls['align_visual_hash_size_combo'] = hash_size_combo
-
-        # Hash threshold
-        threshold_label = QtWidgets.QLabel("Hash Threshold:")
-        threshold_spin = QtWidgets.QSpinBox()
-        threshold_spin.setRange(1, 15)
-        threshold_spin.setValue(self.settings.get('align_visual_hash_threshold', 5))
-        threshold_spin.setToolTip(
-            "Max hamming distance per frame.\n"
-            "Lower = stricter matching.\n"
-            "Default: 5"
-        )
-        layout.addRow(threshold_label, threshold_spin)
-        self.controls['align_visual_hash_threshold'] = threshold_spin
+        layout.addRow(batch_label, batch_spin)
+        self.controls['align_neural_batch_size'] = batch_spin
 
         self.tabs.addTab(tab, "Frame Sync")
 
@@ -563,33 +507,17 @@ class SettingsDialog(QtWidgets.QDialog):
             delay_map = {0: 'first', 1: 'median', 2: 'mean'}
             self.settings['align_delay_selection'] = delay_map.get(idx, 'first')
 
-        # Frame Sync tab
+        # Frame Sync tab (Neural ISC matching)
         if 'align_visual_verification' in self.controls:
             self.settings['align_visual_verification'] = self.controls['align_visual_verification'].isChecked()
-        if 'align_visual_num_checkpoints' in self.controls:
-            self.settings['align_visual_num_checkpoints'] = self.controls['align_visual_num_checkpoints'].value()
-        if 'align_visual_sequence_length' in self.controls:
-            self.settings['align_visual_sequence_length'] = self.controls['align_visual_sequence_length'].value()
-        if 'align_visual_candidate_range' in self.controls:
-            self.settings['align_visual_candidate_range'] = self.controls['align_visual_candidate_range'].value()
-        if 'align_visual_match_threshold_pct' in self.controls:
-            self.settings['align_visual_match_threshold_pct'] = float(self.controls['align_visual_match_threshold_pct'].value())
-
-        if 'align_visual_comparison_method_combo' in self.controls:
-            idx = self.controls['align_visual_comparison_method_combo'].currentIndex()
-            self.settings['align_visual_comparison_method'] = 'hash' if idx == 0 else 'ssim'
-
-        if 'align_visual_hash_algorithm_combo' in self.controls:
-            idx = self.controls['align_visual_hash_algorithm_combo'].currentIndex()
-            algo_map = {0: 'dhash', 1: 'phash', 2: 'average_hash', 3: 'whash'}
-            self.settings['align_visual_hash_algorithm'] = algo_map.get(idx, 'dhash')
-
-        if 'align_visual_hash_size_combo' in self.controls:
-            idx = self.controls['align_visual_hash_size_combo'].currentIndex()
-            self.settings['align_visual_hash_size'] = 8 if idx == 0 else 16
-
-        if 'align_visual_hash_threshold' in self.controls:
-            self.settings['align_visual_hash_threshold'] = self.controls['align_visual_hash_threshold'].value()
+        if 'align_neural_num_positions' in self.controls:
+            self.settings['align_neural_num_positions'] = self.controls['align_neural_num_positions'].value()
+        if 'align_neural_window_seconds' in self.controls:
+            self.settings['align_neural_window_seconds'] = self.controls['align_neural_window_seconds'].value()
+        if 'align_neural_slide_range_seconds' in self.controls:
+            self.settings['align_neural_slide_range_seconds'] = self.controls['align_neural_slide_range_seconds'].value()
+        if 'align_neural_batch_size' in self.controls:
+            self.settings['align_neural_batch_size'] = self.controls['align_neural_batch_size'].value()
 
         # Detectors tab
         if 'enable_audio_analysis' in self.controls:
