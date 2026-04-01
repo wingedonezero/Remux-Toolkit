@@ -1,4 +1,7 @@
 # remux_toolkit/tools/ffmpeg_dvd_gui/gui/prefs_dialog.py
+import os
+import subprocess
+
 from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QVBoxLayout,
     QLineEdit, QPushButton, QSpinBox, QCheckBox, QFileDialog, QComboBox,
@@ -16,6 +19,7 @@ class PrefsDialog(QDialog):
         self.setMinimumWidth(640)
 
         self._init_ui()
+        self._check_all_tools()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -46,6 +50,7 @@ class PrefsDialog(QDialog):
         tools_form = QFormLayout()
 
         self.ffmpeg_edit = QLineEdit(self.settings.get("ffmpeg_path", "ffmpeg"))
+        self.ffmpeg_edit.editingFinished.connect(self._on_ffmpeg_path_changed)
         btn_browse_ffmpeg = QPushButton("Browse...")
         btn_browse_ffmpeg.clicked.connect(self._browse_ffmpeg)
         row_ffmpeg = QHBoxLayout()
@@ -53,7 +58,13 @@ class PrefsDialog(QDialog):
         row_ffmpeg.addWidget(btn_browse_ffmpeg)
         tools_form.addRow("ffmpeg path:", row_ffmpeg)
 
+        self.ffmpeg_version_label = QLabel()
+        self.ffmpeg_version_label.setStyleSheet("font-size: 11px;")
+        self.ffmpeg_version_label.setWordWrap(True)
+        tools_form.addRow("", self.ffmpeg_version_label)
+
         self.ffprobe_edit = QLineEdit(self.settings.get("ffprobe_path", "ffprobe"))
+        self.ffprobe_edit.editingFinished.connect(self._on_ffprobe_path_changed)
         btn_browse_ffprobe = QPushButton("Browse...")
         btn_browse_ffprobe.clicked.connect(self._browse_ffprobe)
         row_ffprobe = QHBoxLayout()
@@ -61,13 +72,24 @@ class PrefsDialog(QDialog):
         row_ffprobe.addWidget(btn_browse_ffprobe)
         tools_form.addRow("ffprobe path:", row_ffprobe)
 
+        self.ffprobe_version_label = QLabel()
+        self.ffprobe_version_label.setStyleSheet("font-size: 11px;")
+        self.ffprobe_version_label.setWordWrap(True)
+        tools_form.addRow("", self.ffprobe_version_label)
+
         self.mkvpropedit_edit = QLineEdit(self.settings.get("mkvpropedit_path", "mkvpropedit"))
+        self.mkvpropedit_edit.editingFinished.connect(self._on_mkvpropedit_path_changed)
         btn_browse_mkvpropedit = QPushButton("Browse...")
         btn_browse_mkvpropedit.clicked.connect(self._browse_mkvpropedit)
         row_mkvpropedit = QHBoxLayout()
         row_mkvpropedit.addWidget(self.mkvpropedit_edit)
         row_mkvpropedit.addWidget(btn_browse_mkvpropedit)
         tools_form.addRow("mkvpropedit path:", row_mkvpropedit)
+
+        self.mkvpropedit_version_label = QLabel()
+        self.mkvpropedit_version_label.setStyleSheet("font-size: 11px;")
+        self.mkvpropedit_version_label.setWordWrap(True)
+        tools_form.addRow("", self.mkvpropedit_version_label)
 
         tools_group.setLayout(tools_form)
         layout.addWidget(tools_group)
@@ -140,31 +162,142 @@ class PrefsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    # -- Version checking --
+
+    def _get_tool_version(self, tool_path: str) -> tuple[bool, str]:
+        """Get version string from a tool. Returns (found, version_string)."""
+        for flag in ["-version", "--version"]:
+            try:
+                result = subprocess.run(
+                    [tool_path, flag],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout:
+                    return True, result.stdout.split('\n')[0].strip()
+            except FileNotFoundError:
+                return False, "Not found"
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:
+                continue
+        return False, "Version check failed"
+
+    def _check_dvdvideo_support(self, ffmpeg_path: str) -> bool:
+        """Check if ffmpeg binary has dvdvideo demuxer support."""
+        try:
+            result = subprocess.run(
+                [ffmpeg_path, "-hide_banner", "-demuxers"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return "dvdvideo" in result.stdout
+        except Exception:
+            pass
+        return False
+
+    def _set_version_label(self, label: QLabel, found: bool, version: str,
+                           dvdvideo: bool | None = None):
+        """Update a version label with color-coded status."""
+        if not found:
+            label.setText(f"Not found")
+            label.setStyleSheet("font-size: 11px; color: #cc3333;")
+            return
+
+        parts = [version]
+        if dvdvideo is True:
+            parts.append("dvdvideo: yes")
+        elif dvdvideo is False:
+            parts.append("dvdvideo: NO (needs --enable-libdvdnav --enable-libdvdread)")
+
+        label.setText(" | ".join(parts))
+        if dvdvideo is False:
+            label.setStyleSheet("font-size: 11px; color: #cc8800;")
+        else:
+            label.setStyleSheet("font-size: 11px; color: #33aa33;")
+
+    def _check_ffmpeg_tool(self):
+        """Check ffmpeg and update its version label."""
+        path = self.ffmpeg_edit.text().strip() or "ffmpeg"
+        found, version = self._get_tool_version(path)
+        dvd = self._check_dvdvideo_support(path) if found else None
+        self._set_version_label(self.ffmpeg_version_label, found, version, dvd)
+
+    def _check_ffprobe_tool(self):
+        """Check ffprobe and update its version label."""
+        path = self.ffprobe_edit.text().strip() or "ffprobe"
+        found, version = self._get_tool_version(path)
+        self._set_version_label(self.ffprobe_version_label, found, version)
+
+    def _check_mkvpropedit_tool(self):
+        """Check mkvpropedit and update its version label."""
+        path = self.mkvpropedit_edit.text().strip() or "mkvpropedit"
+        found, version = self._get_tool_version(path)
+        self._set_version_label(self.mkvpropedit_version_label, found, version)
+
+    def _check_all_tools(self):
+        """Check all tools and update version labels."""
+        self._check_ffmpeg_tool()
+        self._check_ffprobe_tool()
+        self._check_mkvpropedit_tool()
+
+    def _auto_detect_ffprobe(self, ffmpeg_path: str):
+        """Try to find ffprobe next to the selected ffmpeg binary."""
+        if not ffmpeg_path or ffmpeg_path == "ffmpeg":
+            return
+        ffmpeg_dir = os.path.dirname(ffmpeg_path)
+        if not ffmpeg_dir:
+            return
+        ffprobe_candidate = os.path.join(ffmpeg_dir, "ffprobe")
+        if os.path.isfile(ffprobe_candidate) and os.access(ffprobe_candidate, os.X_OK):
+            self.ffprobe_edit.setText(ffprobe_candidate)
+            self._check_ffprobe_tool()
+
+    # -- Path change handlers --
+
+    def _on_ffmpeg_path_changed(self):
+        self._check_ffmpeg_tool()
+        self._auto_detect_ffprobe(self.ffmpeg_edit.text().strip())
+
+    def _on_ffprobe_path_changed(self):
+        self._check_ffprobe_tool()
+
+    def _on_mkvpropedit_path_changed(self):
+        self._check_mkvpropedit_tool()
+
+    # -- Browse buttons --
+
     def _browse_out(self):
         d = QFileDialog.getExistingDirectory(self, "Choose output root", self.out_edit.text())
         if d:
             self.out_edit.setText(d)
 
     def _browse_ffmpeg(self):
+        start = os.path.dirname(self.ffmpeg_edit.text()) if self.ffmpeg_edit.text() not in ("", "ffmpeg") else "/usr/bin"
         f, _ = QFileDialog.getOpenFileName(
-            self, "Locate ffmpeg", self.ffmpeg_edit.text() or "/usr/bin", "All (*)"
+            self, "Locate ffmpeg", start, "All (*)"
         )
         if f:
             self.ffmpeg_edit.setText(f)
+            self._check_ffmpeg_tool()
+            self._auto_detect_ffprobe(f)
 
     def _browse_ffprobe(self):
+        start = os.path.dirname(self.ffprobe_edit.text()) if self.ffprobe_edit.text() not in ("", "ffprobe") else "/usr/bin"
         f, _ = QFileDialog.getOpenFileName(
-            self, "Locate ffprobe", self.ffprobe_edit.text() or "/usr/bin", "All (*)"
+            self, "Locate ffprobe", start, "All (*)"
         )
         if f:
             self.ffprobe_edit.setText(f)
+            self._check_ffprobe_tool()
 
     def _browse_mkvpropedit(self):
+        start = os.path.dirname(self.mkvpropedit_edit.text()) if self.mkvpropedit_edit.text() not in ("", "mkvpropedit") else "/usr/bin"
         f, _ = QFileDialog.getOpenFileName(
-            self, "Locate mkvpropedit", self.mkvpropedit_edit.text() or "/usr/bin", "All (*)"
+            self, "Locate mkvpropedit", start, "All (*)"
         )
         if f:
             self.mkvpropedit_edit.setText(f)
+            self._check_mkvpropedit_tool()
 
     def get_values(self) -> dict:
         return {
