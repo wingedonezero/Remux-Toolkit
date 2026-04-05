@@ -20,6 +20,7 @@ from remux_toolkit.tools.audio_comparison_analysis.audio_comparison_analysis_gui
     AudioComparisonAnalysisWidget,
 )
 from remux_toolkit.tools.ffmpeg_dvd_gui.ffmpeg_dvd_gui_gui import FFmpegDVDGUIWidget
+from remux_toolkit.tools.video_source_analyzer.video_source_analyzer_gui import VideoSourceAnalyzerWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -83,6 +84,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_ffmpeg_dvd_gui_action = QtGui.QAction("FFmpeg DVD Remuxer", self)
         self.open_ffmpeg_dvd_gui_action.triggered.connect(self.open_ffmpeg_dvd_gui)
 
+        self.open_video_source_analyzer_action = QtGui.QAction("Video Source Analyzer", self)
+        self.open_video_source_analyzer_action.triggered.connect(self.open_video_source_analyzer)
+
     def _create_menus(self):
         menu_bar = self.menuBar()
         tools_menu = menu_bar.addMenu("&Tools")
@@ -102,6 +106,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_video_sync_action)
         tools_menu.addAction(self.open_audio_comparison_analysis_action)
         tools_menu.addAction(self.open_ffmpeg_dvd_gui_action)
+        tools_menu.addAction(self.open_video_source_analyzer_action)
 
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
     def open_media_comparator(self): self._open_tool("MediaComparator", "Media Comparator", MediaComparatorWidget)
@@ -121,6 +126,7 @@ class MainWindow(QtWidgets.QMainWindow):
         "AudioComparisonAnalysis", "Audio Comparison Analysis", AudioComparisonAnalysisWidget
     )
     def open_ffmpeg_dvd_gui(self): self._open_tool("FFmpegDVDGUI", "FFmpeg DVD Remuxer", FFmpegDVDGUIWidget)
+    def open_video_source_analyzer(self): self._open_tool("VideoSourceAnalyzer", "Video Source Analyzer", VideoSourceAnalyzerWidget)
 
     def _open_tool(self, tool_name, tab_title, widget_class):
         if tool_name in self.open_tools:
