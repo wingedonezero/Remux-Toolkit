@@ -35,6 +35,14 @@ class AnalysisWorker(QtCore.QObject):
     def stop(self):
         self._stopped = True
 
+    @QtCore.pyqtSlot()
+    def _run_pending(self):
+        """Called by thread.started — runs on the worker thread."""
+        files = getattr(self, "_pending_files", [])
+        l2 = getattr(self, "_pending_l2", True)
+        l3 = getattr(self, "_pending_l3", True)
+        self.analyze_files(files, l2, l3)
+
     def _is_cancelled(self) -> bool:
         return self._stopped
 
@@ -110,6 +118,16 @@ class AnalysisWorker(QtCore.QObject):
             needs_layer2 = self._auto_layer2 and self._needs_pixel_analysis(
                 si, result.bitstream
             )
+            if needs_layer2:
+                on_progress(
+                    f"Layer 1 result: {result.classification.classification} "
+                    f"({result.classification.confidence}) — running Layer 2..."
+                )
+            else:
+                on_progress(
+                    f"Layer 1 classified: {result.classification.classification} "
+                    f"({result.classification.confidence}) — Layer 2 not needed"
+                )
         else:
             needs_layer2 = False
             result.classification = classify(si, None)
@@ -117,15 +135,26 @@ class AnalysisWorker(QtCore.QObject):
         # ── Layer 2: Pixel Analysis ────────────────────────────────────
         if needs_layer2 and not self._stopped:
             on_progress("Layer 2: Pixel analysis (Naranjo + autocorrelation)...")
-            result.pixel = run_layer2(
-                filepath, si,
-                include_per_frame=True,
-                on_progress=on_progress,
-                check_cancelled=self._is_cancelled,
-            )
-            result.layer2_ran = True
+            try:
+                result.pixel = run_layer2(
+                    filepath, si,
+                    include_per_frame=True,
+                    on_progress=on_progress,
+                    check_cancelled=self._is_cancelled,
+                )
+                result.layer2_ran = True
+            except ImportError as e:
+                on_progress(f"Layer 2 skipped: {e} (vapoursynth/scipy required)")
+                from .models import PixelResult
+                result.pixel = PixelResult(error=f"import error: {e}")
+                result.layer2_ran = False
+            except Exception as e:
+                on_progress(f"Layer 2 error: {e}")
+                from .models import PixelResult
+                result.pixel = PixelResult(error=str(e))
+                result.layer2_ran = True
 
-            if self._stopped or result.pixel.error:
+            if result.pixel and (self._stopped or result.pixel.error):
                 result.classification = classify(
                     si, result.bitstream, result.pixel
                 )
@@ -147,12 +176,22 @@ class AnalysisWorker(QtCore.QObject):
         # ── Layer 3: Field-Swap Validation ─────────────────────────────
         if needs_layer3 and result.pixel and not self._stopped:
             on_progress("Layer 3: Field-swap validation...")
-            result.field_swap = run_layer3(
-                filepath, si, result.pixel,
-                on_progress=on_progress,
-                check_cancelled=self._is_cancelled,
-            )
-            result.layer3_ran = True
+            try:
+                result.field_swap = run_layer3(
+                    filepath, si, result.pixel,
+                    on_progress=on_progress,
+                    check_cancelled=self._is_cancelled,
+                )
+                result.layer3_ran = True
+            except ImportError as e:
+                on_progress(f"Layer 3 skipped: {e}")
+                from .models import FieldSwapResult
+                result.field_swap = FieldSwapResult(error=f"import error: {e}")
+            except Exception as e:
+                on_progress(f"Layer 3 error: {e}")
+                from .models import FieldSwapResult
+                result.field_swap = FieldSwapResult(error=str(e))
+                result.layer3_ran = True
 
             # Final classification with all layers
             result.classification = classify(
