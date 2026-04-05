@@ -477,9 +477,12 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
         auto_l2 = self.auto_l2_cb.isChecked()
         auto_l3 = self.auto_l3_cb.isChecked()
 
-        self._thread.started.connect(
-            lambda: self._worker.analyze_files(file_paths, auto_l2, auto_l3)
-        )
+        # Store params on worker so the slot can access them
+        self._worker._pending_files = file_paths
+        self._worker._pending_l2 = auto_l2
+        self._worker._pending_l3 = auto_l3
+
+        self._thread.started.connect(self._worker._run_pending)
         self._thread.start()
 
     def _stop_analysis(self):
