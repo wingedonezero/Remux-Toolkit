@@ -21,6 +21,74 @@ from .field_swap import run_layer3
 from .classifier import classify
 
 
+def _compute_window_metrics(
+    per_frame: list[dict],
+    l1_per_frame: list[dict],
+    win_start: int,
+    win_end: int,
+) -> tuple[float, float, float, float]:
+    """Compute dup_pct, combed_pct, cycling_pct, intl_pct for a window."""
+    chunk = per_frame[win_start:win_end]
+    chunk_size = len(chunk)
+
+    combed_count = sum(1 for f in chunk if f.get("combed", False))
+    combed_pct = combed_count / chunk_size * 100 if chunk_size else 0
+
+    dup_count = 0
+    dup_total = 0
+    for f in chunk:
+        top = f.get("top_fsad")
+        bot = f.get("bot_fsad")
+        if top is not None and top >= 0:
+            dup_total += 1
+            if top < DUP_FIELD_SAD_THRESHOLD or (bot is not None and bot < DUP_FIELD_SAD_THRESHOLD):
+                dup_count += 1
+    dup_pct = (dup_count / dup_total * 100) if dup_total > 0 else 0
+
+    cycling_pct = 0.0
+    intl_pct = 100.0
+    if l1_per_frame and win_end <= len(l1_per_frame):
+        l1_chunk = l1_per_frame[win_start:win_end]
+        cycling_count = sum(1 for f in l1_chunk if f.get("cycling") is True)
+        intl_count = sum(1 for f in l1_chunk if f.get("interlaced_frame") == 1)
+        cycling_pct = cycling_count / chunk_size * 100
+        intl_pct = intl_count / chunk_size * 100
+
+    return dup_pct, combed_pct, cycling_pct, intl_pct
+
+
+def _classify_window(
+    dup_pct: float, combed_pct: float, cycling_pct: float,
+    global_dup_pct: float,
+) -> str:
+    """Classify a single window, using global context to reduce noise."""
+    if cycling_pct > 20:
+        return "FILM"
+
+    # Use a relaxed threshold for windows when the global file is clearly
+    # telecine. Scene changes and static sections temporarily drop dup%
+    # below the full-file threshold, but they're still telecine content.
+    if global_dup_pct >= DUP_FIELD_TELECINE_PCT:
+        # Global file is telecine — use a lower per-window threshold
+        # Only classify as non-telecine if dup% drops very low
+        if dup_pct >= 5.0:
+            return "TELECINE"
+        elif combed_pct < 2:
+            return "PROGRESSIVE"
+        else:
+            return "INTERLACED"
+
+    # Global file is NOT clearly telecine — use standard thresholds
+    if dup_pct >= DUP_FIELD_TELECINE_PCT:
+        return "TELECINE"
+    elif dup_pct <= DUP_FIELD_INTERLACED_PCT and combed_pct < 5:
+        return "PROGRESSIVE"
+    elif dup_pct <= DUP_FIELD_INTERLACED_PCT:
+        return "INTERLACED"
+    else:
+        return "MIXED"
+
+
 def _refine_segments_with_layer2(
     bitstream: BitstreamResult,
     pixel: PixelResult,
@@ -33,10 +101,14 @@ def _refine_segments_with_layer2(
     (no RFF flags), Layer 1 sees everything as VIDEO even though the content
     is telecine. This function re-segments using per-frame duplicate field
     and combing data from Layer 2.
+
+    Uses the global dup field % to set context-aware thresholds: when the
+    whole file is clearly telecine, individual windows need much lower dup%
+    to be classified as non-telecine (avoids false MIXED on scene changes).
     """
     per_frame = pixel.per_frame
     if not per_frame:
-        return bitstream.segments  # no data, keep original
+        return bitstream.segments
 
     total = len(per_frame)
     if total == 0:
@@ -44,78 +116,55 @@ def _refine_segments_with_layer2(
     if fps <= 0:
         fps = 29.97
 
+    # Global dup field % from full-file analysis (for context)
+    global_dup_pct = pixel.dup_field_pct
+
+    l1_per_frame = bitstream.per_frame if bitstream else []
     window = SEGMENT_WINDOW
+
+    # Pass 1: classify each window
+    window_types: list[tuple[int, int, str]] = []  # (start, end, type)
+    for win_start in range(0, total, window):
+        win_end = min(win_start + window, total)
+        dup_pct, combed_pct, cycling_pct, _ = _compute_window_metrics(
+            per_frame, l1_per_frame, win_start, win_end,
+        )
+        win_type = _classify_window(dup_pct, combed_pct, cycling_pct, global_dup_pct)
+        window_types.append((win_start, win_end, win_type))
+
+    # Pass 2: absorb tiny isolated segments (1 window surrounded by same type)
+    if len(window_types) >= 3:
+        for i in range(1, len(window_types) - 1):
+            prev_type = window_types[i - 1][2]
+            curr_type = window_types[i][2]
+            next_type = window_types[i + 1][2]
+            if prev_type == next_type and curr_type != prev_type:
+                # Isolated different window — absorb into neighbors
+                window_types[i] = (window_types[i][0], window_types[i][1], prev_type)
+
+    # Pass 3: merge adjacent same-type windows into segments
     segments: list[Segment] = []
     current_type: str | None = None
     seg_start = 0
 
-    for win_start in range(0, total, window):
-        win_end = min(win_start + window, total)
-        chunk = per_frame[win_start:win_end]
-        chunk_size = len(chunk)
-
-        # Count combed frames and duplicate fields in this window
-        combed_count = sum(1 for f in chunk if f.get("combed", False))
-        combed_pct = combed_count / chunk_size * 100
-
-        # For dup fields: check if top_fsad/bot_fsad exist (first frame won't have them)
-        dup_count = 0
-        dup_total = 0
-        for f in chunk:
-            top = f.get("top_fsad")
-            bot = f.get("bot_fsad")
-            if top is not None and top >= 0:
-                dup_total += 1
-                if top < DUP_FIELD_SAD_THRESHOLD or (bot is not None and bot < DUP_FIELD_SAD_THRESHOLD):
-                    dup_count += 1
-        dup_pct = (dup_count / dup_total * 100) if dup_total > 0 else 0
-
-        # Also check Layer 1 cycling for this window if available
-        l1_per_frame = bitstream.per_frame if bitstream else []
-        cycling_pct = 0.0
-        intl_pct = 100.0
-        if l1_per_frame and win_end <= len(l1_per_frame):
-            l1_chunk = l1_per_frame[win_start:win_end]
-            cycling_count = sum(1 for f in l1_chunk if f.get("cycling") is True)
-            intl_count = sum(1 for f in l1_chunk if f.get("interlaced_frame") == 1)
-            cycling_pct = cycling_count / chunk_size * 100
-            intl_pct = intl_count / chunk_size * 100
-
-        # Classify this window
-        if cycling_pct > 20:
-            # Layer 1 says FILM (soft telecine)
-            win_type = "FILM"
-        elif dup_pct >= DUP_FIELD_TELECINE_PCT:
-            # Layer 2 says telecine (hard telecine)
-            win_type = "TELECINE"
-        elif dup_pct <= DUP_FIELD_INTERLACED_PCT and combed_pct < 5:
-            win_type = "PROGRESSIVE"
-        elif dup_pct <= DUP_FIELD_INTERLACED_PCT:
-            win_type = "INTERLACED"
-        else:
-            win_type = "MIXED"
-
+    for win_start, win_end, win_type in window_types:
         if win_type != current_type:
             if current_type is not None:
-                seg_size = win_start - seg_start
-                if seg_size > 0:
-                    seg = _make_refined_segment(
-                        seg_start, win_start, current_type,
-                        per_frame, bitstream, fps,
-                    )
-                    segments.append(seg)
+                seg = _make_refined_segment(
+                    seg_start, win_start, current_type,
+                    per_frame, bitstream, fps,
+                )
+                segments.append(seg)
             seg_start = win_start
             current_type = win_type
 
     # Close final segment
     if current_type is not None:
-        seg_size = total - seg_start
-        if seg_size > 0:
-            seg = _make_refined_segment(
-                seg_start, total, current_type,
-                per_frame, bitstream, fps,
-            )
-            segments.append(seg)
+        seg = _make_refined_segment(
+            seg_start, total, current_type,
+            per_frame, bitstream, fps,
+        )
+        segments.append(seg)
 
     return segments
 
