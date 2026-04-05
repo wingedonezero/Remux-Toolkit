@@ -854,13 +854,30 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
             return None
         return fp, result
 
-    def _safe_filename(self, filepath: str) -> str:
-        name = os.path.splitext(os.path.basename(filepath))[0]
-        for ch in " ()[]!@#$%^&=+{}':;":
+    def _safe_name(self, name: str) -> str:
+        """Sanitize a name for use as a filename (preserving readability)."""
+        # Replace only truly problematic filesystem chars
+        for ch in '/:*?"<>|':
             name = name.replace(ch, "_")
-        while "__" in name:
-            name = name.replace("__", "_")
-        return name.strip("_")
+        return name.strip()
+
+    def _export_path_for(self, export_dir: str, filepath: str, suffix: str) -> str:
+        """
+        Build export path using the source file's parent folder as a subfolder.
+
+        e.g. source: /data/[DVDISO] Starship Operators/title.mkv
+             export: {export_dir}/[DVDISO] Starship Operators/title_{suffix}
+        """
+        parent_name = os.path.basename(os.path.dirname(filepath))
+        file_stem = os.path.splitext(os.path.basename(filepath))[0]
+
+        if parent_name:
+            sub_dir = os.path.join(export_dir, self._safe_name(parent_name))
+        else:
+            sub_dir = export_dir
+
+        os.makedirs(sub_dir, exist_ok=True)
+        return os.path.join(sub_dir, f"{self._safe_name(file_stem)}{suffix}")
 
     def _export(self, mode: str):
         export_dir = self._get_export_dir()
@@ -870,8 +887,7 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
         if mode == "all_full":
             count = 0
             for fp, result in self.results.items():
-                name = self._safe_filename(fp)
-                out = os.path.join(export_dir, f"{name}_full.json")
+                out = self._export_path_for(export_dir, fp, "_full.json")
                 with open(out, "w") as f:
                     f.write(result.to_json(include_per_frame=True))
                 count += 1
@@ -882,18 +898,17 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
         if not sel:
             return
         fp, result = sel
-        name = self._safe_filename(fp)
 
         if mode == "full":
-            out = os.path.join(export_dir, f"{name}_full.json")
+            out = self._export_path_for(export_dir, fp, "_full.json")
             with open(out, "w") as f:
                 f.write(result.to_json(include_per_frame=True))
         elif mode == "summary":
-            out = os.path.join(export_dir, f"{name}_summary.json")
+            out = self._export_path_for(export_dir, fp, "_summary.json")
             with open(out, "w") as f:
                 f.write(result.to_json(include_per_frame=False))
         elif mode == "log":
-            out = os.path.join(export_dir, f"{name}_summary.log")
+            out = self._export_path_for(export_dir, fp, "_summary.log")
             with open(out, "w") as f:
                 f.write(result.summary_text())
 
