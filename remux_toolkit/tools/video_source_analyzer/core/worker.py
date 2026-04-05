@@ -8,12 +8,171 @@ from typing import Optional
 
 from PyQt6 import QtCore
 
-from .models import AnalysisResult, StreamInfo, FILM_PCT_HIGH, FILM_PCT_LOW
+from .models import (
+    AnalysisResult, StreamInfo, Segment, BitstreamResult, PixelResult,
+    FILM_PCT_HIGH, FILM_PCT_LOW, SEGMENT_WINDOW,
+    DUP_FIELD_SAD_THRESHOLD, COMBING_RATIO_THRESHOLD,
+    DUP_FIELD_TELECINE_PCT, DUP_FIELD_INTERLACED_PCT,
+)
 from .stream_info import get_stream_info
 from .bitstream import run_layer1
 from .pixel_analysis import run_layer2
 from .field_swap import run_layer3
 from .classifier import classify
+
+
+def _refine_segments_with_layer2(
+    bitstream: BitstreamResult,
+    pixel: PixelResult,
+    fps: float,
+) -> list[Segment]:
+    """
+    Rebuild segment map using Layer 2 per-frame data.
+
+    Layer 1 segments are based purely on trf cycling. For hard telecine
+    (no RFF flags), Layer 1 sees everything as VIDEO even though the content
+    is telecine. This function re-segments using per-frame duplicate field
+    and combing data from Layer 2.
+    """
+    per_frame = pixel.per_frame
+    if not per_frame:
+        return bitstream.segments  # no data, keep original
+
+    total = len(per_frame)
+    if total == 0:
+        return bitstream.segments
+    if fps <= 0:
+        fps = 29.97
+
+    window = SEGMENT_WINDOW
+    segments: list[Segment] = []
+    current_type: str | None = None
+    seg_start = 0
+
+    for win_start in range(0, total, window):
+        win_end = min(win_start + window, total)
+        chunk = per_frame[win_start:win_end]
+        chunk_size = len(chunk)
+
+        # Count combed frames and duplicate fields in this window
+        combed_count = sum(1 for f in chunk if f.get("combed", False))
+        combed_pct = combed_count / chunk_size * 100
+
+        # For dup fields: check if top_fsad/bot_fsad exist (first frame won't have them)
+        dup_count = 0
+        dup_total = 0
+        for f in chunk:
+            top = f.get("top_fsad")
+            bot = f.get("bot_fsad")
+            if top is not None and top >= 0:
+                dup_total += 1
+                if top < DUP_FIELD_SAD_THRESHOLD or (bot is not None and bot < DUP_FIELD_SAD_THRESHOLD):
+                    dup_count += 1
+        dup_pct = (dup_count / dup_total * 100) if dup_total > 0 else 0
+
+        # Also check Layer 1 cycling for this window if available
+        l1_per_frame = bitstream.per_frame if bitstream else []
+        cycling_pct = 0.0
+        intl_pct = 100.0
+        if l1_per_frame and win_end <= len(l1_per_frame):
+            l1_chunk = l1_per_frame[win_start:win_end]
+            cycling_count = sum(1 for f in l1_chunk if f.get("cycling") is True)
+            intl_count = sum(1 for f in l1_chunk if f.get("interlaced_frame") == 1)
+            cycling_pct = cycling_count / chunk_size * 100
+            intl_pct = intl_count / chunk_size * 100
+
+        # Classify this window
+        if cycling_pct > 20:
+            # Layer 1 says FILM (soft telecine)
+            win_type = "FILM"
+        elif dup_pct >= DUP_FIELD_TELECINE_PCT:
+            # Layer 2 says telecine (hard telecine)
+            win_type = "TELECINE"
+        elif dup_pct <= DUP_FIELD_INTERLACED_PCT and combed_pct < 5:
+            win_type = "PROGRESSIVE"
+        elif dup_pct <= DUP_FIELD_INTERLACED_PCT:
+            win_type = "INTERLACED"
+        else:
+            win_type = "MIXED"
+
+        if win_type != current_type:
+            if current_type is not None:
+                seg_size = win_start - seg_start
+                if seg_size > 0:
+                    seg = _make_refined_segment(
+                        seg_start, win_start, current_type,
+                        per_frame, bitstream, fps,
+                    )
+                    segments.append(seg)
+            seg_start = win_start
+            current_type = win_type
+
+    # Close final segment
+    if current_type is not None:
+        seg_size = total - seg_start
+        if seg_size > 0:
+            seg = _make_refined_segment(
+                seg_start, total, current_type,
+                per_frame, bitstream, fps,
+            )
+            segments.append(seg)
+
+    return segments
+
+
+def _make_refined_segment(
+    start: int, end: int, content_type: str,
+    per_frame: list[dict], bitstream: BitstreamResult, fps: float,
+) -> Segment:
+    """Create a Segment with both Layer 1 and Layer 2 metrics."""
+    chunk = per_frame[start:end]
+    chunk_size = len(chunk)
+
+    combed_count = sum(1 for f in chunk if f.get("combed", False))
+    combed_pct = combed_count / chunk_size * 100 if chunk_size else 0
+
+    dup_count = 0
+    dup_total = 0
+    for f in chunk:
+        top = f.get("top_fsad")
+        bot = f.get("bot_fsad")
+        if top is not None and top >= 0:
+            dup_total += 1
+            if top < DUP_FIELD_SAD_THRESHOLD or (bot is not None and bot < DUP_FIELD_SAD_THRESHOLD):
+                dup_count += 1
+    dup_pct = (dup_count / dup_total * 100) if dup_total > 0 else 0
+
+    # Layer 1 metrics for this range
+    cycling_pct = 0.0
+    intl_pct = 100.0
+    l1_per_frame = bitstream.per_frame if bitstream else []
+    if l1_per_frame and end <= len(l1_per_frame):
+        l1_chunk = l1_per_frame[start:end]
+        cycling_count = sum(1 for f in l1_chunk if f.get("cycling") is True)
+        intl_count = sum(1 for f in l1_chunk if f.get("interlaced_frame") == 1)
+        cycling_pct = round(cycling_count / chunk_size * 100, 1)
+        intl_pct = round(intl_count / chunk_size * 100, 1)
+
+    # Map content_type back to seg_type for Layer 1 compatibility
+    seg_type_map = {
+        "FILM": "FILM",
+        "TELECINE": "FILM",
+        "INTERLACED": "VIDEO",
+        "PROGRESSIVE": "VIDEO",
+        "MIXED": "MIXED",
+    }
+
+    return Segment(
+        start_frame=start,
+        end_frame=end,
+        seg_type=seg_type_map.get(content_type, "VIDEO"),
+        cycling_pct=cycling_pct,
+        interlaced_pct=intl_pct,
+        duration_sec=round(chunk_size / fps, 1),
+        content_type=content_type,
+        dup_field_pct=round(dup_pct, 1),
+        combed_pct=round(combed_pct, 1),
+    )
 
 
 class AnalysisWorker(QtCore.QObject):
@@ -160,6 +319,14 @@ class AnalysisWorker(QtCore.QObject):
                 )
                 result.total_elapsed_sec = round(time.time() - t_total, 2)
                 return result
+
+            # Refine segment map with Layer 2 per-frame data
+            if result.bitstream and result.pixel:
+                on_progress("Refining segment map with pixel analysis data...")
+                fps = si.fps if si.fps > 0 else 29.97
+                result.bitstream.segments = _refine_segments_with_layer2(
+                    result.bitstream, result.pixel, fps
+                )
 
             # Reclassify with Layer 2 data
             result.classification = classify(

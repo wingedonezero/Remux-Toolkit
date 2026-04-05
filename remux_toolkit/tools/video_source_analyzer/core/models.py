@@ -149,10 +149,19 @@ class Segment:
     interlaced_pct: float
     frame_count: int = 0
     duration_sec: float = 0.0
+    # Layer 2 refined fields (filled after pixel analysis)
+    content_type: str = ""       # "TELECINE", "INTERLACED", "PROGRESSIVE", "MIXED", or ""
+    dup_field_pct: float = -1.0  # duplicate field % in this segment (-1 = not computed)
+    combed_pct: float = -1.0     # combed frame % in this segment (-1 = not computed)
 
     def __post_init__(self):
         if self.frame_count == 0:
             self.frame_count = self.end_frame - self.start_frame
+
+    @property
+    def display_type(self) -> str:
+        """Best available segment type for display: content_type if available, else seg_type."""
+        return self.content_type if self.content_type else self.seg_type
 
 
 @dataclass
@@ -412,10 +421,14 @@ def _build_summary(result: AnalysisResult) -> str:
                 t_sec = s.start_frame / fps
                 t_min = int(t_sec // 60)
                 t_s = t_sec % 60
+                label = s.display_type
+                extra = ""
+                if s.dup_field_pct >= 0:
+                    extra = f", dup={s.dup_field_pct:.0f}%, combed={s.combed_pct:.0f}%"
                 lines.append(
                     f"    {s.start_frame:>7}-{s.end_frame:>7} "
-                    f"[{t_min:02d}:{t_s:04.1f}] {s.seg_type:>5}  "
-                    f"({s.cycling_pct:.0f}% film, {s.interlaced_pct:.0f}% intl, "
+                    f"[{t_min:02d}:{t_s:04.1f}] {label:>10}  "
+                    f"({s.cycling_pct:.0f}% film, {s.interlaced_pct:.0f}% intl{extra}, "
                     f"{s.frame_count} frames, {s.duration_sec:.1f}s)"
                 )
             lines.append("")

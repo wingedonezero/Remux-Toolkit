@@ -18,9 +18,12 @@ from .core.models import AnalysisResult, Segment
 # ═══════════════════════════════════════════════════════════════════════════
 
 _SEG_COLORS = {
-    "FILM": QtGui.QColor(76, 175, 80),     # green
-    "VIDEO": QtGui.QColor(244, 67, 54),     # red
-    "MIXED": QtGui.QColor(255, 193, 7),     # amber
+    "FILM": QtGui.QColor(76, 175, 80),        # green — soft telecine (Layer 1)
+    "VIDEO": QtGui.QColor(244, 67, 54),        # red — native video (Layer 1)
+    "MIXED": QtGui.QColor(255, 193, 7),        # amber
+    "TELECINE": QtGui.QColor(33, 150, 243),    # blue — hard telecine (Layer 2)
+    "INTERLACED": QtGui.QColor(244, 67, 54),   # red — confirmed interlaced (Layer 2)
+    "PROGRESSIVE": QtGui.QColor(0, 188, 212),  # cyan — progressive (Layer 2)
 }
 
 
@@ -84,7 +87,7 @@ class SegmentMapWidget(QtWidgets.QWidget):
         # Draw segments
         for i, seg in enumerate(self.segments):
             rect = self._seg_rect(i)
-            color = _SEG_COLORS.get(seg.seg_type, QtGui.QColor(100, 100, 100))
+            color = _SEG_COLORS.get(seg.display_type, QtGui.QColor(100, 100, 100))
 
             if i == self._selected_idx:
                 color = color.lighter(130)
@@ -121,11 +124,14 @@ class SegmentMapWidget(QtWidgets.QWidget):
             seg = self.segments[self._hover_idx]
             t_start = seg.start_frame / self.fps
             t_end = seg.end_frame / self.fps
-            tip = (
-                f"{seg.seg_type}  |  Frames {seg.start_frame:,}-{seg.end_frame:,}\n"
-                f"Time {t_start:.1f}s - {t_end:.1f}s  |  {seg.frame_count:,} frames\n"
-                f"Film cycling: {seg.cycling_pct:.0f}%  |  Interlaced: {seg.interlaced_pct:.0f}%"
-            )
+            lines = [
+                f"{seg.display_type}  |  Frames {seg.start_frame:,}-{seg.end_frame:,}",
+                f"Time {t_start:.1f}s - {t_end:.1f}s  |  {seg.frame_count:,} frames",
+                f"Film cycling: {seg.cycling_pct:.0f}%  |  Interlaced: {seg.interlaced_pct:.0f}%",
+            ]
+            if seg.dup_field_pct >= 0:
+                lines.append(f"Dup fields: {seg.dup_field_pct:.1f}%  |  Combed: {seg.combed_pct:.1f}%")
+            tip = "\n".join(lines)
             QtWidgets.QToolTip.showText(event.globalPosition().toPoint(), tip, self)
         else:
             QtWidgets.QToolTip.hideText()
@@ -247,13 +253,18 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
 
         # Legend
         legend_layout = QtWidgets.QHBoxLayout()
-        for label, color in [("FILM", _SEG_COLORS["FILM"]),
-                              ("VIDEO", _SEG_COLORS["VIDEO"]),
-                              ("MIXED", _SEG_COLORS["MIXED"])]:
+        for label, color in [
+            ("FILM", _SEG_COLORS["FILM"]),
+            ("TELECINE", _SEG_COLORS["TELECINE"]),
+            ("INTERLACED", _SEG_COLORS["INTERLACED"]),
+            ("PROGRESSIVE", _SEG_COLORS["PROGRESSIVE"]),
+            ("MIXED", _SEG_COLORS["MIXED"]),
+        ]:
             swatch = QtWidgets.QLabel(f"  {label}  ")
             swatch.setStyleSheet(
                 f"background-color: {color.name()}; color: white; "
-                f"font-weight: bold; padding: 2px 8px; border-radius: 3px;"
+                f"font-weight: bold; padding: 2px 6px; border-radius: 3px;"
+                f"font-size: 10px;"
             )
             legend_layout.addWidget(swatch)
         legend_layout.addStretch()
@@ -265,10 +276,11 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
 
         # Segment detail table
         self.segment_table = QtWidgets.QTableWidget()
-        self.segment_table.setColumnCount(7)
+        self.segment_table.setColumnCount(9)
         self.segment_table.setHorizontalHeaderLabels([
-            "Type", "Start Frame", "End Frame",
+            "Content", "Start Frame", "End Frame",
             "Frame Count", "Duration", "Film Cycling %", "Interlaced %",
+            "Dup Field %", "Combed %",
         ])
         self.segment_table.horizontalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.ResizeMode.Stretch
@@ -606,13 +618,15 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
                 duration = f"{t_start:.1f}s - {t_end:.1f}s ({seg.duration_sec:.1f}s)"
 
                 items = [
-                    seg.seg_type,
+                    seg.display_type,
                     f"{seg.start_frame:,}",
                     f"{seg.end_frame:,}",
                     f"{seg.frame_count:,}",
                     duration,
                     f"{seg.cycling_pct:.1f}%",
                     f"{seg.interlaced_pct:.1f}%",
+                    f"{seg.dup_field_pct:.1f}%" if seg.dup_field_pct >= 0 else "-",
+                    f"{seg.combed_pct:.1f}%" if seg.combed_pct >= 0 else "-",
                 ]
                 for col, text in enumerate(items):
                     cell = QtWidgets.QTableWidgetItem(text)
@@ -622,7 +636,7 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
                     )
                     # Color-code the type column
                     if col == 0:
-                        color = _SEG_COLORS.get(seg.seg_type)
+                        color = _SEG_COLORS.get(seg.display_type)
                         if color:
                             cell.setForeground(color)
                     self.segment_table.setItem(row, col, cell)
