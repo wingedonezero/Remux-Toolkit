@@ -157,14 +157,14 @@ def _classify_from_pixel(
     """
     Classify based on Layer 2 Laplacian combing + cadence-5 analysis.
 
-    Key metrics:
-    - combed_pct: % of frames with block-level combing
-    - cadence5_pct: how strongly combed frames follow period-5 (3:2 pulldown)
+    Key insight: cadence-5 is the FINGERPRINT of NTSC 3:2 telecine.
+    Combing % varies with motion content but cadence is structural.
 
-    Decision matrix:
-    - combed ~30-40% + cadence5 >15% → hard telecine
-    - combed >35% + cadence5 <15%    → interlaced
-    - combed <15%                    → progressive
+    Decision priority:
+    1. Cadence-5 strong → hard telecine (regardless of combing %)
+    2. High combing + no cadence → interlaced
+    3. Low combing → progressive
+    4. Otherwise → mixed/uncertain
     """
     combed_pct = px.combed_pct
     cadence5 = px.cadence5_pct
@@ -179,55 +179,70 @@ def _classify_from_pixel(
         fix_pct = fs.fix_pct
         detail += f", fix={fix_pct:.1f}%"
 
-    # ── Progressive: very low combing ─────────────────────────────────
-    if combed_pct < PROGRESSIVE_COMBED_MAX:
-        return result_fn("progressive", "high",
-                         f"low combing ({detail})")
+    # ── Hard telecine: cadence-5 IS the signature ─────────────────────
+    # Cadence is structural — if it's there, it's telecine regardless of
+    # combing %. Combing % varies with motion content.
 
-    # ── Hard telecine: moderate combing with period-5 cadence ─────────
-    if combed_pct >= TELECINE_COMBED_MIN and cadence5 >= TELECINE_CADENCE5_MIN:
-        # Strong telecine signal
-        if combed_pct <= TELECINE_COMBED_MAX and cadence5 >= 30:
-            return result_fn("hard_telecine", "high",
-                             f"telecine cadence detected ({detail})",
-                             "progressive")
-        # Good cadence but combing % is high (might have interlaced segments)
-        if combed_pct > TELECINE_COMBED_MAX:
-            return result_fn("hard_telecine", "medium",
-                             f"telecine cadence + high combing ({detail})",
-                             "progressive")
-        # Moderate cadence
-        return result_fn("hard_telecine", "medium",
-                         f"moderate telecine cadence ({detail})",
-                         "progressive")
-
-    # ── Reinforce with field-swap if available ────────────────────────
-    if fix_pct >= 80 and combed_pct >= TELECINE_COMBED_MIN:
+    # Strong cadence: definitive hard telecine
+    if cadence5 >= 30.0:
         return result_fn("hard_telecine", "high",
-                         f"field-swap confirmed telecine ({detail})",
+                         f"strong period-5 cadence ({detail})",
                          "progressive")
 
-    # ── Interlaced: high combing, no telecine cadence ─────────────────
-    if combed_pct >= INTERLACED_COMBED_MIN and cadence5 < TELECINE_CADENCE5_MIN:
+    # Good cadence with reasonable combing: hard telecine
+    if cadence5 >= 20.0 and combed_pct >= 15.0:
+        return result_fn("hard_telecine", "high",
+                         f"period-5 cadence detected ({detail})",
+                         "progressive")
+
+    # Moderate cadence with combing: likely telecine (weak signal)
+    if cadence5 >= 15.0 and combed_pct >= 15.0:
+        return result_fn("hard_telecine", "medium",
+                         f"moderate period-5 cadence ({detail})",
+                         "progressive")
+
+    # Field-swap can confirm telecine in cadence-weak cases
+    if fix_pct >= 70 and combed_pct >= 15.0:
+        return result_fn("hard_telecine", "medium",
+                         f"field-swap supports telecine ({detail})",
+                         "progressive")
+
+    # ── Weak telecine: high combing + some cadence ────────────────────
+    # Catches cases like Aozora R2J ep1 (30% combed, 13% cad5)
+    if combed_pct >= 25.0 and 12.0 <= cadence5 < 15.0:
+        return result_fn("hard_telecine", "low",
+                         f"weak period-5 cadence + combing ({detail})",
+                         "progressive")
+
+    # ── Interlaced: lots of combing, no telecine cadence ──────────────
+    # True interlaced has combing on most motion frames, no period-5
+    if combed_pct >= 35.0 and cadence5 < 15.0:
         return result_fn("interlaced", "high",
                          f"high combing, no telecine pattern ({detail})",
                          "", "interlaced")
 
-    # ── Gray zone ─────────────────────────────────────────────────────
-    # Moderate combing but weak cadence — could be mixed or noisy telecine
-    if combed_pct >= TELECINE_COMBED_MIN:
-        if fix_pct >= 50:
-            return result_fn("hard_telecine", "medium",
-                             f"field-swap supports telecine ({detail})",
-                             "progressive")
-        if cadence5 >= 10:
-            return result_fn("hard_telecine", "low",
-                             f"weak telecine signal ({detail})",
-                             "progressive")
-        return result_fn("mixed", "low",
-                         f"ambiguous: moderate combing, weak cadence ({detail})",
+    if combed_pct >= 25.0 and cadence5 < 12.0:
+        return result_fn("interlaced", "medium",
+                         f"moderate combing, no cadence ({detail})",
                          "", "interlaced")
 
-    # ── Low-moderate combing, not clearly anything ────────────────────
+    # ── Progressive: very low combing ─────────────────────────────────
+    if combed_pct < 10.0 and cadence5 < 10.0:
+        return result_fn("progressive", "high",
+                         f"low combing, no cadence ({detail})")
+
+    # Some compression noise but still low
+    if combed_pct < 15.0:
+        return result_fn("progressive", "medium",
+                         f"low combing ({detail})")
+
+    # ── Borderline: moderate combing + weak cadence ───────────────────
+    # Likely interlaced with low motion content
+    if 15.0 <= combed_pct < 25.0 and cadence5 < 15.0:
+        return result_fn("interlaced", "low",
+                         f"moderate combing, weak cadence ({detail})",
+                         "", "interlaced")
+
     return result_fn("mixed", "low",
-                     f"unclear ({detail})")
+                     f"unclear ({detail})",
+                     "", "interlaced")
