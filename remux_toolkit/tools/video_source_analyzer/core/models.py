@@ -54,16 +54,18 @@ FILM_PCT_HIGH = 80.0
 FILM_PCT_MED = 50.0
 FILM_PCT_LOW = 30.0
 
-# Layer 2: Naranjo chi-square + autocorrelation
-COMBING_RATIO_THRESHOLD = 1.5
-CHI_SQUARE_ALPHA = 0.02
-MAD_SCALE = 1.4826
+# Layer 2: TIVTC-style Laplacian combing detection
+CTHRESH_8BIT = 9
+MTHRESH_8BIT = 10
+COMBPEL = 40
+BLOCK_SIZE = 16
 
-# Layer 2: Duplicate field detection
-DUP_FIELD_SAD_THRESHOLD = 0.5
-DUP_FIELD_TELECINE_PCT = 15.0
-DUP_FIELD_INTERLACED_PCT = 3.0
-DUP_FIELD_PERIOD5_RATIO = 2.0
+# Layer 2: Classification thresholds
+TELECINE_COMBED_MIN = 20.0
+TELECINE_COMBED_MAX = 45.0
+TELECINE_CADENCE5_MIN = 15.0
+INTERLACED_COMBED_MIN = 35.0
+PROGRESSIVE_COMBED_MAX = 15.0
 
 # Layer 3: Field-swap validation
 FIXED_THRESHOLD = 0.85
@@ -151,7 +153,6 @@ class Segment:
     duration_sec: float = 0.0
     # Layer 2 refined fields (filled after pixel analysis)
     content_type: str = ""       # "TELECINE", "INTERLACED", "PROGRESSIVE", "MIXED", or ""
-    dup_field_pct: float = -1.0  # duplicate field % in this segment (-1 = not computed)
     combed_pct: float = -1.0     # combed frame % in this segment (-1 = not computed)
 
     def __post_init__(self):
@@ -194,50 +195,33 @@ class BitstreamResult:
 
 @dataclass
 class PixelResult:
-    """Results from Layer 2: Naranjo chi-square + autocorrelation + dup fields."""
-    # Chi-square energy test
-    chi_square_detected: bool = False
-    energy_ratio: float = 0.0
-    std_ratio: float = 0.0
-    chi_square_detail: dict = field(default_factory=dict)
-
-    # Field difference x[n] statistics
-    xn_mean: float = 0.0
-    xn_std: float = 0.0
-    xn_median: float = 0.0
-
-    # Autocorrelation — field difference x[n]
-    xn_autocorrelation: dict[str, float] = field(default_factory=dict)
-    xn_lag5: float = 0.0
-    xn_lag1: float = 0.0
-    xn_lag5_lag1_ratio: float = 0.0
-
-    # Autocorrelation — combing ratio
-    comb_autocorrelation: dict[str, float] = field(default_factory=dict)
-    comb_lag5: float = 0.0
-    comb_lag1: float = 0.0
-    comb_lag5_lag1_ratio: float = 0.0
-    has_variance: bool = False
-
-    # Duplicate field detection
-    dup_field_pct: float = 0.0
-    dup_field_pct_02: float = 0.0
-    dup_field_pct_10: float = 0.0
-    dup_field_autocorrelation: dict[str, float] = field(default_factory=dict)
-    dup_field_lag5: float = 0.0
-    dup_field_lag1: float = 0.0
-    dup_field_lag5_lag1_ratio: float = 0.0
-    dup_field_has_period5: bool = False
-    dup_field_top_median_sad: float = 0.0
-    dup_field_bot_median_sad: float = 0.0
-    dup_field_top_p5_sad: float = 0.0
-    dup_field_bot_p5_sad: float = 0.0
-
-    # Combing stats (for Layer 3 handoff)
+    """Results from Layer 2: TIVTC-style Laplacian combing + cadence analysis."""
+    # Combing detection (Laplacian + motion gate + block counting)
     combed_frames: int = 0
     combed_pct: float = 0.0
-    median_ratio: float = 0.0
     combed_indices: list[int] = field(default_factory=list)
+
+    # Combed pixel statistics (per-frame pixel-level)
+    combed_px_mean: float = 0.0
+    combed_px_median: float = 0.0
+    combed_px_p95: float = 0.0
+    frames_with_any_combing: int = 0
+    frames_with_any_combing_pct: float = 0.0
+
+    # Cadence-5 analysis (telecine detection)
+    cadence5_pct: float = 0.0          # % of consecutive gap pairs summing to 5
+    telecine_gap_pct: float = 0.0      # % of gaps that are 1 or 4 (telecine signature)
+    gap_distribution: dict[str, int] = field(default_factory=dict)
+
+    # Field SAD statistics
+    top_field_sad_median: float = 0.0
+    bot_field_sad_median: float = 0.0
+    top_field_sad_p5: float = 0.0
+    bot_field_sad_p5: float = 0.0
+
+    # Bit depth info
+    bit_depth: int = 8
+    bit_depth_scale: int = 1
 
     # Per-frame data
     per_frame: list[dict] = field(default_factory=list)
@@ -423,8 +407,8 @@ def _build_summary(result: AnalysisResult) -> str:
                 t_s = t_sec % 60
                 label = s.display_type
                 extra = ""
-                if s.dup_field_pct >= 0:
-                    extra = f", dup={s.dup_field_pct:.0f}%, combed={s.combed_pct:.0f}%"
+                if s.combed_pct >= 0:
+                    extra = f", combed={s.combed_pct:.0f}%"
                 lines.append(
                     f"    {s.start_frame:>7}-{s.end_frame:>7} "
                     f"[{t_min:02d}:{t_s:04.1f}] {label:>10}  "
@@ -439,59 +423,44 @@ def _build_summary(result: AnalysisResult) -> str:
     # Layer 2
     px = result.pixel
     if px and not px.error:
-        lines.append("  -- Layer 2: Naranjo Detection (chi-square + autocorrelation) --")
-        chi_str = "DETECTED" if px.chi_square_detected else "not detected"
-        lines.append(f"  Chi-square:     {chi_str}")
-        lines.append(f"  Energy ratio:   {px.energy_ratio:.4f}  (>1 = telecine)")
-        lines.append(f"  Std/Robust s:   {px.std_ratio:.4f}  (>1.3 suggests periodic)")
-        lines.append(f"  x[n] mean:      {px.xn_mean:.4f}")
-        lines.append(f"  x[n] std:       {px.xn_std:.4f}")
-        lines.append(f"  x[n] median:    {px.xn_median:.4f}")
-        lines.append("")
-
-        lines.append(f"  Combed frames:  {px.combed_frames:,} ({px.combed_pct:.1f}%)"
-                      f" [threshold={COMBING_RATIO_THRESHOLD}]")
-        lines.append(f"  Median ratio:   {px.median_ratio:.4f}")
+        lines.append("  -- Layer 2: Laplacian Combing Detection (TIVTC-style) --")
+        lines.append(f"  Bit depth:      {px.bit_depth}-bit (threshold scale={px.bit_depth_scale}x)")
         lines.append(f"  Time:           {px.elapsed_sec:.1f}s ({px.frames_per_sec:.0f} f/s)")
         lines.append("")
 
-        # Autocorrelation table
-        xn_ac = px.xn_autocorrelation
-        comb_ac = px.comb_autocorrelation
-        if xn_ac or comb_ac:
-            lines.append("  -- Autocorrelation (lags 1-10) --")
-            lines.append(f"  {'Lag':>5}   {'x[n] field diff':>15}   {'combing ratio':>15}")
-            lines.append(f"  {'---':>5}   {'---------------':>15}   {'---------------':>15}")
-            for lag in range(1, 11):
-                xn_val = xn_ac.get(str(lag), 0)
-                cb_val = comb_ac.get(str(lag), 0)
-                marker = "  < period-5" if lag == 5 else ""
-                lines.append(f"  {lag:>5}   {xn_val:>+15.4f}   {cb_val:>+15.4f}{marker}")
-            lines.append(f"  {'L5/L1':>5}   {px.xn_lag5_lag1_ratio:>15.3f}"
-                          f"   {px.comb_lag5_lag1_ratio:>15.3f}")
+        lines.append("  -- Combing Results --")
+        lines.append(f"  Combed frames:  {px.combed_frames:,} / {px.total_frames:,} ({px.combed_pct:.1f}%)")
+        lines.append(f"  Any combing:    {px.frames_with_any_combing:,} ({px.frames_with_any_combing_pct:.1f}%)")
+        lines.append(f"  Combed px mean: {px.combed_px_mean:.4f}%")
+        lines.append(f"  Combed px p95:  {px.combed_px_p95:.4f}%")
         lines.append("")
 
-        # Duplicate field detection
-        lines.append("  -- Duplicate Field Detection --")
-        lines.append(f"  Dup% (SAD<0.2): {px.dup_field_pct_02:.1f}%")
-        lines.append(f"  Dup% (SAD<0.5): {px.dup_field_pct:.1f}%  < primary threshold")
-        lines.append(f"  Dup% (SAD<1.0): {px.dup_field_pct_10:.1f}%")
-        lines.append(f"  Top median SAD: {px.dup_field_top_median_sad:.4f}")
-        lines.append(f"  Bot median SAD: {px.dup_field_bot_median_sad:.4f}")
-        lines.append(f"  AC lag1:        {px.dup_field_lag1:+.4f}")
-        lines.append(f"  AC lag5:        {px.dup_field_lag5:+.4f}")
-        lines.append(f"  AC lag5/lag1:   {px.dup_field_lag5_lag1_ratio:.3f}")
-        if px.dup_field_has_period5:
-            lines.append(f"  Period-5:       DETECTED (telecine 3:2)")
-        else:
-            lines.append(f"  Period-5:       not detected")
-        if px.dup_field_pct >= DUP_FIELD_TELECINE_PCT:
-            lines.append(f"  Verdict:        TELECINE (>={DUP_FIELD_TELECINE_PCT}% dup fields)")
-        elif px.dup_field_pct <= DUP_FIELD_INTERLACED_PCT:
-            lines.append(f"  Verdict:        TRUE INTERLACED (<={DUP_FIELD_INTERLACED_PCT}% dup)")
-        else:
-            lines.append(f"  Verdict:        GRAY ZONE ({DUP_FIELD_INTERLACED_PCT}-{DUP_FIELD_TELECINE_PCT}%)")
+        lines.append("  -- Cadence-5 Analysis (telecine detection) --")
+        lines.append(f"  Cadence-5:      {px.cadence5_pct:.1f}%  (gap pairs summing to 5)")
+        lines.append(f"  TC gap %:       {px.telecine_gap_pct:.1f}%  (gaps of 1 or 4)")
+        if px.gap_distribution:
+            lines.append(f"  Gap distrib:    {px.gap_distribution}")
         lines.append("")
+
+        # Interpretation
+        if px.combed_pct >= TELECINE_COMBED_MIN and px.cadence5_pct >= TELECINE_CADENCE5_MIN:
+            lines.append(f"  Verdict:        HARD TELECINE (combed={px.combed_pct:.1f}%, cadence5={px.cadence5_pct:.1f}%)")
+        elif px.combed_pct >= INTERLACED_COMBED_MIN and px.cadence5_pct < TELECINE_CADENCE5_MIN:
+            lines.append(f"  Verdict:        INTERLACED (combed={px.combed_pct:.1f}%, no telecine pattern)")
+        elif px.combed_pct < PROGRESSIVE_COMBED_MAX:
+            lines.append(f"  Verdict:        PROGRESSIVE (combed={px.combed_pct:.1f}%)")
+        else:
+            lines.append(f"  Verdict:        UNCERTAIN (combed={px.combed_pct:.1f}%, cadence5={px.cadence5_pct:.1f}%)")
+        lines.append("")
+
+        # Field SAD
+        if px.top_field_sad_median > 0:
+            lines.append("  -- Field SAD --")
+            lines.append(f"  Top median:     {px.top_field_sad_median:.4f}")
+            lines.append(f"  Bot median:     {px.bot_field_sad_median:.4f}")
+            lines.append(f"  Top p5:         {px.top_field_sad_p5:.4f}")
+            lines.append(f"  Bot p5:         {px.bot_field_sad_p5:.4f}")
+            lines.append("")
     elif px and px.error:
         lines.append(f"  Layer 2: ERROR - {px.error}")
         lines.append("")

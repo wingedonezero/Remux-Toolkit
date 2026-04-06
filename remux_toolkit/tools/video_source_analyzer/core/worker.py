@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections import Counter
 from typing import Optional
 
 from PyQt6 import QtCore
@@ -11,8 +12,8 @@ from PyQt6 import QtCore
 from .models import (
     AnalysisResult, StreamInfo, Segment, BitstreamResult, PixelResult,
     FILM_PCT_HIGH, FILM_PCT_LOW, SEGMENT_WINDOW,
-    DUP_FIELD_SAD_THRESHOLD, COMBING_RATIO_THRESHOLD,
-    DUP_FIELD_TELECINE_PCT, DUP_FIELD_INTERLACED_PCT,
+    TELECINE_COMBED_MIN, TELECINE_CADENCE5_MIN,
+    INTERLACED_COMBED_MIN, PROGRESSIVE_COMBED_MAX,
 )
 from .stream_info import get_stream_info
 from .bitstream import run_layer1
@@ -21,72 +22,46 @@ from .field_swap import run_layer3
 from .classifier import classify
 
 
-def _compute_window_metrics(
-    per_frame: list[dict],
-    l1_per_frame: list[dict],
-    win_start: int,
-    win_end: int,
-) -> tuple[float, float, float, float]:
-    """Compute dup_pct, combed_pct, cycling_pct, intl_pct for a window."""
-    chunk = per_frame[win_start:win_end]
-    chunk_size = len(chunk)
-
-    combed_count = sum(1 for f in chunk if f.get("combed", False))
-    combed_pct = combed_count / chunk_size * 100 if chunk_size else 0
-
-    dup_count = 0
-    dup_total = 0
-    for f in chunk:
-        top = f.get("top_fsad")
-        bot = f.get("bot_fsad")
-        if top is not None and top >= 0:
-            dup_total += 1
-            if top < DUP_FIELD_SAD_THRESHOLD or (bot is not None and bot < DUP_FIELD_SAD_THRESHOLD):
-                dup_count += 1
-    dup_pct = (dup_count / dup_total * 100) if dup_total > 0 else 0
-
-    cycling_pct = 0.0
-    intl_pct = 100.0
-    if l1_per_frame and win_end <= len(l1_per_frame):
-        l1_chunk = l1_per_frame[win_start:win_end]
-        cycling_count = sum(1 for f in l1_chunk if f.get("cycling") is True)
-        intl_count = sum(1 for f in l1_chunk if f.get("interlaced_frame") == 1)
-        cycling_pct = cycling_count / chunk_size * 100
-        intl_pct = intl_count / chunk_size * 100
-
-    return dup_pct, combed_pct, cycling_pct, intl_pct
-
-
 def _classify_window(
-    dup_pct: float, combed_pct: float, cycling_pct: float,
-    global_dup_pct: float,
+    combed_pct: float,
+    cadence5_pct: float,
+    cycling_pct: float,
+    global_combed_pct: float,
+    global_cadence5_pct: float,
 ) -> str:
-    """Classify a single window, using global context to reduce noise."""
+    """Classify a single window using combing + cadence metrics."""
     if cycling_pct > 20:
         return "FILM"
 
-    # Use a relaxed threshold for windows when the global file is clearly
-    # telecine. Scene changes and static sections temporarily drop dup%
-    # below the full-file threshold, but they're still telecine content.
-    if global_dup_pct >= DUP_FIELD_TELECINE_PCT:
-        # Global file is telecine — use a lower per-window threshold
-        # Only classify as non-telecine if dup% drops very low
-        if dup_pct >= 5.0:
+    # If global file is clearly telecine, use relaxed per-window thresholds
+    if global_combed_pct >= TELECINE_COMBED_MIN and global_cadence5_pct >= TELECINE_CADENCE5_MIN:
+        # Global is telecine — only classify as non-telecine if very different
+        if combed_pct >= 10:
             return "TELECINE"
-        elif combed_pct < 2:
+        elif combed_pct < 3:
             return "PROGRESSIVE"
         else:
-            return "INTERLACED"
+            return "MIXED"
 
-    # Global file is NOT clearly telecine — use standard thresholds
-    if dup_pct >= DUP_FIELD_TELECINE_PCT:
+    # Standard thresholds
+    if combed_pct >= TELECINE_COMBED_MIN and cadence5_pct >= TELECINE_CADENCE5_MIN:
         return "TELECINE"
-    elif dup_pct <= DUP_FIELD_INTERLACED_PCT and combed_pct < 5:
-        return "PROGRESSIVE"
-    elif dup_pct <= DUP_FIELD_INTERLACED_PCT:
+    elif combed_pct >= INTERLACED_COMBED_MIN:
         return "INTERLACED"
+    elif combed_pct < PROGRESSIVE_COMBED_MAX:
+        return "PROGRESSIVE"
     else:
         return "MIXED"
+
+
+def _window_cadence5(combed_indices: list[int]) -> float:
+    """Compute cadence-5 percentage for a list of combed frame indices."""
+    if len(combed_indices) < 3:
+        return 0.0
+    gaps = [combed_indices[j+1] - combed_indices[j] for j in range(len(combed_indices) - 1)]
+    pairs_sum5 = sum(1 for j in range(len(gaps) - 1) if gaps[j] + gaps[j+1] == 5)
+    total_pairs = len(gaps) - 1
+    return (pairs_sum5 / total_pairs * 100) if total_pairs > 0 else 0.0
 
 
 def _refine_segments_with_layer2(
@@ -95,16 +70,11 @@ def _refine_segments_with_layer2(
     fps: float,
 ) -> list[Segment]:
     """
-    Rebuild segment map using Layer 2 per-frame data.
+    Rebuild segment map using Layer 2 per-frame combing data.
 
     Layer 1 segments are based purely on trf cycling. For hard telecine
-    (no RFF flags), Layer 1 sees everything as VIDEO even though the content
-    is telecine. This function re-segments using per-frame duplicate field
-    and combing data from Layer 2.
-
-    Uses the global dup field % to set context-aware thresholds: when the
-    whole file is clearly telecine, individual windows need much lower dup%
-    to be classified as non-telecine (avoids false MIXED on scene changes).
+    (no RFF flags), Layer 1 sees everything as VIDEO. This function
+    re-segments using Laplacian combing + cadence-5 analysis from Layer 2.
     """
     per_frame = pixel.per_frame
     if not per_frame:
@@ -116,20 +86,39 @@ def _refine_segments_with_layer2(
     if fps <= 0:
         fps = 29.97
 
-    # Global dup field % from full-file analysis (for context)
-    global_dup_pct = pixel.dup_field_pct
+    # Global metrics for context
+    global_combed_pct = pixel.combed_pct
+    global_cadence5_pct = pixel.cadence5_pct
 
     l1_per_frame = bitstream.per_frame if bitstream else []
     window = SEGMENT_WINDOW
 
     # Pass 1: classify each window
-    window_types: list[tuple[int, int, str]] = []  # (start, end, type)
+    window_types: list[tuple[int, int, str]] = []
     for win_start in range(0, total, window):
         win_end = min(win_start + window, total)
-        dup_pct, combed_pct, cycling_pct, _ = _compute_window_metrics(
-            per_frame, l1_per_frame, win_start, win_end,
+        chunk = per_frame[win_start:win_end]
+        chunk_size = len(chunk)
+
+        # Combed frame count and indices within this window
+        combed_count = sum(1 for f in chunk if f.get("combed", False))
+        combed_pct = combed_count / chunk_size * 100 if chunk_size else 0
+
+        # Local combed indices for cadence analysis
+        local_combed = [f["idx"] for f in chunk if f.get("combed", False)]
+        cadence5 = _window_cadence5(local_combed)
+
+        # Layer 1 cycling
+        cycling_pct = 0.0
+        if l1_per_frame and win_end <= len(l1_per_frame):
+            l1_chunk = l1_per_frame[win_start:win_end]
+            cycling_count = sum(1 for f in l1_chunk if f.get("cycling") is True)
+            cycling_pct = cycling_count / chunk_size * 100
+
+        win_type = _classify_window(
+            combed_pct, cadence5, cycling_pct,
+            global_combed_pct, global_cadence5_pct,
         )
-        win_type = _classify_window(dup_pct, combed_pct, cycling_pct, global_dup_pct)
         window_types.append((win_start, win_end, win_type))
 
     # Pass 2: absorb tiny isolated segments (1 window surrounded by same type)
@@ -139,7 +128,6 @@ def _refine_segments_with_layer2(
             curr_type = window_types[i][2]
             next_type = window_types[i + 1][2]
             if prev_type == next_type and curr_type != prev_type:
-                # Isolated different window — absorb into neighbors
                 window_types[i] = (window_types[i][0], window_types[i][1], prev_type)
 
     # Pass 3: merge adjacent same-type windows into segments
@@ -180,17 +168,6 @@ def _make_refined_segment(
     combed_count = sum(1 for f in chunk if f.get("combed", False))
     combed_pct = combed_count / chunk_size * 100 if chunk_size else 0
 
-    dup_count = 0
-    dup_total = 0
-    for f in chunk:
-        top = f.get("top_fsad")
-        bot = f.get("bot_fsad")
-        if top is not None and top >= 0:
-            dup_total += 1
-            if top < DUP_FIELD_SAD_THRESHOLD or (bot is not None and bot < DUP_FIELD_SAD_THRESHOLD):
-                dup_count += 1
-    dup_pct = (dup_count / dup_total * 100) if dup_total > 0 else 0
-
     # Layer 1 metrics for this range
     cycling_pct = 0.0
     intl_pct = 100.0
@@ -219,7 +196,6 @@ def _make_refined_segment(
         interlaced_pct=intl_pct,
         duration_sec=round(chunk_size / fps, 1),
         content_type=content_type,
-        dup_field_pct=round(dup_pct, 1),
         combed_pct=round(combed_pct, 1),
     )
 
@@ -337,12 +313,13 @@ class AnalysisWorker(QtCore.QObject):
                     f"({result.classification.confidence}) — Layer 2 not needed"
                 )
         else:
-            needs_layer2 = False
+            # Non-MPEG-2: always run Layer 2 if enabled
+            needs_layer2 = self._auto_layer2
             result.classification = classify(si, None)
 
         # ── Layer 2: Pixel Analysis ────────────────────────────────────
         if needs_layer2 and not self._stopped:
-            on_progress("Layer 2: Pixel analysis (Naranjo + autocorrelation)...")
+            on_progress("Layer 2: Laplacian combing detection...")
             try:
                 result.pixel = run_layer2(
                     filepath, si,
@@ -352,13 +329,11 @@ class AnalysisWorker(QtCore.QObject):
                 )
                 result.layer2_ran = True
             except ImportError as e:
-                on_progress(f"Layer 2 skipped: {e} (vapoursynth/scipy required)")
-                from .models import PixelResult
+                on_progress(f"Layer 2 skipped: {e} (vapoursynth required)")
                 result.pixel = PixelResult(error=f"import error: {e}")
                 result.layer2_ran = False
             except Exception as e:
                 on_progress(f"Layer 2 error: {e}")
-                from .models import PixelResult
                 result.pixel = PixelResult(error=str(e))
                 result.layer2_ran = True
 
@@ -371,7 +346,7 @@ class AnalysisWorker(QtCore.QObject):
 
             # Refine segment map with Layer 2 per-frame data
             if result.bitstream and result.pixel:
-                on_progress("Refining segment map with pixel analysis data...")
+                on_progress("Refining segment map with combing data...")
                 fps = si.fps if si.fps > 0 else 29.97
                 result.bitstream.segments = _refine_segments_with_layer2(
                     result.bitstream, result.pixel, fps
@@ -436,12 +411,13 @@ class AnalysisWorker(QtCore.QObject):
         """Determine if Layer 3 field-swap validation is needed."""
         if px is None or px.error:
             return False
-        # Gray zone: duplicate field % between thresholds
-        from .models import DUP_FIELD_TELECINE_PCT, DUP_FIELD_INTERLACED_PCT
-        dup_pct = px.dup_field_pct
-        if DUP_FIELD_INTERLACED_PCT < dup_pct < DUP_FIELD_TELECINE_PCT:
+        # Run Layer 3 in gray zones where combing/cadence is ambiguous
+        combed = px.combed_pct
+        cadence5 = px.cadence5_pct
+        # Moderate combing but weak cadence — could be telecine with broken cadence
+        if PROGRESSIVE_COMBED_MAX <= combed < INTERLACED_COMBED_MIN and cadence5 < TELECINE_CADENCE5_MIN:
             return True
-        # Also run if high dup but no period-5 (shifted cadence)
-        if dup_pct >= DUP_FIELD_TELECINE_PCT and not px.dup_field_has_period5:
+        # High combing with some cadence but not conclusive
+        if combed >= TELECINE_COMBED_MIN and 5 < cadence5 < TELECINE_CADENCE5_MIN:
             return True
         return False

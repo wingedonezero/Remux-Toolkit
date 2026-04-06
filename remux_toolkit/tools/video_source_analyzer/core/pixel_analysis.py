@@ -1,122 +1,42 @@
-"""Layer 2: Naranjo chi-square + dual autocorrelation + duplicate field detection."""
+"""Layer 2: TIVTC-style Laplacian combing detection + cadence analysis.
+
+Uses the proven 5-tap vertical Laplacian kernel [1, -3, 4, -3, 1] from
+TIVTC/HandBrake to detect combing artifacts, with a temporal motion gate
+to avoid false positives on static content.
+
+Frame-level combing is determined via block-based counting (COMBPEL threshold
+per 16x16 block), matching the approach used by HandBrake/TIVTC.
+
+Classification signals:
+- combed_pct: percentage of frames flagged as combed
+- cadence5_pct: how strongly combed frames follow period-5 (3:2 telecine)
+- These two metrics cleanly separate content types:
+    ~30-40% combed + high cadence-5  → hard telecine
+    >40% combed + low cadence-5      → interlaced
+    <15% combed                      → progressive
+"""
 
 from __future__ import annotations
 
 import time
+from collections import Counter
 from typing import Callable, Optional
 
-from .models import (
-    PixelResult, StreamInfo,
-    COMBING_RATIO_THRESHOLD, CHI_SQUARE_ALPHA, MAD_SCALE,
-    DUP_FIELD_SAD_THRESHOLD, DUP_FIELD_PERIOD5_RATIO,
-)
+from .models import PixelResult, StreamInfo
 
 
-def _compute_field_difference(arr, np) -> float:
-    """Field difference x[n] = mean|even_rows - odd_rows|."""
-    h, w = arr.shape
-    if h < 6:
-        return 0.0
-    f = arr.astype(np.float32)
-    even_rows = f[0::2]
-    odd_rows = f[1::2]
-    min_h = min(len(even_rows), len(odd_rows))
-    return float(np.mean(np.abs(even_rows[:min_h] - odd_rows[:min_h])))
+# ── TIVTC-equivalent thresholds (8-bit baseline, scaled for higher depths) ──
+CTHRESH_8BIT = 9          # adjacent-line diff threshold
+MTHRESH_8BIT = 10         # motion threshold (temporal gate)
+BLOCK_SIZE = 16            # block size for combed pixel counting
+COMBPEL = 40               # combed pixels per block to flag frame as combed
 
-
-def _compute_combing_ratio(arr, np) -> tuple[float, float, float]:
-    """
-    Inter-field/intra-field SAD ratio — self-normalizing combing metric.
-
-    Returns (ratio, inter_sad, intra_sad).
-    """
-    h, w = arr.shape
-    if h < 6:
-        return 0.0, 0.0, 0.0
-
-    f = arr.astype(np.float32)
-
-    # Inter-field: adjacent rows (different fields)
-    even_rows = f[0::2]
-    odd_rows = f[1::2]
-    min_h = min(len(even_rows), len(odd_rows))
-    inter_sad = float(np.mean(np.abs(even_rows[:min_h] - odd_rows[:min_h])))
-
-    # Intra-field: same-parity rows (within each field)
-    intra_top = (
-        float(np.mean(np.abs(even_rows[:-1] - even_rows[1:])))
-        if len(even_rows) > 1 else 0.0
-    )
-    intra_bot = (
-        float(np.mean(np.abs(odd_rows[:-1] - odd_rows[1:])))
-        if len(odd_rows) > 1 else 0.0
-    )
-    intra_sad = (intra_top + intra_bot) / 2.0
-
-    if intra_sad < 0.1:
-        return (0.0 if inter_sad < 0.1 else 10.0), inter_sad, intra_sad
-
-    return inter_sad / intra_sad, inter_sad, intra_sad
-
-
-def _chi_square_detection(x, np, alpha=CHI_SQUARE_ALPHA) -> dict:
-    """
-    Naranjo chi-square energy test for telecine detection.
-
-    Under H0 (not telecined): normalized field differences are ~Gaussian.
-    Under H1 (telecined): periodic pulses add energy above noise floor.
-    """
-    from scipy import stats as sp_stats
-
-    N = len(x)
-    if N < 20:
-        return {"detected": False, "energy_ratio": 0, "std_ratio": 1.0,
-                "reason": "too few frames"}
-
-    # Robust noise estimation using MAD
-    x_median = float(np.median(x))
-    mad = float(np.median(np.abs(x - x_median)))
-    sigma_robust = mad * MAD_SCALE
-
-    x_std = float(np.std(x, ddof=1))
-
-    if sigma_robust < 0.01:
-        if x_std < 0.01:
-            return {"detected": False, "energy_ratio": 0, "std_ratio": 1.0,
-                    "reason": "no variance in field differences"}
-        sigma_robust = x_std  # fallback
-
-    x_norm = (x - x_median) / sigma_robust
-    energy = float(np.sum(x_norm ** 2))
-    threshold = float(sp_stats.chi2.ppf(1 - alpha, df=N))
-
-    detected = energy > threshold
-    energy_ratio = energy / threshold
-    std_ratio = x_std / sigma_robust if sigma_robust > 0.01 else 1.0
-
-    return {
-        "detected": detected,
-        "energy": round(energy, 1),
-        "threshold": round(threshold, 1),
-        "energy_ratio": round(energy_ratio, 4),
-        "std_ratio": round(std_ratio, 4),
-        "sigma_robust": round(sigma_robust, 4),
-        "reason": (f"energy {'>' if detected else '<='} threshold "
-                   f"({energy:.1f} vs {threshold:.1f}, ratio={energy_ratio:.3f})"),
-    }
-
-
-def _autocorr(signal, np):
-    """Compute normalized autocorrelation at lags 1-10."""
-    mean_s = float(np.mean(signal))
-    centered = signal - mean_s
-    var_s = float(np.var(signal))
-    ac = {}
-    if var_s > 0.001:
-        for lag in range(1, 11):
-            if lag < len(signal):
-                ac[lag] = float(np.mean(centered[:-lag] * centered[lag:]) / var_s)
-    return ac, var_s > 0.001
+# Classification thresholds (applied to combed_pct and cadence5_pct)
+TELECINE_COMBED_MIN = 20.0     # minimum combed% to consider telecine
+TELECINE_COMBED_MAX = 45.0     # above this, likely interlaced not telecine
+TELECINE_CADENCE5_MIN = 15.0   # minimum cadence-5% for telecine
+INTERLACED_COMBED_MIN = 35.0   # minimum combed% for interlaced
+PROGRESSIVE_COMBED_MAX = 15.0  # below this, progressive
 
 
 def run_layer2(
@@ -127,12 +47,17 @@ def run_layer2(
     check_cancelled: Optional[Callable[[], bool]] = None,
 ) -> PixelResult:
     """
-    Naranjo chi-square energy test + dual autocorrelation + dup field detection.
+    TIVTC-style combing detection with cadence analysis.
 
-    Decodes the full video via VapourSynth. Computes three signals per frame:
-    1. Field difference x[n] for chi-square energy test
-    2. Combing ratio for autocorrelation (key metric: lag5/lag1)
-    3. Duplicate field SAD for telecine field-copy detection
+    Decodes full video via VapourSynth. Per-frame:
+    1. 5-tap vertical Laplacian for combing detection
+    2. Temporal motion gate to suppress false positives
+    3. Block-based frame decision (COMBPEL per 16x16 block)
+    4. Field SAD for duplicate field tracking
+
+    Post-processing:
+    - Cadence-5 analysis on combed frame indices
+    - Gap distribution for pattern identification
     """
     import numpy as np
     import vapoursynth as vs
@@ -169,39 +94,82 @@ def run_layer2(
     else:
         clip_y = clip
 
+    # Scale thresholds for bit depth
+    bits = clip_y.format.bits_per_sample
+    scale = 1 << (bits - 8)  # 1 for 8-bit, 4 for 10-bit, 16 for 12-bit
+    cthresh = CTHRESH_8BIT * scale
+    mthresh = MTHRESH_8BIT * scale
+    lap_thresh = cthresh * 6  # Laplacian threshold = 6x cthresh (TIVTC convention)
+
     # Per-frame analysis
     per_frame = []
-    field_diffs = []
-    ratios = []
     combed_indices = []
+    prev_frame = None
     prev_top_field = None
     prev_bot_field = None
     top_field_sads = []
     bot_field_sads = []
+    combed_px_pcts = []
     last_report = t0
 
     for i, frame in enumerate(clip_y.frames()):
-        # Check cancellation
         if check_cancelled and check_cancelled():
             px.error = "cancelled"
             px.elapsed_sec = time.time() - t0
             return px
 
-        arr = np.asarray(frame[0])
+        arr = np.asarray(frame[0]).copy().astype(np.float32)
+        h, w = arr.shape
 
-        # Signal 1: field difference x[n]
-        xn = _compute_field_difference(arr, np)
+        # ── 1. Laplacian combing detection ────────────────────────────
+        # 5-tap kernel [1, -3, 4, -3, 1] applied vertically
+        # Detects alternating-line discontinuity (combing signature)
+        if h >= 5:
+            lap = np.abs(
+                arr[0:h-4] + 4*arr[2:h-2] + arr[4:h]
+                - 3*(arr[1:h-3] + arr[3:h-1])
+            )
+            # Adjacent-line difference (basic combing check)
+            adj_diff = np.abs(arr[2:h-2] - arr[3:h-1])
+            # Both conditions must be true (TIVTC metric 2)
+            combed_mask = (adj_diff > cthresh) & (lap > lap_thresh)
+        else:
+            combed_mask = np.zeros((max(h-4, 1), w), dtype=bool)
 
-        # Signal 2: combing ratio
-        ratio, inter_sad, intra_sad = _compute_combing_ratio(arr, np)
-        combed = ratio > COMBING_RATIO_THRESHOLD
+        # ── 2. Motion gate (temporal) ─────────────────────────────────
+        # Only count combed pixels where there is motion between frames
+        # This prevents false positives on static content with vertical detail
+        if prev_frame is not None and h >= 5:
+            motion = np.abs(arr - prev_frame)
+            motion_region = motion[2:h-2]
+            combed_mask = combed_mask & (motion_region > mthresh)
 
-        # Signal 3: duplicate field detection
-        f32 = arr.astype(np.float32)
-        top_f = f32[0::2]
-        bot_f = f32[1::2]
-        top_fsad = -1.0
-        bot_fsad = -1.0
+        # ── 3. Block-based frame decision ─────────────────────────────
+        # Count combed pixels per 16x16 block; if any block exceeds COMBPEL,
+        # the frame is classified as combed
+        gh, gw = combed_mask.shape
+        is_combed = False
+        max_block_count = 0
+        total_combed_px = int(combed_mask.sum())
+        combed_px_pct = total_combed_px / max(combed_mask.size, 1) * 100
+
+        for by in range(0, gh, BLOCK_SIZE):
+            for bx in range(0, gw, BLOCK_SIZE):
+                block = combed_mask[by:by+BLOCK_SIZE, bx:bx+BLOCK_SIZE]
+                bc = int(block.sum())
+                if bc > max_block_count:
+                    max_block_count = bc
+                if bc > COMBPEL:
+                    is_combed = True
+
+        combed_px_pcts.append(combed_px_pct)
+
+        # ── 4. Field SAD (duplicate field tracking) ───────────────────
+        top_f = arr[0::2]
+        bot_f = arr[1::2]
+        top_fsad = None
+        bot_fsad = None
+
         if prev_top_field is not None:
             min_ht = min(len(top_f), len(prev_top_field))
             min_hb = min(len(bot_f), len(prev_bot_field))
@@ -211,33 +179,29 @@ def run_layer2(
                 bot_f[:min_hb] - prev_bot_field[:min_hb])))
             top_field_sads.append(top_fsad)
             bot_field_sads.append(bot_fsad)
+
         prev_top_field = top_f.copy()
         prev_bot_field = bot_f.copy()
+        prev_frame = arr
 
+        if is_combed:
+            combed_indices.append(i)
+
+        # Store per-frame data
         if include_per_frame:
             per_frame.append({
                 "idx": i,
-                "xn": round(xn, 4),
-                "ratio": round(ratio, 4),
-                "inter_sad": round(inter_sad, 2),
-                "intra_sad": round(intra_sad, 2),
-                "combed": combed,
-                "top_fsad": round(top_fsad, 4) if top_fsad >= 0 else None,
-                "bot_fsad": round(bot_fsad, 4) if bot_fsad >= 0 else None,
+                "combed": is_combed,
+                "combed_px_pct": round(combed_px_pct, 3),
+                "max_block": max_block_count,
+                "top_fsad": round(top_fsad, 4) if top_fsad is not None else None,
+                "bot_fsad": round(bot_fsad, 4) if bot_fsad is not None else None,
             })
         else:
-            # Still need ratio/combed for Layer 3 handoff
             per_frame.append({
                 "idx": i,
-                "ratio": round(ratio, 4),
-                "intra_sad": round(intra_sad, 2),
-                "combed": combed,
+                "combed": is_combed,
             })
-
-        field_diffs.append(xn)
-        ratios.append(ratio)
-        if combed:
-            combed_indices.append(i)
 
         # Progress reporting
         now = time.time()
@@ -255,100 +219,58 @@ def run_layer2(
     elapsed = time.time() - t0
     rate_fps = total / elapsed if elapsed > 0 else 0
 
-    xn_arr = np.array(field_diffs)
-    ratios_arr = np.array(ratios)
-
-    # ── Chi-square energy test ─────────────────────────────────────────
-    if on_progress:
-        on_progress("Computing chi-square energy test...")
-
-    chi_result = _chi_square_detection(xn_arr, np)
-    px.chi_square_detected = chi_result.get("detected", False)
-    px.energy_ratio = round(chi_result.get("energy_ratio", 0), 4)
-    px.std_ratio = round(chi_result.get("std_ratio", 1.0), 4)
-    px.chi_square_detail = chi_result
-
-    # ── Combing statistics ─────────────────────────────────────────────
+    # ── Combing statistics ────────────────────────────────────────────
     px.combed_frames = len(combed_indices)
     px.combed_pct = round(px.combed_frames / total * 100, 2) if total > 0 else 0
-    px.median_ratio = round(float(np.median(ratios_arr)), 4)
     px.combed_indices = combed_indices
 
-    # ── Field difference stats ─────────────────────────────────────────
-    px.xn_mean = round(float(np.mean(xn_arr)), 4)
-    px.xn_std = round(float(np.std(xn_arr)), 4)
-    px.xn_median = round(float(np.median(xn_arr)), 4)
+    # Combed pixel percentage stats
+    cp_arr = np.array(combed_px_pcts) if combed_px_pcts else np.array([0.0])
+    px.combed_px_mean = round(float(np.mean(cp_arr)), 4)
+    px.combed_px_median = round(float(np.median(cp_arr)), 4)
+    px.combed_px_p95 = round(float(np.percentile(cp_arr, 95)), 4)
+    px.frames_with_any_combing = int(np.sum(cp_arr > 0))
+    px.frames_with_any_combing_pct = round(
+        px.frames_with_any_combing / total * 100, 2) if total > 0 else 0
 
-    # ── Autocorrelation of BOTH signals ────────────────────────────────
-    xn_autocorr, xn_has_var = _autocorr(xn_arr, np)
-    comb_autocorr, comb_has_var = _autocorr(ratios_arr, np)
+    # ── Cadence-5 analysis (telecine detection) ───────────────────────
+    px.cadence5_pct = 0.0
+    px.gap_distribution = {}
 
-    px.xn_autocorrelation = {str(k): round(v, 4) for k, v in xn_autocorr.items()}
-    px.xn_lag1 = round(xn_autocorr.get(1, 0.0), 4)
-    px.xn_lag5 = round(xn_autocorr.get(5, 0.0), 4)
-    px.xn_lag5_lag1_ratio = round(
-        px.xn_lag5 / px.xn_lag1 if abs(px.xn_lag1) > 0.001 else 0.0, 4
-    )
+    if len(combed_indices) > 5:
+        gaps = [combed_indices[j+1] - combed_indices[j]
+                for j in range(len(combed_indices) - 1)]
+        gap_counts = Counter(gaps)
+        px.gap_distribution = {str(k): v for k, v in gap_counts.most_common(10)}
 
-    px.comb_autocorrelation = {str(k): round(v, 4) for k, v in comb_autocorr.items()}
-    px.comb_lag1 = round(comb_autocorr.get(1, 0.0), 4)
-    px.comb_lag5 = round(comb_autocorr.get(5, 0.0), 4)
-    px.comb_lag5_lag1_ratio = round(
-        px.comb_lag5 / px.comb_lag1 if abs(px.comb_lag1) > 0.001 else 0.0, 4
-    )
-    px.has_variance = comb_has_var or xn_has_var
-
-    # ── Duplicate field detection ──────────────────────────────────────
-    top_sads_arr = np.array(top_field_sads)
-    bot_sads_arr = np.array(bot_field_sads)
-    n_pairs = len(top_sads_arr)
-
-    if n_pairs > 10:
-        either_dup = (
-            (top_sads_arr < DUP_FIELD_SAD_THRESHOLD)
-            | (bot_sads_arr < DUP_FIELD_SAD_THRESHOLD)
+        # Cadence-5: consecutive gap pairs that sum to 5
+        # In 3:2 telecine, gaps alternate 1,4 or 2,3 (summing to 5)
+        pairs_sum5 = sum(
+            1 for j in range(len(gaps) - 1)
+            if gaps[j] + gaps[j+1] == 5
         )
-        px.dup_field_pct = round(float(np.sum(either_dup) / n_pairs * 100), 2)
-        px.dup_field_pct_02 = round(float(np.sum(
-            (top_sads_arr < 0.2) | (bot_sads_arr < 0.2)) / n_pairs * 100), 2)
-        px.dup_field_pct_10 = round(float(np.sum(
-            (top_sads_arr < 1.0) | (bot_sads_arr < 1.0)) / n_pairs * 100), 2)
+        total_pairs = len(gaps) - 1
+        if total_pairs > 0:
+            px.cadence5_pct = round(pairs_sum5 / total_pairs * 100, 2)
 
-        # Autocorrelation of the duplicate mask
-        dup_sig = either_dup.astype(np.float64)
-        dup_sig_centered = dup_sig - dup_sig.mean()
-        dup_sig_var = float(np.var(dup_sig))
+        # Telecine gap ratio: how much of the gap distribution is 1+4 (telecine)
+        gap1 = gap_counts.get(1, 0)
+        gap4 = gap_counts.get(4, 0)
+        total_gaps = len(gaps)
+        px.telecine_gap_pct = round((gap1 + gap4) / total_gaps * 100, 2) if total_gaps > 0 else 0
 
-        dup_autocorr = {}
-        if dup_sig_var > 1e-6:
-            for lag in range(1, 11):
-                if lag < len(dup_sig):
-                    dup_autocorr[lag] = float(
-                        np.mean(dup_sig_centered[:-lag] * dup_sig_centered[lag:])
-                        / dup_sig_var
-                    )
+    # ── Field SAD statistics ──────────────────────────────────────────
+    if top_field_sads:
+        top_arr = np.array(top_field_sads)
+        bot_arr = np.array(bot_field_sads)
+        px.top_field_sad_median = round(float(np.median(top_arr)), 4)
+        px.bot_field_sad_median = round(float(np.median(bot_arr)), 4)
+        px.top_field_sad_p5 = round(float(np.percentile(top_arr, 5)), 4)
+        px.bot_field_sad_p5 = round(float(np.percentile(bot_arr, 5)), 4)
 
-        px.dup_field_autocorrelation = {
-            str(k): round(v, 4) for k, v in dup_autocorr.items()
-        }
-        px.dup_field_lag1 = round(dup_autocorr.get(1, 0.0), 4)
-        px.dup_field_lag5 = round(dup_autocorr.get(5, 0.0), 4)
-        dup_l5l1 = (
-            px.dup_field_lag5 / px.dup_field_lag1
-            if abs(px.dup_field_lag1) > 0.001 else 0.0
-        )
-        px.dup_field_lag5_lag1_ratio = round(dup_l5l1, 4)
-        px.dup_field_has_period5 = (
-            dup_l5l1 > DUP_FIELD_PERIOD5_RATIO and px.dup_field_lag5 > 0.1
-        )
-
-        # Field SAD statistics
-        px.dup_field_top_median_sad = round(float(np.median(top_sads_arr)), 4)
-        px.dup_field_bot_median_sad = round(float(np.median(bot_sads_arr)), 4)
-        px.dup_field_top_p5_sad = round(float(np.percentile(top_sads_arr, 5)), 4)
-        px.dup_field_bot_p5_sad = round(float(np.percentile(bot_sads_arr, 5)), 4)
-
-    # ── Finalize ───────────────────────────────────────────────────────
+    # ── Finalize ──────────────────────────────────────────────────────
+    px.bit_depth = bits
+    px.bit_depth_scale = scale
     px.per_frame = per_frame
     px.elapsed_sec = round(elapsed, 2)
     px.frames_per_sec = round(rate_fps, 1)
@@ -356,7 +278,8 @@ def run_layer2(
     if on_progress:
         on_progress(
             f"Layer 2 complete: {total:,} frames in {elapsed:.1f}s "
-            f"@ {rate_fps:.0f} f/s"
+            f"@ {rate_fps:.0f} f/s | "
+            f"combed={px.combed_pct:.1f}%, cadence5={px.cadence5_pct:.1f}%"
         )
 
     return px

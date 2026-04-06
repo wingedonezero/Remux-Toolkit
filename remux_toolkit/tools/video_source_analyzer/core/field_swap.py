@@ -9,7 +9,24 @@ from .models import (
     FieldSwapResult, PixelResult, StreamInfo,
     FIXED_THRESHOLD, MIN_COMBED_FOR_FIELDSWAP,
 )
-from .pixel_analysis import _compute_combing_ratio
+
+
+def _compute_combing_ratio(arr, np) -> tuple[float, float, float]:
+    """Inter-field/intra-field SAD ratio — used for field-swap validation."""
+    h, w = arr.shape
+    if h < 6:
+        return 0.0, 0.0, 0.0
+    f = arr.astype(np.float32)
+    even_rows = f[0::2]
+    odd_rows = f[1::2]
+    min_h = min(len(even_rows), len(odd_rows))
+    inter_sad = float(np.mean(np.abs(even_rows[:min_h] - odd_rows[:min_h])))
+    intra_top = float(np.mean(np.abs(even_rows[:-1] - even_rows[1:]))) if len(even_rows) > 1 else 0.0
+    intra_bot = float(np.mean(np.abs(odd_rows[:-1] - odd_rows[1:]))) if len(odd_rows) > 1 else 0.0
+    intra_sad = (intra_top + intra_bot) / 2.0
+    if intra_sad < 0.1:
+        return (0.0 if inter_sad < 0.1 else 10.0), inter_sad, intra_sad
+    return inter_sad / intra_sad, inter_sad, intra_sad
 
 
 def _swap_top_field(base, donor):
