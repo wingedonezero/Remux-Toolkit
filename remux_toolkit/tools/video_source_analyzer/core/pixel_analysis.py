@@ -112,55 +112,60 @@ def run_layer2(
     combed_px_pcts = []
     last_report = t0
 
-    for i, frame in enumerate(clip_y.frames()):
+    # Use VapourSynth's built-in frame prefetching for parallel decode
+    # prefetch=8 means up to 8 frames decoded in parallel by ffms2
+    frame_iter = clip_y.frames(prefetch=8, backlog=16, close=True)
+
+    for i, frame in enumerate(frame_iter):
         if check_cancelled and check_cancelled():
             px.error = "cancelled"
             px.elapsed_sec = time.time() - t0
             return px
 
-        arr = np.asarray(frame[0]).copy().astype(np.float32)
+        # int16 is ~2x faster than float32 and sufficient for our math
+        # (no overflow at 8-12 bit luma values with our kernel coefficients)
+        arr = np.asarray(frame[0]).astype(np.int16, copy=False)
         h, w = arr.shape
 
         # ── 1. Laplacian combing detection ────────────────────────────
         # 5-tap kernel [1, -3, 4, -3, 1] applied vertically
-        # Detects alternating-line discontinuity (combing signature)
         if h >= 5:
             lap = np.abs(
                 arr[0:h-4] + 4*arr[2:h-2] + arr[4:h]
                 - 3*(arr[1:h-3] + arr[3:h-1])
             )
-            # Adjacent-line difference (basic combing check)
             adj_diff = np.abs(arr[2:h-2] - arr[3:h-1])
-            # Both conditions must be true (TIVTC metric 2)
             combed_mask = (adj_diff > cthresh) & (lap > lap_thresh)
         else:
             combed_mask = np.zeros((max(h-4, 1), w), dtype=bool)
 
         # ── 2. Motion gate (temporal) ─────────────────────────────────
-        # Only count combed pixels where there is motion between frames
-        # This prevents false positives on static content with vertical detail
         if prev_frame is not None and h >= 5:
             motion = np.abs(arr - prev_frame)
             motion_region = motion[2:h-2]
             combed_mask = combed_mask & (motion_region > mthresh)
 
-        # ── 3. Block-based frame decision ─────────────────────────────
-        # Count combed pixels per 16x16 block; if any block exceeds COMBPEL,
-        # the frame is classified as combed
+        # ── 3. Block-based frame decision (vectorized) ────────────────
+        # Reshape combed_mask into 16x16 blocks and sum each block
+        # in a single numpy operation instead of Python loops
         gh, gw = combed_mask.shape
-        is_combed = False
-        max_block_count = 0
         total_combed_px = int(combed_mask.sum())
         combed_px_pct = total_combed_px / max(combed_mask.size, 1) * 100
 
-        for by in range(0, gh, BLOCK_SIZE):
-            for bx in range(0, gw, BLOCK_SIZE):
-                block = combed_mask[by:by+BLOCK_SIZE, bx:bx+BLOCK_SIZE]
-                bc = int(block.sum())
-                if bc > max_block_count:
-                    max_block_count = bc
-                if bc > COMBPEL:
-                    is_combed = True
+        # Pad to multiple of BLOCK_SIZE so reshape works
+        pad_h = (BLOCK_SIZE - gh % BLOCK_SIZE) % BLOCK_SIZE
+        pad_w = (BLOCK_SIZE - gw % BLOCK_SIZE) % BLOCK_SIZE
+        if pad_h or pad_w:
+            mask_padded = np.pad(combed_mask, ((0, pad_h), (0, pad_w)))
+        else:
+            mask_padded = combed_mask
+        gh2, gw2 = mask_padded.shape
+        # Reshape to (rows, BLOCK, cols, BLOCK), sum over the BLOCK axes
+        blocks = mask_padded.reshape(
+            gh2 // BLOCK_SIZE, BLOCK_SIZE, gw2 // BLOCK_SIZE, BLOCK_SIZE
+        ).sum(axis=(1, 3), dtype=np.int32)
+        max_block_count = int(blocks.max()) if blocks.size > 0 else 0
+        is_combed = max_block_count > COMBPEL
 
         combed_px_pcts.append(combed_px_pct)
 
