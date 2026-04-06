@@ -29,57 +29,51 @@ def _classify_window(
     file_type: str,
 ) -> str:
     """
-    Classify a single window using combing + cadence metrics.
+    Classify a single window using cadence-5 as the primary signal.
 
-    Uses the file-level classification as dominant context. Combing %
-    varies hugely with motion content (a quiet 500-frame window in
-    interlaced content can show 5% combing while a busy window shows
-    60%). Without context, the same file looks like a noisy mix.
+    Cadence-5 is the structural fingerprint of NTSC 3:2 pulldown — if
+    a window has period-5 combed pairs, it IS telecine, regardless of
+    combing %. This same logic works at file and window level.
 
-    Strategy: default to the file type, only flip on STRONG opposing
-    evidence within the window.
+    Quiet/static windows have very few combed frames so cadence-5 isn't
+    meaningful — those default to the file type.
     """
     if cycling_pct > 20:
         return "FILM"
 
-    # ── File is HARD TELECINE ────────────────────────────────────────
-    if file_type == "hard_telecine":
-        # Strong opposing evidence: high combing, no cadence → interlaced segment
-        if combed_pct >= 40 and cadence5_pct < 10:
-            return "INTERLACED"
-        # Truly progressive segment: very low combing, no cadence
-        if combed_pct < 3 and cadence5_pct < 5:
-            return "PROGRESSIVE"
-        # Default: telecine (even on low-motion windows)
+    # ── Strong telecine cadence → TELECINE (truth signal) ────────────
+    # Cadence is structural; if it's there, it's telecine
+    if cadence5_pct >= 25 and combed_pct >= 8:
         return "TELECINE"
 
-    # ── File is INTERLACED ───────────────────────────────────────────
-    if file_type == "interlaced":
-        # Strong opposing evidence: telecine cadence in this window
-        if cadence5_pct >= 25 and combed_pct >= 15:
-            return "TELECINE"
-        # Truly progressive segment: very low combing
-        if combed_pct < 3 and cadence5_pct < 5:
-            return "PROGRESSIVE"
-        # Default: interlaced (even on low-motion windows)
+    # ── High combing without cadence → INTERLACED ────────────────────
+    # True interlaced video has combing on most motion frames
+    if combed_pct >= 30 and cadence5_pct < 10:
         return "INTERLACED"
 
-    # ── File is PROGRESSIVE ──────────────────────────────────────────
-    if file_type == "progressive":
-        # Strong opposing evidence: high combing
-        if combed_pct >= 35 and cadence5_pct < 15:
-            return "INTERLACED"
-        if cadence5_pct >= 25 and combed_pct >= 15:
-            return "TELECINE"
+    # ── Very low combing → PROGRESSIVE or static section ─────────────
+    if combed_pct < 5 and cadence5_pct < 8:
+        # In a telecine/interlaced file, this could just be a static scene
+        # — fall back to file type rather than calling it progressive
+        if file_type in ("hard_telecine", "interlaced"):
+            return "TELECINE" if file_type == "hard_telecine" else "INTERLACED"
         return "PROGRESSIVE"
 
-    # ── File is SOFT TELECINE / MIXED / UNKNOWN ──────────────────────
-    # Use standalone window thresholds
-    if cadence5_pct >= 25 and combed_pct >= 15:
+    # ── Moderate signals — defer to file type ────────────────────────
+    # Window data is ambiguous, trust the file-level classification
+    if file_type == "hard_telecine":
         return "TELECINE"
-    if combed_pct >= 35 and cadence5_pct < 15:
+    if file_type == "interlaced":
         return "INTERLACED"
-    if combed_pct < 10 and cadence5_pct < 10:
+    if file_type == "progressive":
+        return "PROGRESSIVE"
+
+    # ── Standalone fallback for soft_telecine_mixed / unknown files ──
+    if combed_pct >= 20 and cadence5_pct >= 15:
+        return "TELECINE"
+    if combed_pct >= 30:
+        return "INTERLACED"
+    if combed_pct < 10:
         return "PROGRESSIVE"
     return "MIXED"
 
