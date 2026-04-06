@@ -8,8 +8,8 @@ from .models import (
     ClassificationResult, StreamInfo, BitstreamResult, PixelResult,
     FieldSwapResult,
     FILM_PCT_HIGH, FILM_PCT_MED, FILM_PCT_LOW,
-    DUP_FIELD_TELECINE_PCT, DUP_FIELD_INTERLACED_PCT,
-    FIELDSWAP_TELECINE_PCT, FIELDSWAP_INTERLACED_PCT,
+    TELECINE_COMBED_MIN, TELECINE_COMBED_MAX, TELECINE_CADENCE5_MIN,
+    INTERLACED_COMBED_MIN, PROGRESSIVE_COMBED_MAX,
 )
 
 
@@ -28,7 +28,7 @@ def classify(
     3. VFR + high Film% → soft telecine
     4. Film% alone (CFR with cycling) → soft telecine
     5. Pure progressive (>95% progressive frames)
-    6. Interlaced → use Layer 2 duplicate fields + Layer 3 field-swap
+    6. Interlaced → use Layer 2 Laplacian combing + cadence-5
     7. Mixed / fallback
     """
     bs = bitstream or BitstreamResult()
@@ -64,6 +64,9 @@ def classify(
 
     # ── Non-MPEG-2 shortcut ────────────────────────────────────────────
     if not stream_info.is_mpeg2:
+        # For non-MPEG-2, use Layer 2 if available
+        if px is not None and not px.error:
+            return _classify_from_pixel(px, fs, result)
         if stream_info.scan_type.lower() == "progressive":
             return result("progressive", "high",
                           "non-MPEG-2 codec, container says progressive")
@@ -125,93 +128,17 @@ def classify(
         return result("progressive", "high",
                       f"{prog_pct:.1f}% progressive frames, {film_pct:.1f}% film")
 
-    # ── Interlaced → Layer 2 + Layer 3 ─────────────────────────────────
-    if intl_pct > 80 and film_pct < 5 and px is not None:
-        chi_detected = px.chi_square_detected
-        energy_ratio = px.energy_ratio
-        comb_l5l1 = px.comb_lag5_lag1_ratio
-        has_var = px.has_variance
+    # ── Interlaced / hard telecine → Layer 2 ──────────────────────────
+    if intl_pct > 80 and film_pct < 5 and px is not None and not px.error:
+        return _classify_from_pixel(px, fs, result)
 
-        # Duplicate field metrics (primary discriminator)
-        dup_pct = px.dup_field_pct
-        dup_l5l1 = px.dup_field_lag5_lag1_ratio
-        dup_period5 = px.dup_field_has_period5
-
-        # Layer 3 metrics
-        fix_pct = fs.fix_pct if fs else -1.0
-        insufficient = fs.insufficient_data if fs else True
-        has_fieldswap = fix_pct >= 0 and not insufficient
-
-        detail = (f"dup={dup_pct:.1f}% L5/L1={dup_l5l1:.2f}, "
-                  f"comb_L5/L1={comb_l5l1:.2f}")
-        if has_fieldswap:
-            detail += f", fix={fix_pct:.1f}%"
-
-        # 1. No variance → interlaced
-        if not has_var:
-            return result("interlaced", "high",
-                          f"no signal variance ({detail})",
-                          "", "interlaced")
-
-        # 2. High dup fields + period-5 → hard telecine (definitive)
-        if dup_pct >= DUP_FIELD_TELECINE_PCT and dup_period5:
-            return result("hard_telecine", "high",
-                          f"duplicate fields with period-5 ({detail})",
-                          "progressive")
-
-        # 3. High dup fields, no clear period-5
-        if dup_pct >= DUP_FIELD_TELECINE_PCT:
-            if has_fieldswap and fix_pct >= FIELDSWAP_TELECINE_PCT:
-                return result("hard_telecine", "high",
-                              f"high dup fields + field-swap ({detail})",
-                              "progressive")
-            return result("hard_telecine", "medium",
-                          f"high dup fields, no period-5 ({detail})",
-                          "progressive")
-
-        # 4. No duplicate fields → true interlaced
-        if dup_pct <= DUP_FIELD_INTERLACED_PCT:
-            return result("interlaced", "high",
-                          f"no duplicate fields ({detail})",
-                          "", "interlaced")
-
-        # ── Gray zone (3-15% dup fields) ───────────────────────────
-        # 5. Field-swap confirms telecine
-        if has_fieldswap and fix_pct >= FIELDSWAP_TELECINE_PCT:
-            return result("hard_telecine", "high",
-                          f"field-swap confirmed + moderate dup ({detail})",
-                          "progressive")
-
-        # 6. Field-swap negative → interlaced
-        if has_fieldswap and fix_pct < FIELDSWAP_INTERLACED_PCT:
-            return result("interlaced", "high",
-                          f"field-swap negative + low dup ({detail})",
-                          "", "interlaced")
-
-        # 7. Strong autocorrelation signals
-        if comb_l5l1 > 2.0 and dup_pct > 5:
-            return result("hard_telecine", "medium",
-                          f"period-5 combing + dup fields ({detail})",
-                          "progressive")
-
-        # 8. Moderate mixed signals
-        if has_fieldswap and fix_pct > 50:
-            return result("hard_telecine", "medium",
-                          f"moderate field-swap + dup ({detail})",
-                          "progressive")
-
-        # 9. Fallback → interlaced
-        return result("interlaced", "medium",
-                      f"uncertain gray zone ({detail})",
-                      "", "interlaced")
-
-    # ── Interlaced without Layer 2 ─────────────────────────────────────
+    # ── Interlaced without Layer 2 ────────────────────────────────────
     if intl_pct > 80 and film_pct < 5:
         return result("interlaced", "low",
                       f"{intl_pct:.1f}% interlaced, no pixel analysis",
                       "", "interlaced")
 
-    # ── Mixed / fallback ────────────────────────────────────────��──────
+    # ── Mixed / fallback ──────────────────────────────────────────────
     if has_film_seg and has_video_seg:
         return result("mixed", "low",
                       f"mixed segments: film={film_pct:.1f}%, intl={intl_pct:.1f}%",
@@ -220,3 +147,87 @@ def classify(
     return result("unknown", "low",
                   f"unclassified: film={film_pct:.1f}%, "
                   f"prog={prog_pct:.1f}%, intl={intl_pct:.1f}%")
+
+
+def _classify_from_pixel(
+    px: PixelResult,
+    fs: Optional[FieldSwapResult],
+    result_fn,
+) -> ClassificationResult:
+    """
+    Classify based on Layer 2 Laplacian combing + cadence-5 analysis.
+
+    Key metrics:
+    - combed_pct: % of frames with block-level combing
+    - cadence5_pct: how strongly combed frames follow period-5 (3:2 pulldown)
+
+    Decision matrix:
+    - combed ~30-40% + cadence5 >15% → hard telecine
+    - combed >35% + cadence5 <15%    → interlaced
+    - combed <15%                    → progressive
+    """
+    combed_pct = px.combed_pct
+    cadence5 = px.cadence5_pct
+    telecine_gap = px.telecine_gap_pct
+
+    detail = (f"combed={combed_pct:.1f}%, cadence5={cadence5:.1f}%, "
+              f"tc_gaps={telecine_gap:.1f}%")
+
+    # Layer 3 field-swap if available
+    fix_pct = -1.0
+    if fs and not fs.insufficient_data and fs.fix_pct >= 0:
+        fix_pct = fs.fix_pct
+        detail += f", fix={fix_pct:.1f}%"
+
+    # ── Progressive: very low combing ─────────────────────────────────
+    if combed_pct < PROGRESSIVE_COMBED_MAX:
+        return result_fn("progressive", "high",
+                         f"low combing ({detail})")
+
+    # ── Hard telecine: moderate combing with period-5 cadence ─────────
+    if combed_pct >= TELECINE_COMBED_MIN and cadence5 >= TELECINE_CADENCE5_MIN:
+        # Strong telecine signal
+        if combed_pct <= TELECINE_COMBED_MAX and cadence5 >= 30:
+            return result_fn("hard_telecine", "high",
+                             f"telecine cadence detected ({detail})",
+                             "progressive")
+        # Good cadence but combing % is high (might have interlaced segments)
+        if combed_pct > TELECINE_COMBED_MAX:
+            return result_fn("hard_telecine", "medium",
+                             f"telecine cadence + high combing ({detail})",
+                             "progressive")
+        # Moderate cadence
+        return result_fn("hard_telecine", "medium",
+                         f"moderate telecine cadence ({detail})",
+                         "progressive")
+
+    # ── Reinforce with field-swap if available ────────────────────────
+    if fix_pct >= 80 and combed_pct >= TELECINE_COMBED_MIN:
+        return result_fn("hard_telecine", "high",
+                         f"field-swap confirmed telecine ({detail})",
+                         "progressive")
+
+    # ── Interlaced: high combing, no telecine cadence ─────────────────
+    if combed_pct >= INTERLACED_COMBED_MIN and cadence5 < TELECINE_CADENCE5_MIN:
+        return result_fn("interlaced", "high",
+                         f"high combing, no telecine pattern ({detail})",
+                         "", "interlaced")
+
+    # ── Gray zone ─────────────────────────────────────────────────────
+    # Moderate combing but weak cadence — could be mixed or noisy telecine
+    if combed_pct >= TELECINE_COMBED_MIN:
+        if fix_pct >= 50:
+            return result_fn("hard_telecine", "medium",
+                             f"field-swap supports telecine ({detail})",
+                             "progressive")
+        if cadence5 >= 10:
+            return result_fn("hard_telecine", "low",
+                             f"weak telecine signal ({detail})",
+                             "progressive")
+        return result_fn("mixed", "low",
+                         f"ambiguous: moderate combing, weak cadence ({detail})",
+                         "", "interlaced")
+
+    # ── Low-moderate combing, not clearly anything ────────────────────
+    return result_fn("mixed", "low",
+                     f"unclear ({detail})")

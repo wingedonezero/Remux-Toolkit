@@ -129,8 +129,8 @@ class SegmentMapWidget(QtWidgets.QWidget):
                 f"Time {t_start:.1f}s - {t_end:.1f}s  |  {seg.frame_count:,} frames",
                 f"Film cycling: {seg.cycling_pct:.0f}%  |  Interlaced: {seg.interlaced_pct:.0f}%",
             ]
-            if seg.dup_field_pct >= 0:
-                lines.append(f"Dup fields: {seg.dup_field_pct:.1f}%  |  Combed: {seg.combed_pct:.1f}%")
+            if seg.combed_pct >= 0:
+                lines.append(f"Combed: {seg.combed_pct:.1f}%")
             tip = "\n".join(lines)
             QtWidgets.QToolTip.showText(event.globalPosition().toPoint(), tip, self)
         else:
@@ -280,7 +280,7 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
         self.segment_table.setHorizontalHeaderLabels([
             "Content", "Start Frame", "End Frame",
             "Frame Count", "Duration", "Film Cycling %", "Interlaced %",
-            "Dup Field %", "Combed %",
+            "Combed %",
         ])
         self.segment_table.horizontalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.ResizeMode.Stretch
@@ -625,7 +625,6 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
                     duration,
                     f"{seg.cycling_pct:.1f}%",
                     f"{seg.interlaced_pct:.1f}%",
-                    f"{seg.dup_field_pct:.1f}%" if seg.dup_field_pct >= 0 else "-",
                     f"{seg.combed_pct:.1f}%" if seg.combed_pct >= 0 else "-",
                 ]
                 for col, text in enumerate(items):
@@ -720,62 +719,38 @@ class VideoSourceAnalyzerWidget(QtWidgets.QWidget):
         # Layer 2
         px = result.pixel
         if px and not px.error:
-            l2_node = QtWidgets.QTreeWidgetItem(tree, ["Layer 2: Pixel Analysis", ""])
+            l2_node = QtWidgets.QTreeWidgetItem(tree, ["Layer 2: Laplacian Combing", ""])
 
-            chi_node = QtWidgets.QTreeWidgetItem(l2_node, ["Chi-Square Test", ""])
+            comb_node = QtWidgets.QTreeWidgetItem(l2_node, ["Combing Detection", ""])
             for k, v in [
-                ("Detected", str(px.chi_square_detected)),
-                ("Energy Ratio", f"{px.energy_ratio:.4f}"),
-                ("Std Ratio", f"{px.std_ratio:.4f}"),
-            ]:
-                QtWidgets.QTreeWidgetItem(chi_node, [k, v])
-
-            xn_node = QtWidgets.QTreeWidgetItem(l2_node, ["Field Diff x[n]", ""])
-            for k, v in [
-                ("Mean", f"{px.xn_mean:.4f}"),
-                ("Std", f"{px.xn_std:.4f}"),
-                ("Median", f"{px.xn_median:.4f}"),
-            ]:
-                QtWidgets.QTreeWidgetItem(xn_node, [k, v])
-
-            comb_node = QtWidgets.QTreeWidgetItem(l2_node, ["Combing Stats", ""])
-            for k, v in [
-                ("Combed Frames", f"{px.combed_frames:,} ({px.combed_pct:.1f}%)"),
-                ("Median Ratio", f"{px.median_ratio:.4f}"),
+                ("Combed Frames", f"{px.combed_frames:,} / {px.total_frames:,} ({px.combed_pct:.1f}%)"),
+                ("Any Combing", f"{px.frames_with_any_combing:,} ({px.frames_with_any_combing_pct:.1f}%)"),
+                ("Combed px Mean", f"{px.combed_px_mean:.4f}%"),
+                ("Combed px P95", f"{px.combed_px_p95:.4f}%"),
+                ("Bit Depth", f"{px.bit_depth}-bit (scale={px.bit_depth_scale}x)"),
             ]:
                 QtWidgets.QTreeWidgetItem(comb_node, [k, v])
 
-            ac_node = QtWidgets.QTreeWidgetItem(l2_node, ["Autocorrelation", ""])
+            cad_node = QtWidgets.QTreeWidgetItem(l2_node, ["Cadence-5 (Telecine)", ""])
             for k, v in [
-                ("x[n] Lag5/Lag1", f"{px.xn_lag5_lag1_ratio:.3f}"),
-                ("Comb Lag5/Lag1", f"{px.comb_lag5_lag1_ratio:.3f}"),
-                ("Has Variance", str(px.has_variance)),
+                ("Cadence-5", f"{px.cadence5_pct:.1f}%"),
+                ("TC Gap %", f"{px.telecine_gap_pct:.1f}%"),
             ]:
-                QtWidgets.QTreeWidgetItem(ac_node, [k, v])
+                QtWidgets.QTreeWidgetItem(cad_node, [k, v])
+            if px.gap_distribution:
+                gap_node = QtWidgets.QTreeWidgetItem(cad_node, ["Gap Distribution", ""])
+                for gap_str, count in sorted(px.gap_distribution.items(), key=lambda x: -x[1]):
+                    QtWidgets.QTreeWidgetItem(gap_node, [f"Gap {gap_str}", f"{count:,}"])
 
-            # Full autocorrelation values
-            if px.xn_autocorrelation:
-                xn_ac_node = QtWidgets.QTreeWidgetItem(ac_node, ["x[n] Lags", ""])
-                for lag_str, val in sorted(px.xn_autocorrelation.items(), key=lambda x: int(x[0])):
-                    marker = " (period-5)" if lag_str == "5" else ""
-                    QtWidgets.QTreeWidgetItem(xn_ac_node, [f"Lag {lag_str}{marker}", f"{val:+.4f}"])
-            if px.comb_autocorrelation:
-                cb_ac_node = QtWidgets.QTreeWidgetItem(ac_node, ["Comb Lags", ""])
-                for lag_str, val in sorted(px.comb_autocorrelation.items(), key=lambda x: int(x[0])):
-                    marker = " (period-5)" if lag_str == "5" else ""
-                    QtWidgets.QTreeWidgetItem(cb_ac_node, [f"Lag {lag_str}{marker}", f"{val:+.4f}"])
-
-            dup_node = QtWidgets.QTreeWidgetItem(l2_node, ["Duplicate Fields", ""])
-            for k, v in [
-                ("Dup% (SAD<0.5)", f"{px.dup_field_pct:.1f}%"),
-                ("Dup% (SAD<0.2)", f"{px.dup_field_pct_02:.1f}%"),
-                ("Dup% (SAD<1.0)", f"{px.dup_field_pct_10:.1f}%"),
-                ("Top Median SAD", f"{px.dup_field_top_median_sad:.4f}"),
-                ("Bot Median SAD", f"{px.dup_field_bot_median_sad:.4f}"),
-                ("AC Lag5/Lag1", f"{px.dup_field_lag5_lag1_ratio:.3f}"),
-                ("Period-5", str(px.dup_field_has_period5)),
-            ]:
-                QtWidgets.QTreeWidgetItem(dup_node, [k, v])
+            if px.top_field_sad_median > 0:
+                sad_node = QtWidgets.QTreeWidgetItem(l2_node, ["Field SAD", ""])
+                for k, v in [
+                    ("Top Median", f"{px.top_field_sad_median:.4f}"),
+                    ("Bot Median", f"{px.bot_field_sad_median:.4f}"),
+                    ("Top P5", f"{px.top_field_sad_p5:.4f}"),
+                    ("Bot P5", f"{px.bot_field_sad_p5:.4f}"),
+                ]:
+                    QtWidgets.QTreeWidgetItem(sad_node, [k, v])
 
             for k, v in [
                 ("Frames", f"{px.total_frames:,}"),
