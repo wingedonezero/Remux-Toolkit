@@ -26,32 +26,62 @@ def _classify_window(
     combed_pct: float,
     cadence5_pct: float,
     cycling_pct: float,
-    global_combed_pct: float,
-    global_cadence5_pct: float,
+    file_type: str,
 ) -> str:
-    """Classify a single window using combing + cadence metrics."""
+    """
+    Classify a single window using combing + cadence metrics.
+
+    Uses the file-level classification as dominant context. Combing %
+    varies hugely with motion content (a quiet 500-frame window in
+    interlaced content can show 5% combing while a busy window shows
+    60%). Without context, the same file looks like a noisy mix.
+
+    Strategy: default to the file type, only flip on STRONG opposing
+    evidence within the window.
+    """
     if cycling_pct > 20:
         return "FILM"
 
-    # If global file is clearly telecine, use relaxed per-window thresholds
-    if global_combed_pct >= TELECINE_COMBED_MIN and global_cadence5_pct >= TELECINE_CADENCE5_MIN:
-        # Global is telecine — only classify as non-telecine if very different
-        if combed_pct >= 10:
-            return "TELECINE"
-        elif combed_pct < 3:
+    # ── File is HARD TELECINE ────────────────────────────────────────
+    if file_type == "hard_telecine":
+        # Strong opposing evidence: high combing, no cadence → interlaced segment
+        if combed_pct >= 40 and cadence5_pct < 10:
+            return "INTERLACED"
+        # Truly progressive segment: very low combing, no cadence
+        if combed_pct < 3 and cadence5_pct < 5:
             return "PROGRESSIVE"
-        else:
-            return "MIXED"
-
-    # Standard thresholds
-    if combed_pct >= TELECINE_COMBED_MIN and cadence5_pct >= TELECINE_CADENCE5_MIN:
+        # Default: telecine (even on low-motion windows)
         return "TELECINE"
-    elif combed_pct >= INTERLACED_COMBED_MIN:
+
+    # ── File is INTERLACED ───────────────────────────────────────────
+    if file_type == "interlaced":
+        # Strong opposing evidence: telecine cadence in this window
+        if cadence5_pct >= 25 and combed_pct >= 15:
+            return "TELECINE"
+        # Truly progressive segment: very low combing
+        if combed_pct < 3 and cadence5_pct < 5:
+            return "PROGRESSIVE"
+        # Default: interlaced (even on low-motion windows)
         return "INTERLACED"
-    elif combed_pct < PROGRESSIVE_COMBED_MAX:
+
+    # ── File is PROGRESSIVE ──────────────────────────────────────────
+    if file_type == "progressive":
+        # Strong opposing evidence: high combing
+        if combed_pct >= 35 and cadence5_pct < 15:
+            return "INTERLACED"
+        if cadence5_pct >= 25 and combed_pct >= 15:
+            return "TELECINE"
         return "PROGRESSIVE"
-    else:
-        return "MIXED"
+
+    # ── File is SOFT TELECINE / MIXED / UNKNOWN ──────────────────────
+    # Use standalone window thresholds
+    if cadence5_pct >= 25 and combed_pct >= 15:
+        return "TELECINE"
+    if combed_pct >= 35 and cadence5_pct < 15:
+        return "INTERLACED"
+    if combed_pct < 10 and cadence5_pct < 10:
+        return "PROGRESSIVE"
+    return "MIXED"
 
 
 def _window_cadence5(combed_indices: list[int]) -> float:
@@ -68,13 +98,14 @@ def _refine_segments_with_layer2(
     bitstream: BitstreamResult,
     pixel: PixelResult,
     fps: float,
+    file_type: str = "",
 ) -> list[Segment]:
     """
     Rebuild segment map using Layer 2 per-frame combing data.
 
-    Layer 1 segments are based purely on trf cycling. For hard telecine
-    (no RFF flags), Layer 1 sees everything as VIDEO. This function
-    re-segments using Laplacian combing + cadence-5 analysis from Layer 2.
+    Uses the file's overall classification as dominant context. Combing %
+    varies hugely with motion, so a quiet window in interlaced content
+    will look different from a busy one — but it's still interlaced.
     """
     per_frame = pixel.per_frame
     if not per_frame:
@@ -85,10 +116,6 @@ def _refine_segments_with_layer2(
         return bitstream.segments
     if fps <= 0:
         fps = 29.97
-
-    # Global metrics for context
-    global_combed_pct = pixel.combed_pct
-    global_cadence5_pct = pixel.cadence5_pct
 
     l1_per_frame = bitstream.per_frame if bitstream else []
     window = SEGMENT_WINDOW
@@ -116,8 +143,7 @@ def _refine_segments_with_layer2(
             cycling_pct = cycling_count / chunk_size * 100
 
         win_type = _classify_window(
-            combed_pct, cadence5, cycling_pct,
-            global_combed_pct, global_cadence5_pct,
+            combed_pct, cadence5, cycling_pct, file_type,
         )
         window_types.append((win_start, win_end, win_type))
 
@@ -344,18 +370,19 @@ class AnalysisWorker(QtCore.QObject):
                 result.total_elapsed_sec = round(time.time() - t_total, 2)
                 return result
 
+            # Classify first so we know the file type for context-aware refinement
+            result.classification = classify(
+                si, result.bitstream, result.pixel
+            )
+
             # Refine segment map with Layer 2 per-frame data
             if result.bitstream and result.pixel:
                 on_progress("Refining segment map with combing data...")
                 fps = si.fps if si.fps > 0 else 29.97
                 result.bitstream.segments = _refine_segments_with_layer2(
-                    result.bitstream, result.pixel, fps
+                    result.bitstream, result.pixel, fps,
+                    file_type=result.classification.classification,
                 )
-
-            # Reclassify with Layer 2 data
-            result.classification = classify(
-                si, result.bitstream, result.pixel
-            )
 
             # Decide if Layer 3 is needed
             needs_layer3 = self._auto_layer3 and self._needs_field_swap(
