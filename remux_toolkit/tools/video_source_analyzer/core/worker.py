@@ -79,13 +79,22 @@ def _classify_window(
 
 
 def _window_cadence5(combed_indices: list[int]) -> float:
-    """Compute cadence-5 percentage for a list of combed frame indices."""
+    """
+    Compute telecine cadence percentage for a list of combed frame indices.
+
+    Counts only the true 3:2 pulldown signature: consecutive gap pairs
+    that are exactly (1,4) or (4,1). The (2,3) pattern that occurs in
+    interlaced content with motion is correctly excluded.
+    """
     if len(combed_indices) < 3:
         return 0.0
     gaps = [combed_indices[j+1] - combed_indices[j] for j in range(len(combed_indices) - 1)]
-    pairs_sum5 = sum(1 for j in range(len(gaps) - 1) if gaps[j] + gaps[j+1] == 5)
+    telecine_pairs = sum(
+        1 for j in range(len(gaps) - 1)
+        if (gaps[j] == 1 and gaps[j+1] == 4) or (gaps[j] == 4 and gaps[j+1] == 1)
+    )
     total_pairs = len(gaps) - 1
-    return (pairs_sum5 / total_pairs * 100) if total_pairs > 0 else 0.0
+    return (telecine_pairs / total_pairs * 100) if total_pairs > 0 else 0.0
 
 
 def _refine_segments_with_layer2(
@@ -114,22 +123,23 @@ def _refine_segments_with_layer2(
     l1_per_frame = bitstream.per_frame if bitstream else []
     window = SEGMENT_WINDOW
 
-    # Pass 1: classify each window
-    window_types: list[tuple[int, int, str]] = []
+    # Pass 1: classify each window AND mark low-signal windows
+    # Low-signal windows have too few combed frames for cadence analysis
+    # to be meaningful — they need to inherit from neighbors.
+    LOW_SIGNAL_COMBED_PCT = 5.0  # below this, we don't trust the cadence
+
+    window_data: list[dict] = []
     for win_start in range(0, total, window):
         win_end = min(win_start + window, total)
         chunk = per_frame[win_start:win_end]
         chunk_size = len(chunk)
 
-        # Combed frame count and indices within this window
         combed_count = sum(1 for f in chunk if f.get("combed", False))
         combed_pct = combed_count / chunk_size * 100 if chunk_size else 0
 
-        # Local combed indices for cadence analysis
         local_combed = [f["idx"] for f in chunk if f.get("combed", False)]
         cadence5 = _window_cadence5(local_combed)
 
-        # Layer 1 cycling
         cycling_pct = 0.0
         if l1_per_frame and win_end <= len(l1_per_frame):
             l1_chunk = l1_per_frame[win_start:win_end]
@@ -139,16 +149,81 @@ def _refine_segments_with_layer2(
         win_type = _classify_window(
             combed_pct, cadence5, cycling_pct, file_type,
         )
-        window_types.append((win_start, win_end, win_type))
 
-    # Pass 2: absorb tiny isolated segments (1 window surrounded by same type)
-    if len(window_types) >= 3:
-        for i in range(1, len(window_types) - 1):
-            prev_type = window_types[i - 1][2]
-            curr_type = window_types[i][2]
-            next_type = window_types[i + 1][2]
+        # Low-signal: not enough combed frames to trust the verdict
+        low_signal = combed_pct < LOW_SIGNAL_COMBED_PCT and cycling_pct < 20
+
+        window_data.append({
+            "start": win_start, "end": win_end,
+            "type": win_type, "low_signal": low_signal,
+            "combed_pct": combed_pct, "cadence5": cadence5,
+        })
+
+    # Pass 2a: carry-forward through low-signal stretches
+    # If a low-signal window is between two high-confidence windows of the
+    # same type, inherit that type. Walk forwards filling gaps between
+    # confident windows of the same type.
+    n = len(window_data)
+    if n >= 3:
+        # Find runs of low-signal windows and check their neighbors
+        i = 0
+        while i < n:
+            if window_data[i]["low_signal"]:
+                # Find the end of this low-signal run
+                j = i
+                while j < n and window_data[j]["low_signal"]:
+                    j += 1
+                # i..j-1 is the low-signal run
+                # Look at the high-signal neighbors before and after
+                prev_type = None
+                next_type = None
+                if i > 0 and not window_data[i - 1]["low_signal"]:
+                    prev_type = window_data[i - 1]["type"]
+                if j < n and not window_data[j]["low_signal"]:
+                    next_type = window_data[j]["type"]
+
+                # If both neighbors are same type → inherit
+                # If only one neighbor exists → inherit
+                inherited = None
+                if prev_type and next_type:
+                    if prev_type == next_type:
+                        inherited = prev_type
+                elif prev_type:
+                    inherited = prev_type
+                elif next_type:
+                    inherited = next_type
+
+                if inherited:
+                    for k in range(i, j):
+                        window_data[k]["type"] = inherited
+                i = j
+            else:
+                i += 1
+
+    # Pass 2b: absorb single isolated different windows
+    if n >= 3:
+        for i in range(1, n - 1):
+            prev_type = window_data[i - 1]["type"]
+            curr_type = window_data[i]["type"]
+            next_type = window_data[i + 1]["type"]
             if prev_type == next_type and curr_type != prev_type:
-                window_types[i] = (window_types[i][0], window_types[i][1], prev_type)
+                window_data[i]["type"] = prev_type
+
+    # Pass 2c: absorb 2-window anomalies surrounded by same type
+    # e.g. TELECINE TELECINE INTERLACED INTERLACED TELECINE TELECINE
+    if n >= 5:
+        for i in range(1, n - 3):
+            if (window_data[i - 1]["type"] == window_data[i + 3]["type"]
+                    and window_data[i]["type"] == window_data[i + 1]["type"]
+                    and window_data[i]["type"] != window_data[i - 1]["type"]):
+                # Only absorb if the pair is short relative to surrounding context
+                # (don't absorb genuine 2-window OPs/EDs which are usually 3+ windows)
+                surround_type = window_data[i - 1]["type"]
+                window_data[i]["type"] = surround_type
+                window_data[i + 1]["type"] = surround_type
+
+    # Convert window_data back to (start, end, type) tuples for Pass 3
+    window_types = [(w["start"], w["end"], w["type"]) for w in window_data]
 
     # Pass 3: merge adjacent same-type windows into segments
     segments: list[Segment] = []

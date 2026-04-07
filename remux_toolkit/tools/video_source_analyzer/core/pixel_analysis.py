@@ -238,8 +238,18 @@ def run_layer2(
     px.frames_with_any_combing_pct = round(
         px.frames_with_any_combing / total * 100, 2) if total > 0 else 0
 
-    # ── Cadence-5 analysis (telecine detection) ───────────────────────
+    # ── Telecine cadence analysis ─────────────────────────────────────
+    # Real 3:2 pulldown produces combed frames at strict positions like
+    #   2,3, 7,8, 12,13, 17,18, 22,23 ...
+    # which yields a gap sequence of 1,4,1,4,1,4 ...
+    # Consecutive gap pairs are STRICTLY (1,4) or (4,1).
+    #
+    # The previous "any pair summing to 5" metric was triggered by (2,3)
+    # patterns from interlaced content with motion clusters, causing false
+    # telecine detection. We now require the actual structural fingerprint:
+    # the (1,4)+(4,1) pattern.
     px.cadence5_pct = 0.0
+    px.telecine_gap_pct = 0.0
     px.gap_distribution = {}
 
     if len(combed_indices) > 5:
@@ -248,17 +258,19 @@ def run_layer2(
         gap_counts = Counter(gaps)
         px.gap_distribution = {str(k): v for k, v in gap_counts.most_common(10)}
 
-        # Cadence-5: consecutive gap pairs that sum to 5
-        # In 3:2 telecine, gaps alternate 1,4 or 2,3 (summing to 5)
-        pairs_sum5 = sum(
+        # Telecine cadence: ONLY (1,4) and (4,1) consecutive gap pairs
+        # This is the exact structural fingerprint of NTSC 3:2 pulldown
+        telecine_pairs = sum(
             1 for j in range(len(gaps) - 1)
-            if gaps[j] + gaps[j+1] == 5
+            if (gaps[j] == 1 and gaps[j+1] == 4)
+            or (gaps[j] == 4 and gaps[j+1] == 1)
         )
         total_pairs = len(gaps) - 1
         if total_pairs > 0:
-            px.cadence5_pct = round(pairs_sum5 / total_pairs * 100, 2)
+            px.cadence5_pct = round(telecine_pairs / total_pairs * 100, 2)
 
-        # Telecine gap ratio: how much of the gap distribution is 1+4 (telecine)
+        # Telecine gap balance: gap=1 and gap=4 should both be present
+        # in real telecine. In interlaced content gap=4 is rare.
         gap1 = gap_counts.get(1, 0)
         gap4 = gap_counts.get(4, 0)
         total_gaps = len(gaps)
