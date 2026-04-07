@@ -25,42 +25,49 @@ from .classifier import classify
 def _classify_window(
     combed_pct: float,
     cadence5_pct: float,
+    gap_balance: float,
     cycling_pct: float,
     file_type: str,
 ) -> str:
     """
-    Classify a single window using cadence-5 as the primary signal.
+    Classify a single window using cadence + gap balance.
 
-    Cadence-5 is the structural fingerprint of NTSC 3:2 pulldown — if
-    a window has period-5 combed pairs, it IS telecine, regardless of
-    combing %. This same logic works at file and window level.
+    Real 3:2 telecine has TWO signatures, both required:
+    1. (1,4)+(4,1) consecutive gap pairs (cadence5_pct)
+    2. Roughly equal counts of gap=1 and gap=4 (gap_balance >= 0.4)
 
-    Quiet/static windows have very few combed frames so cadence-5 isn't
-    meaningful — those default to the file type.
+    Interlaced content with regular motion can produce coincidental (1,4)
+    pairs but the gap distribution is heavily skewed toward gap=1, so
+    gap_balance acts as a sanity check. This is the same idea as TIVTC's
+    field-matching cadence verification — both signatures must agree.
+
+    Window-level thresholds are stricter than file-level because each
+    window has fewer combed frames and less statistical power.
     """
     if cycling_pct > 20:
         return "FILM"
 
-    # ── Strong telecine cadence → TELECINE (truth signal) ────────────
-    # Cadence is structural; if it's there, it's telecine
-    if cadence5_pct >= 25 and combed_pct >= 8:
+    # ── Strong telecine: definitive cadence + balance ────────────────
+    # At window level, real telecine shows 50%+ cadence AND balanced gaps
+    if cadence5_pct >= 50 and gap_balance >= 0.4 and combed_pct >= 10:
         return "TELECINE"
 
-    # ── High combing without cadence → INTERLACED ────────────────────
-    # True interlaced video has combing on most motion frames
-    if combed_pct >= 30 and cadence5_pct < 10:
+    # Moderate but balanced telecine — still trustworthy
+    if cadence5_pct >= 35 and gap_balance >= 0.5 and combed_pct >= 15:
+        return "TELECINE"
+
+    # ── High combing without telecine signatures → INTERLACED ────────
+    if combed_pct >= 35 and cadence5_pct < 30:
         return "INTERLACED"
 
-    # ── Very low combing → PROGRESSIVE or static section ─────────────
-    if combed_pct < 5 and cadence5_pct < 8:
-        # In a telecine/interlaced file, this could just be a static scene
-        # — fall back to file type rather than calling it progressive
+    # ── Very low combing → static section / progressive ──────────────
+    if combed_pct < 5 and cadence5_pct < 10:
         if file_type in ("hard_telecine", "interlaced"):
             return "TELECINE" if file_type == "hard_telecine" else "INTERLACED"
         return "PROGRESSIVE"
 
     # ── Moderate signals — defer to file type ────────────────────────
-    # Window data is ambiguous, trust the file-level classification
+    # In an interlaced file, weak/borderline cadence is just noise
     if file_type == "hard_telecine":
         return "TELECINE"
     if file_type == "interlaced":
@@ -68,8 +75,8 @@ def _classify_window(
     if file_type == "progressive":
         return "PROGRESSIVE"
 
-    # ── Standalone fallback for soft_telecine_mixed / unknown files ──
-    if combed_pct >= 20 and cadence5_pct >= 15:
+    # ── Standalone fallback for unknown/mixed files ──────────────────
+    if cadence5_pct >= 35 and gap_balance >= 0.4 and combed_pct >= 15:
         return "TELECINE"
     if combed_pct >= 30:
         return "INTERLACED"
@@ -78,23 +85,41 @@ def _classify_window(
     return "MIXED"
 
 
-def _window_cadence5(combed_indices: list[int]) -> float:
+def _window_cadence_metrics(combed_indices: list[int]) -> tuple[float, float]:
     """
-    Compute telecine cadence percentage for a list of combed frame indices.
+    Compute (cadence5_pct, gap_balance) for a list of combed frame indices.
 
-    Counts only the true 3:2 pulldown signature: consecutive gap pairs
-    that are exactly (1,4) or (4,1). The (2,3) pattern that occurs in
-    interlaced content with motion is correctly excluded.
+    cadence5_pct: % of consecutive gap pairs that are exactly (1,4) or (4,1)
+    gap_balance: min(gap1, gap4) / max(gap1, gap4) — 1.0 = perfectly balanced,
+                 0.0 = one type completely dominates
+
+    Real 3:2 telecine has cadence5 ≈ 100% and balance ≈ 1.0.
+    Interlaced content can have moderate cadence5 by chance but balance
+    will be very low because gap=1 dominates.
     """
     if len(combed_indices) < 3:
-        return 0.0
+        return 0.0, 0.0
     gaps = [combed_indices[j+1] - combed_indices[j] for j in range(len(combed_indices) - 1)]
     telecine_pairs = sum(
         1 for j in range(len(gaps) - 1)
         if (gaps[j] == 1 and gaps[j+1] == 4) or (gaps[j] == 4 and gaps[j+1] == 1)
     )
     total_pairs = len(gaps) - 1
-    return (telecine_pairs / total_pairs * 100) if total_pairs > 0 else 0.0
+    cadence_pct = (telecine_pairs / total_pairs * 100) if total_pairs > 0 else 0.0
+
+    gap1 = sum(1 for g in gaps if g == 1)
+    gap4 = sum(1 for g in gaps if g == 4)
+    if max(gap1, gap4) > 0:
+        balance = min(gap1, gap4) / max(gap1, gap4)
+    else:
+        balance = 0.0
+
+    return cadence_pct, balance
+
+
+# Legacy alias kept for any external callers
+def _window_cadence5(combed_indices: list[int]) -> float:
+    return _window_cadence_metrics(combed_indices)[0]
 
 
 def _refine_segments_with_layer2(
@@ -138,7 +163,7 @@ def _refine_segments_with_layer2(
         combed_pct = combed_count / chunk_size * 100 if chunk_size else 0
 
         local_combed = [f["idx"] for f in chunk if f.get("combed", False)]
-        cadence5 = _window_cadence5(local_combed)
+        cadence5, gap_balance = _window_cadence_metrics(local_combed)
 
         cycling_pct = 0.0
         if l1_per_frame and win_end <= len(l1_per_frame):
@@ -147,7 +172,7 @@ def _refine_segments_with_layer2(
             cycling_pct = cycling_count / chunk_size * 100
 
         win_type = _classify_window(
-            combed_pct, cadence5, cycling_pct, file_type,
+            combed_pct, cadence5, gap_balance, cycling_pct, file_type,
         )
 
         # Low-signal: not enough combed frames to trust the verdict
@@ -216,11 +241,34 @@ def _refine_segments_with_layer2(
             if (window_data[i - 1]["type"] == window_data[i + 3]["type"]
                     and window_data[i]["type"] == window_data[i + 1]["type"]
                     and window_data[i]["type"] != window_data[i - 1]["type"]):
-                # Only absorb if the pair is short relative to surrounding context
-                # (don't absorb genuine 2-window OPs/EDs which are usually 3+ windows)
                 surround_type = window_data[i - 1]["type"]
                 window_data[i]["type"] = surround_type
                 window_data[i + 1]["type"] = surround_type
+
+    # Pass 2d: file-type aggressive cleanup
+    # In a file classified as INTERLACED, any TELECINE cluster of <4 windows
+    # is almost certainly a false positive (regular motion patterns producing
+    # coincidental cadence). Same for HARD_TELECINE files with INTERLACED
+    # clusters smaller than 4 windows.
+    MIN_OPPOSING_RUN = 4  # 4 windows = 2000 frames ~= 67 seconds at 29.97fps
+    if file_type in ("interlaced", "hard_telecine") and n >= 3:
+        opposing = "TELECINE" if file_type == "interlaced" else "INTERLACED"
+        dominant = "INTERLACED" if file_type == "interlaced" else "TELECINE"
+
+        i = 0
+        while i < n:
+            if window_data[i]["type"] == opposing:
+                j = i
+                while j < n and window_data[j]["type"] == opposing:
+                    j += 1
+                run_len = j - i
+                if run_len < MIN_OPPOSING_RUN:
+                    # Absorb this short opposing run into the dominant type
+                    for k in range(i, j):
+                        window_data[k]["type"] = dominant
+                i = j
+            else:
+                i += 1
 
     # Convert window_data back to (start, end, type) tuples for Pass 3
     window_types = [(w["start"], w["end"], w["type"]) for w in window_data]
