@@ -301,16 +301,29 @@ class SettingsDialog(QtWidgets.QDialog):
 
         layout.addRow(QtWidgets.QLabel(""))  # Spacer
 
-        # Enable neural frame matching
-        enable_checkbox = QtWidgets.QCheckBox("Enable Neural Frame Matching (ISC)")
-        enable_checkbox.setChecked(self.settings.get('align_visual_verification', True))
+        # Enable sliding pHash frame matching
+        enable_checkbox = QtWidgets.QCheckBox("Enable Sliding pHash Frame Matching")
+        enable_checkbox.setChecked(self.settings.get('align_use_sliding', True))
         enable_checkbox.setToolTip(
-            "Fine-tune audio offset with ISC neural features.\n"
-            "Uses Meta's ISC model for robust frame matching.\n"
+            "Fine-tune audio offset with GPU pHash sliding-window matching.\n"
+            "No model weights required — uses 2D DCT perceptual hashes.\n"
             "Recommended: ON"
         )
         layout.addRow(enable_checkbox)
-        self.controls['align_visual_verification'] = enable_checkbox
+        self.controls['align_use_sliding'] = enable_checkbox
+
+        # Run in subprocess toggle
+        subprocess_checkbox = QtWidgets.QCheckBox("Run in subprocess (GPU isolation)")
+        subprocess_checkbox.setChecked(self.settings.get('align_use_subprocess', True))
+        subprocess_checkbox.setToolTip(
+            "Run the audio SCC + sliding pHash stage in a subprocess so\n"
+            "torch's CUDA/ROCm context is fully reclaimed on exit.\n"
+            "Adds a few seconds of startup per comparison but avoids\n"
+            "leaking several GB of host RAM per run.\n"
+            "Recommended: ON"
+        )
+        layout.addRow(subprocess_checkbox)
+        self.controls['align_use_subprocess'] = subprocess_checkbox
 
         layout.addRow(QtWidgets.QLabel(""))  # Spacer
 
@@ -318,20 +331,20 @@ class SettingsDialog(QtWidgets.QDialog):
         positions_label = QtWidgets.QLabel("Test Positions:")
         positions_spin = QtWidgets.QSpinBox()
         positions_spin.setRange(1, 9)
-        positions_spin.setValue(self.settings.get('align_neural_num_positions', 3))
+        positions_spin.setValue(self.settings.get('align_sliding_num_positions', 3))
         positions_spin.setToolTip(
             "Number of test positions across the video.\n"
             "Consensus voting picks the most common offset.\n"
-            "Default: 3 (at 20%, 50%, 80% of video)"
+            "Default: 3 (evenly spaced between 10% and 90% of video)"
         )
         layout.addRow(positions_label, positions_spin)
-        self.controls['align_neural_num_positions'] = positions_spin
+        self.controls['align_sliding_num_positions'] = positions_spin
 
         # Window duration
         window_label = QtWidgets.QLabel("Window Duration:")
         window_spin = QtWidgets.QSpinBox()
         window_spin.setRange(5, 30)
-        window_spin.setValue(self.settings.get('align_neural_window_seconds', 10))
+        window_spin.setValue(self.settings.get('align_sliding_window_seconds', 10))
         window_spin.setSuffix("s")
         window_spin.setToolTip(
             "Duration of frame window at each position.\n"
@@ -339,33 +352,48 @@ class SettingsDialog(QtWidgets.QDialog):
             "Default: 10s"
         )
         layout.addRow(window_label, window_spin)
-        self.controls['align_neural_window_seconds'] = window_spin
+        self.controls['align_sliding_window_seconds'] = window_spin
 
         # Slide range
         slide_label = QtWidgets.QLabel("Slide Range:")
         slide_spin = QtWidgets.QSpinBox()
         slide_spin.setRange(1, 15)
-        slide_spin.setValue(self.settings.get('align_neural_slide_range_seconds', 5))
+        slide_spin.setValue(self.settings.get('align_sliding_slide_range_seconds', 5))
         slide_spin.setSuffix("s")
         slide_spin.setToolTip(
             "Search range around audio offset (per side).\n"
             "Default: 5s (slides ±5s around prediction)"
         )
         layout.addRow(slide_label, slide_spin)
-        self.controls['align_neural_slide_range_seconds'] = slide_spin
+        self.controls['align_sliding_slide_range_seconds'] = slide_spin
 
         # Batch size
         batch_label = QtWidgets.QLabel("GPU Batch Size:")
         batch_spin = QtWidgets.QSpinBox()
         batch_spin.setRange(1, 128)
-        batch_spin.setValue(self.settings.get('align_neural_batch_size', 32))
+        batch_spin.setValue(self.settings.get('align_sliding_batch_size', 32))
         batch_spin.setToolTip(
-            "GPU batch size for ISC feature extraction.\n"
+            "GPU batch size for pHash descriptor extraction.\n"
             "Lower if running out of VRAM.\n"
             "Default: 32"
         )
         layout.addRow(batch_label, batch_spin)
-        self.controls['align_neural_batch_size'] = batch_spin
+        self.controls['align_sliding_batch_size'] = batch_spin
+
+        # Hash size
+        hash_label = QtWidgets.QLabel("pHash Size:")
+        hash_spin = QtWidgets.QSpinBox()
+        hash_spin.setRange(8, 64)
+        hash_spin.setSingleStep(4)
+        hash_spin.setValue(self.settings.get('align_sliding_hash_size', 32))
+        hash_spin.setToolTip(
+            "Perceptual hash size. The descriptor length is hash_size**2.\n"
+            "32 → 1024-bit (default, sharpest peaks).\n"
+            "Smaller = faster, less discriminative.\n"
+            "Default: 32"
+        )
+        layout.addRow(hash_label, hash_spin)
+        self.controls['align_sliding_hash_size'] = hash_spin
 
         self.tabs.addTab(tab, "Frame Sync")
 
@@ -507,17 +535,21 @@ class SettingsDialog(QtWidgets.QDialog):
             delay_map = {0: 'first', 1: 'median', 2: 'mean'}
             self.settings['align_delay_selection'] = delay_map.get(idx, 'first')
 
-        # Frame Sync tab (Neural ISC matching)
-        if 'align_visual_verification' in self.controls:
-            self.settings['align_visual_verification'] = self.controls['align_visual_verification'].isChecked()
-        if 'align_neural_num_positions' in self.controls:
-            self.settings['align_neural_num_positions'] = self.controls['align_neural_num_positions'].value()
-        if 'align_neural_window_seconds' in self.controls:
-            self.settings['align_neural_window_seconds'] = self.controls['align_neural_window_seconds'].value()
-        if 'align_neural_slide_range_seconds' in self.controls:
-            self.settings['align_neural_slide_range_seconds'] = self.controls['align_neural_slide_range_seconds'].value()
-        if 'align_neural_batch_size' in self.controls:
-            self.settings['align_neural_batch_size'] = self.controls['align_neural_batch_size'].value()
+        # Frame Sync tab (Sliding pHash matching)
+        if 'align_use_sliding' in self.controls:
+            self.settings['align_use_sliding'] = self.controls['align_use_sliding'].isChecked()
+        if 'align_use_subprocess' in self.controls:
+            self.settings['align_use_subprocess'] = self.controls['align_use_subprocess'].isChecked()
+        if 'align_sliding_num_positions' in self.controls:
+            self.settings['align_sliding_num_positions'] = self.controls['align_sliding_num_positions'].value()
+        if 'align_sliding_window_seconds' in self.controls:
+            self.settings['align_sliding_window_seconds'] = self.controls['align_sliding_window_seconds'].value()
+        if 'align_sliding_slide_range_seconds' in self.controls:
+            self.settings['align_sliding_slide_range_seconds'] = self.controls['align_sliding_slide_range_seconds'].value()
+        if 'align_sliding_batch_size' in self.controls:
+            self.settings['align_sliding_batch_size'] = self.controls['align_sliding_batch_size'].value()
+        if 'align_sliding_hash_size' in self.controls:
+            self.settings['align_sliding_hash_size'] = self.controls['align_sliding_hash_size'].value()
 
         # Detectors tab
         if 'enable_audio_analysis' in self.controls:
