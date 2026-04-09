@@ -292,12 +292,16 @@ class ComparisonPipeline(QObject):
                     'peak_fit': self.settings.get('align_peak_fit', True),
                     'delay_selection': self.settings.get('align_delay_selection', 'first'),
                     'audio_lang': self.settings.get('align_audio_lang', None),
-                    # Neural frame matching (ISC) settings
-                    'visual_verification': self.settings.get('align_visual_verification', True),
-                    'neural_num_positions': self.settings.get('align_neural_num_positions', 3),
-                    'neural_window_seconds': self.settings.get('align_neural_window_seconds', 10),
-                    'neural_slide_range_seconds': self.settings.get('align_neural_slide_range_seconds', 5),
-                    'neural_batch_size': self.settings.get('align_neural_batch_size', 32),
+                    # Sliding pHash frame matching settings
+                    'use_sliding': self.settings.get('align_use_sliding', True),
+                    'sliding_num_positions': self.settings.get('align_sliding_num_positions', 3),
+                    'sliding_window_seconds': self.settings.get('align_sliding_window_seconds', 10),
+                    'sliding_slide_range_seconds': self.settings.get('align_sliding_slide_range_seconds', 5),
+                    'sliding_batch_size': self.settings.get('align_sliding_batch_size', 32),
+                    'sliding_hash_size': self.settings.get('align_sliding_hash_size', 32),
+                    # Run alignment_advanced in a subprocess to isolate
+                    # torch/GPU memory (recommended).
+                    'use_subprocess': self.settings.get('align_use_subprocess', True),
                 }
 
                 align = robust_align(

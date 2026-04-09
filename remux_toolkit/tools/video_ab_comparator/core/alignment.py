@@ -22,6 +22,11 @@ class AlignResult:
     offset_sec: float
     drift_ratio: float
     confidence: float
+    # Content-domain frame offset from the sliding pHash matcher
+    # (populated only when use_advanced + use_sliding). FrameMapper uses
+    # this for direct frame-to-frame mapping when available.
+    offset_frames: Optional[int] = None
+    method: str = "hybrid"
 
 def extract_audio_fingerprint(source_path: str, start_time: float, duration: float) -> Optional[np.ndarray]:
     """Extract audio fingerprint using FFmpeg's chromaprint."""
@@ -275,6 +280,117 @@ def precise_align_keyframes(source_a_path: str, source_b_path: str,
 
     return best_offset
 
+
+def _run_advanced_align_subprocess(source_a_path: str, source_b_path: str,
+                                    config, fps_a: float, fps_b: float,
+                                    progress_callback=None):
+    """Run advanced_align in a subprocess to isolate torch/GPU memory.
+
+    Returns an ``AdvancedAlignResult`` on success, or ``None`` on any
+    failure (caller falls back to in-process execution).
+    """
+    import subprocess
+    import sys
+    import tempfile
+    import dataclasses
+    from dataclasses import asdict
+
+    try:
+        from .alignment_advanced import AlignResult as AdvancedAlignResult
+    except Exception:
+        return None
+
+    workdir = Path(tempfile.gettempdir()) / "remux_toolkit_align_subprocess"
+    workdir.mkdir(parents=True, exist_ok=True)
+    config_path = workdir / "align_config.json"
+    output_path = workdir / "align_result.json"
+
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(asdict(config), f, indent=2)
+    except Exception as exc:
+        print(f"[Align] Failed to write subprocess config: {exc}")
+        return None
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "remux_toolkit.tools.video_ab_comparator.core.alignment_subprocess",
+        "--source-a", source_a_path,
+        "--source-b", source_b_path,
+        "--config-json", str(config_path),
+        "--output-json", str(output_path),
+        f"--fps-a={fps_a}",
+        f"--fps-b={fps_b}",
+    ]
+
+    print(f"[Align] Running advanced_align in subprocess (GPU isolation)...")
+
+    json_prefix = "__RTK_ALIGN_JSON__ "
+    json_payload = None
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        if process.stdout:
+            for line in process.stdout:
+                line = line.rstrip("\n")
+                if line.startswith(json_prefix):
+                    try:
+                        json_payload = json.loads(line.split(json_prefix, 1)[1])
+                    except json.JSONDecodeError:
+                        json_payload = None
+                elif line:
+                    # Forward log lines to parent stdout
+                    print(line)
+                    if progress_callback:
+                        # Heuristic: don't try to parse progress from
+                        # child log lines; just keep the parent's
+                        # progress bar moving with a coarse tick.
+                        pass
+
+        return_code = process.wait()
+
+        if process.stderr:
+            for line in process.stderr:
+                line = line.rstrip("\n")
+                if line and not line.startswith("Downloading:"):
+                    print(f"[Align subprocess stderr] {line}")
+
+        if return_code != 0:
+            print(f"[Align] Subprocess exit code {return_code}")
+            if json_payload and not json_payload.get("success"):
+                print(f"[Align] Subprocess error: {json_payload.get('error')}")
+            return None
+
+        if not json_payload or not json_payload.get("success"):
+            print("[Align] Subprocess returned no result payload")
+            return None
+
+        with open(output_path, encoding="utf-8") as f:
+            result_dict = json.load(f)
+
+        return AdvancedAlignResult(
+            offset_sec=float(result_dict.get("offset_sec", 0.0)),
+            drift_ratio=float(result_dict.get("drift_ratio", 0.0)),
+            confidence=float(result_dict.get("confidence", 0.0)),
+            chunk_results=result_dict.get("chunk_results", []) or [],
+            accepted_count=int(result_dict.get("accepted_count", 0)),
+            method=str(result_dict.get("method", "SCC")),
+            offset_frames=result_dict.get("offset_frames"),
+        )
+
+    except Exception as exc:
+        print(f"[Align] Subprocess launch failed: {exc}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
                 duration: float, progress_callback=None,
                 use_advanced: bool = False,
@@ -320,33 +436,57 @@ def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
             peak_fit=align_config.get('peak_fit', True),
             delay_selection=align_config.get('delay_selection', 'first'),
             audio_lang=align_config.get('audio_lang', None),
-            # Neural frame matching (ISC) settings
-            visual_verification=align_config.get('visual_verification', True),
-            neural_num_positions=align_config.get('neural_num_positions', 3),
-            neural_window_seconds=align_config.get('neural_window_seconds', 10),
-            neural_slide_range_seconds=align_config.get('neural_slide_range_seconds', 5),
-            neural_batch_size=align_config.get('neural_batch_size', 32),
+            # Sliding pHash frame matching settings
+            use_sliding=align_config.get('use_sliding', True),
+            sliding_num_positions=align_config.get('sliding_num_positions', 3),
+            sliding_window_seconds=align_config.get('sliding_window_seconds', 10),
+            sliding_slide_range_seconds=align_config.get('sliding_slide_range_seconds', 5),
+            sliding_batch_size=align_config.get('sliding_batch_size', 32),
+            sliding_hash_size=align_config.get('sliding_hash_size', 32),
         )
 
-        advanced_result = advanced_align(
-            str(source_a.path),
-            str(source_b.path),
-            config,
-            fps_a,
-            fps_b,
-            progress_callback
-        )
+        use_subprocess = bool(align_config.get('use_subprocess', True))
+        advanced_result = None
+        if use_subprocess:
+            advanced_result = _run_advanced_align_subprocess(
+                str(source_a.path),
+                str(source_b.path),
+                config,
+                fps_a,
+                fps_b,
+                progress_callback,
+            )
+            if advanced_result is None:
+                print("[Align] Subprocess path failed — falling back to in-process advanced_align")
+
+        if advanced_result is None:
+            advanced_result = advanced_align(
+                str(source_a.path),
+                str(source_b.path),
+                config,
+                fps_a,
+                fps_b,
+                progress_callback
+            )
 
         # Calculate drift ratio
         drift_ratio = 0.0
         if abs(fps_a - fps_b) > 0.01:
             drift_ratio = (fps_a - fps_b) / fps_a
 
-        # Convert to standard AlignResult
+        # Convert to standard AlignResult. Note that the offset is
+        # negated to match ab_comparator's sign convention (positive =
+        # B ahead of A). offset_frames is passed through AS-IS because
+        # it's already a content-domain frame index delta from the
+        # sliding matcher — it does not participate in the sign flip.
+        # FrameMapper applies `frame_b = frame_a + offset_frames`
+        # directly.
         result = AlignResult(
-            offset_sec=-advanced_result.offset_sec,  # Negate for convention
+            offset_sec=-advanced_result.offset_sec,
             drift_ratio=drift_ratio,
-            confidence=advanced_result.confidence
+            confidence=advanced_result.confidence,
+            offset_frames=advanced_result.offset_frames,
+            method=advanced_result.method,
         )
 
         return result

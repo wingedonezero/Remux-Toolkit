@@ -29,12 +29,14 @@ DEFAULTS = {
     "align_delay_selection": "first",  # Delay selection strategy: first/median/mean
     "align_audio_lang": "jpn",  # Audio language to use for alignment (None = first track)
 
-    # Neural Frame Matching (ISC model) Settings
-    "align_visual_verification": True,  # Enable ISC neural frame matching
-    "align_neural_num_positions": 3,  # Test positions across video (at 20%, 50%, 80%)
-    "align_neural_window_seconds": 10,  # Duration of frame window per position
-    "align_neural_slide_range_seconds": 5,  # ±N seconds sliding range
-    "align_neural_batch_size": 32,  # GPU batch size for ISC feature extraction
+    # Sliding pHash Frame Matching Settings
+    "align_use_sliding": True,  # Enable GPU pHash sliding-window matching
+    "align_use_subprocess": True,  # Run audio SCC + sliding in a subprocess (GPU isolation)
+    "align_sliding_num_positions": 3,  # Test positions across video (evenly 10-90%)
+    "align_sliding_window_seconds": 10,  # Duration of frame window per position
+    "align_sliding_slide_range_seconds": 5,  # ±N seconds sliding range
+    "align_sliding_batch_size": 32,  # GPU batch size for pHash extraction
+    "align_sliding_hash_size": 32,  # pHash size (32 = 1024-bit descriptor)
 
     # Frame Mapping Settings
     "use_frame_mapper": True,  # Use VideoTimestamps for frame-perfect mapping

@@ -1,11 +1,13 @@
 # remux_toolkit/tools/video_ab_comparator/core/alignment_advanced.py
 """
 Advanced audio-based alignment using GPU-accelerated SCC correlation
-with ISC neural frame matching for frame-perfect accuracy.
+with GPU pHash sliding for frame-perfect accuracy.
 
 Based on Video-Sync-GUI methodology:
 - GPU PyTorch FFT for audio cross-correlation (with parabolic peak fit)
-- ISC neural feature matching for frame-level alignment verification
+- GPU pHash (DCT-II) sliding-window matching for frame-level alignment
+  verification (replaces the earlier ISC neural matcher — same search
+  geometry, no model weights, ~3x faster, sharper peaks)
 """
 
 from __future__ import annotations
@@ -52,12 +54,13 @@ class AlignmentConfig:
     # Language selection (None = use first audio track)
     audio_lang: Optional[str] = None
 
-    # Neural frame matching (ISC model)
-    visual_verification: bool = True  # Fine-tune with ISC neural frame matching
-    neural_num_positions: int = 3  # Test positions across video (at 20%, 50%, 80%)
-    neural_window_seconds: int = 10  # Duration of frame window per position
-    neural_slide_range_seconds: int = 5  # ±N seconds sliding range
-    neural_batch_size: int = 32  # GPU batch size for ISC feature extraction
+    # Sliding pHash frame matching (GPU DCT-II, no weights)
+    use_sliding: bool = True  # Fine-tune audio offset with sliding pHash matching
+    sliding_num_positions: int = 3  # Test positions across video (evenly, 10-90%)
+    sliding_window_seconds: int = 10  # Duration of frame window per position
+    sliding_slide_range_seconds: int = 5  # ±N seconds sliding range
+    sliding_batch_size: int = 32  # GPU batch size for pHash extraction
+    sliding_hash_size: int = 32  # pHash size (32 → 1024-bit descriptor)
 
 
 @dataclass
@@ -387,14 +390,18 @@ def advanced_align(source_a_path: str, source_b_path: str,
     # Track verified frame offset for frame-to-frame mapping
     verified_frame_offset = None
 
-    # Neural frame matching for frame-perfect accuracy
-    # Uses ISC (Image Similarity Challenge) neural features to slide-match frame sequences
-    if config.visual_verification and final_offset_sec != 0.0:
+    # Sliding pHash frame matching for frame-perfect accuracy.
+    # GPU DCT-II perceptual hash, no model weights. Slides a source
+    # window across the target and picks the position with the best
+    # mean cosine similarity, then takes a consensus across several
+    # positions across the video. Content-indexed (the returned
+    # offset_frames can be used directly by FrameMapper).
+    if config.use_sliding and final_offset_sec != 0.0:
         if progress_callback:
-            progress_callback("Neural frame matching (ISC)...", 92)
+            progress_callback("Sliding pHash frame matching...", 92)
 
         try:
-            from .neural_matcher import calculate_neural_verified_offset
+            from .sliding_matcher import calculate_sliding_offset
 
             import tempfile
             temp_dir = Path(tempfile.gettempdir()) / "remux_toolkit_frame_sync"
@@ -402,46 +409,52 @@ def advanced_align(source_a_path: str, source_b_path: str,
 
             audio_offset_ms = final_offset_sec * 1000.0
 
-            neural_result = calculate_neural_verified_offset(
+            sliding_result = calculate_sliding_offset(
                 source_a_path,
                 source_b_path,
                 audio_offset_ms,
                 fps_a,
                 fps_b,
                 duration,
-                num_positions=config.neural_num_positions,
-                window_seconds=config.neural_window_seconds,
-                slide_range_seconds=config.neural_slide_range_seconds,
-                batch_size=config.neural_batch_size,
+                num_positions=config.sliding_num_positions,
+                window_seconds=config.sliding_window_seconds,
+                slide_range_seconds=config.sliding_slide_range_seconds,
+                batch_size=config.sliding_batch_size,
+                hash_size=config.sliding_hash_size,
                 temp_dir=temp_dir,
                 progress_callback=progress_callback,
             )
 
-            if neural_result["success"]:
-                frame_corrected_offset_sec = neural_result["offset_ms"] / 1000.0
-                verified_frame_offset = neural_result["offset_frames"]
+            if sliding_result["success"]:
+                frame_corrected_offset_sec = sliding_result["offset_ms"] / 1000.0
+                verified_frame_offset = sliding_result["offset_frames"]
 
-                print(f"\n✓ Neural frame matching successful!")
-                print(f"  Audio offset: {final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms)")
-                print(f"  Neural offset: {frame_corrected_offset_sec:.6f}s ({neural_result['offset_ms']:.3f}ms)")
-                print(f"  Frame offset: {neural_result['offset_frames']:+d} frames")
-                print(f"  Confidence: {neural_result['confidence_label']} ({neural_result['confidence']:.1%})")
-                print(f"  Consensus: {neural_result.get('consensus_count', 0)}/{neural_result.get('num_positions', 0)} positions")
+                print(f"\n✓ Sliding pHash matching successful!")
+                print(f"  Audio offset:   {final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms)")
+                print(f"  Sliding offset: {frame_corrected_offset_sec:.6f}s ({sliding_result['offset_ms']:.3f}ms)")
+                print(f"  Frame offset:   {sliding_result['offset_frames']:+d} frames (content)")
+                print(f"  Confidence:     {sliding_result['confidence_label']} ({sliding_result['confidence']:.1%})")
+                print(f"  Consensus:      {sliding_result.get('consensus_count', 0)}/{sliding_result.get('num_positions', 0)} positions")
+                if sliding_result.get("pts_correction_applied"):
+                    print(
+                        f"  PTS delta:      {sliding_result['pts_delta_frames']:+d} frames "
+                        f"({sliding_result['pts_delta_s']:+.3f}s)"
+                    )
 
                 final_offset_sec = frame_corrected_offset_sec
-                final_confidence = (final_confidence * 0.4) + (neural_result["confidence"] * 0.6)
+                final_confidence = (final_confidence * 0.4) + (sliding_result["confidence"] * 0.6)
 
             else:
-                print(f"\n⚠ Neural frame matching: {neural_result['method']}")
-                if neural_result.get("error"):
-                    print(f"  Reason: {neural_result['error']}")
+                print(f"\n⚠ Sliding pHash matching: {sliding_result['method']}")
+                if sliding_result.get("error"):
+                    print(f"  Reason: {sliding_result['error']}")
                 print(f"  Keeping audio offset: {final_offset_sec:.6f}s")
 
         except ImportError as e:
-            print(f"Neural frame matching unavailable: {e}")
+            print(f"Sliding pHash matching unavailable: {e}")
             print(f"Keeping audio-only offset: {final_offset_sec:.6f}s")
         except Exception as e:
-            print(f"Neural frame matching error: {e}")
+            print(f"Sliding pHash matching error: {e}")
             import traceback
             traceback.print_exc()
             print(f"Keeping audio-only offset: {final_offset_sec:.6f}s")
@@ -457,10 +470,10 @@ def advanced_align(source_a_path: str, source_b_path: str,
         progress_callback("Alignment complete", 98)
 
     # Determine method string
-    if config.visual_verification and verified_frame_offset is not None:
-        method_str = "SCC+NeuralISC"  # Audio correlation + ISC neural matching
-    elif config.visual_verification:
-        method_str = "SCC+NeuralFallback"  # Neural attempted but fell back
+    if config.use_sliding and verified_frame_offset is not None:
+        method_str = "SCC+pHash"  # Audio correlation + GPU pHash sliding
+    elif config.use_sliding:
+        method_str = "SCC+pHashFallback"  # Sliding attempted but fell back
     else:
         method_str = "SCC"  # Audio-only
 
