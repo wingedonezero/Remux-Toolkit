@@ -15,6 +15,12 @@ DEFAULTS = {
     "avoid_negative_ts": False,  # -avoid_negative_ts make_zero
     "extra_args": "",
     "preserve_structure": True,
+    # Native muxer (libmkv_shim) — opt-in until cross-validated against
+    # MakeMKV on the corpus. Default False so existing flow is unchanged.
+    "use_native_remux": False,
+    "apply_trim": False,                   # cell-trim deciders (Step F port)
+    "include_subpictures": True,           # subs in native path
+    "include_closed_captions": True,       # EIA-608 via ccextractor
     "col_widths": [],
     "center_split_sizes": [],
     "v_split_sizes": [],
