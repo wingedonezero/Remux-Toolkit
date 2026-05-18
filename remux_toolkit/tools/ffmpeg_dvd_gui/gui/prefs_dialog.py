@@ -154,6 +154,64 @@ class PrefsDialog(QDialog):
         advanced_group.setLayout(advanced_form)
         layout.addWidget(advanced_group)
 
+        # Native Muxer panel — opt-in to libmkv_shim rip backend +
+        # build/status controls.
+        native_group = QGroupBox("Native Muxer (libmkv_shim)")
+        native_form = QFormLayout()
+
+        self.native_remux_check = QCheckBox(
+            "Use native muxer instead of FFmpeg subprocess"
+        )
+        self.native_remux_check.setChecked(
+            bool(self.settings.get("use_native_remux", False))
+        )
+        self.native_remux_check.setToolTip(
+            "Routes rips through the libmkv_shim path (Python orchestration\n"
+            "+ libebml/libmatroska direct writes). Opt-in until cross-\n"
+            "validation against MakeMKV on the corpus is complete."
+        )
+        native_form.addRow("", self.native_remux_check)
+
+        self.native_apply_trim_check = QCheckBox(
+            "Apply cell-trim deciders (MakeMKV-style)"
+        )
+        self.native_apply_trim_check.setChecked(
+            bool(self.settings.get("apply_trim", False))
+        )
+        self.native_apply_trim_check.setToolTip(
+            "Runs the ported cell_validator + trim deciders on each title\n"
+            "and skips non-content cells at the head/tail. Only effective\n"
+            "with the native muxer."
+        )
+        native_form.addRow("", self.native_apply_trim_check)
+
+        self.native_cc_check = QCheckBox(
+            "Extract closed captions (EIA-608) when present"
+        )
+        self.native_cc_check.setChecked(
+            bool(self.settings.get("include_closed_captions", True))
+        )
+        self.native_cc_check.setToolTip(
+            "Uses ccextractor to extract line 21 CCs from the ripped MKV\n"
+            "and merges them in as an SRT track via mkvmerge."
+        )
+        native_form.addRow("", self.native_cc_check)
+
+        # Shim status + Rebuild
+        self.shim_status_label = QLabel()
+        self.shim_status_label.setStyleSheet("font-size: 11px;")
+        self.shim_status_label.setWordWrap(True)
+        self.shim_rebuild_btn = QPushButton("Rebuild Shim")
+        self.shim_rebuild_btn.clicked.connect(self._on_rebuild_shim)
+        shim_row = QHBoxLayout()
+        shim_row.addWidget(self.shim_status_label, 1)
+        shim_row.addWidget(self.shim_rebuild_btn)
+        native_form.addRow("Shim status:", shim_row)
+        self._refresh_shim_status()
+
+        native_group.setLayout(native_form)
+        layout.addWidget(native_group)
+
         # Dialog buttons
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -161,6 +219,81 @@ class PrefsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    # -- Native shim controls --
+
+    def _refresh_shim_status(self):
+        """Probe libmkv_shim and update the status label."""
+        try:
+            from ..core.mux.native import get_shim_status, ShimStatus
+        except Exception as e:
+            self.shim_status_label.setText(f"shim module unavailable: {e}")
+            self.shim_status_label.setStyleSheet("font-size: 11px; color: #cc3333;")
+            return
+        info = get_shim_status()
+        if info.status == ShimStatus.OK:
+            self.shim_status_label.setText(
+                f"OK — {info.version or 'libmkv_shim'} ({info.so_path})"
+            )
+            self.shim_status_label.setStyleSheet(
+                "font-size: 11px; color: #33aa33;"
+            )
+        elif info.status == ShimStatus.MISSING_HEADERS:
+            self.shim_status_label.setText(
+                "Missing dev headers (apt: libebml-dev libmatroska-dev). "
+                f"{info.message or ''}"
+            )
+            self.shim_status_label.setStyleSheet(
+                "font-size: 11px; color: #cc3333;"
+            )
+        elif info.status == ShimStatus.NOT_BUILT:
+            self.shim_status_label.setText(
+                "Not built — click Rebuild Shim to compile."
+            )
+            self.shim_status_label.setStyleSheet(
+                "font-size: 11px; color: #cc8800;"
+            )
+        elif info.status == ShimStatus.STALE:
+            self.shim_status_label.setText(
+                "Stale — source is newer than the .so. Click Rebuild."
+            )
+            self.shim_status_label.setStyleSheet(
+                "font-size: 11px; color: #cc8800;"
+            )
+        else:
+            self.shim_status_label.setText(
+                f"{info.status.value}: {info.message or ''}"
+            )
+            self.shim_status_label.setStyleSheet(
+                "font-size: 11px; color: #cc3333;"
+            )
+
+    def _on_rebuild_shim(self):
+        """Run the shim build script; show the result in-line."""
+        try:
+            from ..core.mux.native import build_shim
+        except Exception as e:
+            self.shim_status_label.setText(f"cannot import build_shim: {e}")
+            self.shim_status_label.setStyleSheet(
+                "font-size: 11px; color: #cc3333;"
+            )
+            return
+        self.shim_rebuild_btn.setEnabled(False)
+        self.shim_status_label.setText("Building...")
+        # Capture output to display the tail in case of failure.
+        lines: list[str] = []
+        try:
+            ok = build_shim(output_callback=lines.append)
+        finally:
+            self.shim_rebuild_btn.setEnabled(True)
+        if ok:
+            self._refresh_shim_status()
+        else:
+            tail = "\n".join(lines[-3:])
+            self.shim_status_label.setText(f"Build failed: {tail or 'see log'}")
+            self.shim_status_label.setStyleSheet(
+                "font-size: 11px; color: #cc3333;"
+            )
 
     # -- Version checking --
 
@@ -313,4 +446,8 @@ class PrefsDialog(QDialog):
             "avoid_negative_ts": self.chk_avoid_neg_ts.isChecked(),
             "chapter_naming": self.chapter_combo.currentData(),
             "extra_args": self.extra_args.text().strip(),
+            # Native muxer settings
+            "use_native_remux": self.native_remux_check.isChecked(),
+            "apply_trim": self.native_apply_trim_check.isChecked(),
+            "include_closed_captions": self.native_cc_check.isChecked(),
         }

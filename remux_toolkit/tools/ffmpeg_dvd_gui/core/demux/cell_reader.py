@@ -100,7 +100,14 @@ class CellReader:
     def __init__(self, disc, title_num: int, *,
                  vts_no: Optional[int] = None,
                  pgc_no: Optional[int] = None,
-                 batch_sectors: int = 64):
+                 batch_sectors: int = 64,
+                 cell_filter: Optional[set[int]] = None):
+        """``cell_filter`` is an optional set of 1-based cell indices to
+        INCLUDE in iteration. When None (the default), every cell in the
+        PGC is read. When provided, cells whose ``index`` is not in the
+        set are silently skipped — this is the integration point for
+        the analyzer's trim decisions.
+        """
         self.disc = disc
         self.title_num = title_num
         self.batch_sectors = batch_sectors
@@ -112,7 +119,11 @@ class CellReader:
             self.vts_no, self.pgc_no = vts_no, pgc_no
 
         with dr.open_ifo(disc, self.vts_no) as vts:
-            self.cells = _cells_for_pgc(vts, self.pgc_no)
+            all_cells = _cells_for_pgc(vts, self.pgc_no)
+        if cell_filter is None:
+            self.cells = all_cells
+        else:
+            self.cells = [c for c in all_cells if c.index in cell_filter]
 
         self._vob: Optional[dr.DvdFileP] = None
 

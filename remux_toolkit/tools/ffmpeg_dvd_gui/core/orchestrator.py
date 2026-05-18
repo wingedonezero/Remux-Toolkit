@@ -204,18 +204,82 @@ class _StreamPlan:
                               # extra ffmpeg input opts (-ar, -ac, etc.)
                               # placed AFTER `-fflags +genpts` and BEFORE -i
 
+    # Codec parameters from libdvdread's audio_attr (used by the native
+    # mux path; ffmpeg path auto-detects so these fields are ignored
+    # there). Zero/empty for video streams.
+    sample_rate: int = 0      # Hz
+    channels: int = 0         # 1..8
+    bits_per_sample: int = 0  # only meaningful for LPCM; 0 otherwise
+
+    # DVD-Video display attributes for the video stream (only meaningful
+    # when is_video=True). 0 = unspecified.
+    pixel_w: int = 0
+    pixel_h: int = 0
+    display_w: int = 0           # DAR-adjusted display width
+    display_h: int = 0
+    color_primaries: int = 0     # H.273 codes: 5=bt470bg, 6=smpte170m, ...
+    color_transfer: int = 0
+    color_matrix: int = 0
+    color_range: int = 0         # 1=tv (16-235), 2=full
+    letterboxed: bool = False    # 4:3 frame with 16:9 letterboxed content
+
+    # DVD-Video audio_attr / subp_attr extensions. 0 = unspecified.
+    # Audio code_extension: 1=normal, 2=visually-impaired, 3=director's
+    #   commentary, 4=alt director's commentary. Drives MKV track name
+    #   + DEFAULT-flag decisions.
+    # Subpicture code_extension: 9=forced, 13=director's commentary,
+    #   14=director's notes; lower values are CC variants.
+    code_extension: int = 0
+    lang_extension: int = 0
+
+
+#: DVD picture_size codes → (pixel_w, pixel_h) for NTSC.
+_PICTURE_SIZE_NTSC_DIMS = {
+    0: (720, 480), 1: (704, 480), 2: (352, 480), 3: (352, 240),
+}
+_PICTURE_SIZE_PAL_DIMS = {
+    0: (720, 576), 1: (704, 576), 2: (352, 576), 3: (352, 288),
+}
+
+
+def _video_display_dims(video_attr) -> tuple[int, int, int, int]:
+    """Resolve (pixel_w, pixel_h, display_w, display_h) from VideoAttr.
+
+    DVD-Video display_aspect_ratio: 0 = 4:3, 3 = 16:9 (anamorphic — the
+    pixel grid is 720 wide but stretched to 16:9 on playback). Players
+    use DisplayWidth/Height to compute the rendered aspect.
+    """
+    video_format = int(video_attr.video_format)
+    sizes = _PICTURE_SIZE_NTSC_DIMS if video_format == 0 else _PICTURE_SIZE_PAL_DIMS
+    pw, ph = sizes.get(int(video_attr.picture_size), (720, 480))
+
+    dar_code = int(video_attr.display_aspect_ratio)
+    if dar_code == 3:        # 16:9 anamorphic
+        dw, dh = 16, 9
+    elif dar_code == 0:      # 4:3
+        dw, dh = 4, 3
+    else:                    # 1, 2 reserved; default to pixel grid
+        dw, dh = pw, ph
+    return pw, ph, dw, dh
+
+
+def _video_color_codes(video_format: int) -> tuple[int, int, int, int]:
+    """Return (primaries, transfer, matrix, range) H.273 codes for DVD-Video.
+
+    All DVDs are SD BT.601 broadcast-range. The primaries/matrix differ
+    between NTSC (SMPTE 170M = 6) and PAL (BT.470 BG = 5); transfer is
+    SMPTE 170M for both (it's the BT.601 transfer); range is broadcast.
+    """
+    if video_format == 0:    # NTSC
+        return 6, 6, 6, 1    # smpte170m / smpte170m / smpte170m / tv
+    return 5, 6, 5, 1        # bt470bg / smpte170m / bt470bg / tv
+
 
 def _enumerate_streams(disc, vts_no: int, pgc_no: int,
                         *, include_subpictures: bool) -> tuple[list[_StreamPlan], _ColorPlan, str]:
     """Returns (streams_in_emission_order, color_plan, video_framerate_str).
     Stream order: video first, then audio (slot order), then subpictures."""
     plans: list[_StreamPlan] = []
-
-    plans.append(_StreamPlan(
-        key=stream_key(STREAM_MPEG_VIDEO, None),
-        codec_name="mpeg2video", ffmpeg_input_format="mpegvideo",
-        language="", title="", is_video=True,
-    ))
 
     with dr.open_ifo(disc, vts_no) as vts:
         m = vts.contents.vtsi_mat.contents
@@ -224,6 +288,20 @@ def _enumerate_streams(disc, vts_no: int, pgc_no: int,
 
         video_format = int(m.vts_video_attr.video_format)
         framerate = "30000/1001" if video_format == 0 else "25"
+
+        # Video plan: gather pixel dims + DAR-adjusted display + color.
+        pw, ph, dw, dh = _video_display_dims(m.vts_video_attr)
+        cp, ct, cm, cr = _video_color_codes(video_format)
+        plans.append(_StreamPlan(
+            key=stream_key(STREAM_MPEG_VIDEO, None),
+            codec_name="mpeg2video", ffmpeg_input_format="mpegvideo",
+            language="", title="", is_video=True,
+            pixel_w=pw, pixel_h=ph,
+            display_w=dw, display_h=dh,
+            color_primaries=cp, color_transfer=ct,
+            color_matrix=cm, color_range=cr,
+            letterboxed=bool(m.vts_video_attr.letterboxed),
+        ))
 
         for slot in range(min(int(m.nr_of_vts_audio_streams), 8)):
             if not (pgc.audio_control[slot] & 0x8000):
@@ -234,12 +312,19 @@ def _enumerate_streams(disc, vts_no: int, pgc_no: int,
                 continue
             our_name, sub_base, ff_fmt = entry
             extra_args: list[str] = []
+            # DVD-Video forces 48 kHz for AC3/DTS/MP1/MP2; LPCM may be
+            # 96 kHz. Channels field is N-1.
+            sample_rate = 48000
+            channels = int(attr.channels) + 1
+            bits_per_sample = 0
             if our_name == "lpcm":
                 # Bit-depth/sample-rate/channels are in the VTS audio_attr; we
                 # tell ffmpeg via `-ar`/`-ac` since raw PCM has no framing.
                 ff_fmt, extra_args = _plan_lpcm_input(attr)
                 if ff_fmt is None:
                     continue  # unsupported LPCM (20-bit)
+                sample_rate = _LPCM_SAMPLE_RATE.get(int(attr.sample_frequency), 48000)
+                bits_per_sample = {0: 16, 1: 20, 2: 24}.get(int(attr.quantization), 16)
             if ff_fmt is None:
                 continue
             substream_id = sub_base + slot
@@ -253,12 +338,38 @@ def _enumerate_streams(disc, vts_no: int, pgc_no: int,
                 language=lang,
                 title=f"Audio {slot+1} ({lang or '?'})",
                 extra_input_args=extra_args,
+                sample_rate=sample_rate,
+                channels=channels,
+                bits_per_sample=bits_per_sample,
+                code_extension=int(attr.code_extension),
+                lang_extension=int(attr.lang_extension),
             ))
 
-        # NOTE: subpictures are NOT added to the multi-fd pipe plan. ffmpeg
-        # has no `-f dvd_subtitle` raw demuxer, so we can't pipe them. They
-        # are extracted via a separate `_extract_subpictures_via_dvdvideo`
-        # side-channel and added to the final ffmpeg command as a file input.
+        # NOTE: subpictures are NOT added to the multi-fd pipe plan for
+        # the ffmpeg path — ffmpeg has no `-f dvd_subtitle` raw demuxer.
+        # The ffmpeg path uses `_extract_subpictures_via_dvdvideo`.
+        # The NATIVE mux path (codec_name="subpicture") consumes the
+        # private_stream_1 + substream_id 0x20+slot PES directly and
+        # parses SP_DCSQ inline (see core/demux/subpicture.py). We emit
+        # plans for it here when requested; callers that don't want
+        # subpictures (ffmpeg path) pass include_subpictures=False.
+        if include_subpictures:
+            for slot in range(min(int(m.nr_of_vts_subp_streams), 32)):
+                ctrl = pgc.subp_control[slot]
+                if not (ctrl & 0x80000000):
+                    continue
+                subp_attr = m.vts_subp_attr[slot]
+                lang = _lang_code_to_str(subp_attr.lang_code) or ""
+                substream_id = 0x20 + slot
+                plans.append(_StreamPlan(
+                    key=stream_key(STREAM_PRIVATE_1, substream_id),
+                    codec_name="subpicture",
+                    ffmpeg_input_format="",   # not used on native path
+                    language=lang,
+                    title=f"Subtitle {slot+1} ({lang or '?'})",
+                    code_extension=int(subp_attr.code_extension),
+                    lang_extension=int(subp_attr.lang_extension),
+                ))
 
     color = _color_for_video_format(video_format)
     return plans, color, framerate
