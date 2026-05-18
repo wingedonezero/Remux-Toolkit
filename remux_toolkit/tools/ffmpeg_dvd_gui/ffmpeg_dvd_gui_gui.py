@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QThread, QUrl
-from PyQt6.QtGui import QAction, QDesktopServices
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QHBoxLayout, QPushButton, QSplitter,
     QTreeWidgetItem, QProgressBar, QMenu, QFileDialog, QHeaderView, QDialog
@@ -18,7 +18,8 @@ from .ffmpeg_dvd_gui_config import DEFAULTS
 from .utils.paths import find_dvd_roots_with_structure, is_iso, get_dvd_input_path
 from .utils.ffmpeg_parser import duration_to_seconds, format_bytes_human
 from .models.job import Job
-from .core.info_probe import DVDProbeWorker
+from .core.info_probe import DVDProbeWorker as FFprobeDVDProbeWorker
+from .core.info_probe_native import DVDProbeWorker as NativeDVDProbeWorker
 from .core.remuxer import FFmpegDVDWorker
 from .gui.queue_tree import DropTree
 from .gui.details_panel import DetailsPanel
@@ -109,7 +110,8 @@ class FFmpegDVDGUIWidget(QWidget):
         self.btn_stop.clicked.connect(self.stop_queue)
 
     def _setup_workers(self):
-        self.probe_worker = DVDProbeWorker(self.settings)
+        probe_cls = NativeDVDProbeWorker if self.settings.get("use_native_probe", True) else FFprobeDVDProbeWorker
+        self.probe_worker = probe_cls(self.settings)
         self.probe_thread = QThread(self)
         self.probe_worker.moveToThread(self.probe_thread)
         self.probe_worker.probed.connect(self._on_probed)
@@ -267,40 +269,116 @@ class FFmpegDVDGUIWidget(QWidget):
         self._updating_checks = True
         try:
             item.takeChildren()
+            # Phase 3: every title is shown; analyzer's `hidden_by_default`
+            # controls only the *initial check state*. User can always check
+            # or uncheck anything. Reasons surface inline + tooltip + details.
             minlen = int(self.settings.get("minlength", 60))
-            any_child = False
+            any_auto_checked = False
 
             for t_idx in sorted(titles_info or {}):
                 info = titles_info[t_idx]
+                duration_secs = info.get("duration_seconds", 0) or 0
+                hidden_by_analyzer = bool(info.get("hidden_by_default", False))
+                classification = info.get("classification") or ""
+                dup_of = info.get("duplicate_of")
+                contains = info.get("contains_titles") or []
 
-                # Filter by minimum length
-                duration_secs = info.get("duration_seconds", 0)
-                if duration_secs and duration_secs < minlen:
-                    continue
-
-                video_codec = info.get("video_codec", "")
-                audio_count = str(info.get("audio_count", 0))
-                sub_count = str(info.get("subtitle_count", 0))
-                chapters = str(info.get("chapters", 0))
-                duration = info.get("duration", "")
+                # Inline label so the row is self-explanatory at a glance.
+                label_bits = [f"#{t_idx}"]
+                if dup_of is not None:
+                    label_bits.append(f"↳ duplicate of #{dup_of}")
+                elif classification == "filler":
+                    label_bits.append("(filler)")
+                elif classification == "stub":
+                    label_bits.append("(stub)")
+                if contains:
+                    label_bits.append(
+                        f"⊇ contains {', '.join(f'#{n}' for n in contains)}"
+                    )
+                title_text = "  ".join(label_bits)
 
                 child = QTreeWidgetItem([
-                    f"#{t_idx}",
-                    video_codec,
-                    audio_count,
-                    sub_count,
-                    chapters,
-                    duration,
+                    title_text,
+                    info.get("video_codec", ""),
+                    str(info.get("audio_count", 0)),
+                    str(info.get("subtitle_count", 0)),
+                    str(info.get("chapters", 0)),
+                    info.get("duration", ""),
                     "",
-                    ""
+                    "",
                 ])
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                child.setCheckState(0, Qt.CheckState.Checked)
-                item.addChild(child)
-                any_child = True
 
-            job.selected_titles = None if any_child else set()
-            item.setCheckState(0, Qt.CheckState.Checked if any_child else Qt.CheckState.Unchecked)
+                # Auto-check rule (transparent; reasons visible in tooltip):
+                #   - hidden_by_analyzer (filler or duplicate): unchecked
+                #   - duration shorter than user minlength: unchecked
+                #   - else: checked
+                below_min = (duration_secs > 0 and duration_secs < minlen)
+                auto_check = not (hidden_by_analyzer or below_min)
+                child.setCheckState(
+                    0, Qt.CheckState.Checked if auto_check else Qt.CheckState.Unchecked
+                )
+                if auto_check:
+                    any_auto_checked = True
+
+                # Tooltip explains the decision in plain language.
+                tooltip = [f"Title #{t_idx}"]
+                if classification:
+                    tooltip.append(f"Classification: {classification}")
+                if (vts := info.get("vts")) is not None:
+                    tooltip.append(f"VTS {vts}, PGC {info.get('pgc', '?')}")
+                if dup_of is not None:
+                    basis = info.get("duplicate_basis") or ""
+                    extra = f" (matched on {basis})" if basis else ""
+                    tooltip.append(f"Duplicate of #{dup_of}{extra}")
+                if contains:
+                    tooltip.append(
+                        "Compilation containing: "
+                        + ", ".join(f"#{n}" for n in contains)
+                    )
+                if not auto_check:
+                    if hidden_by_analyzer and dup_of is not None:
+                        tooltip.append("Unchecked because it duplicates another title")
+                    elif hidden_by_analyzer:
+                        tooltip.append("Unchecked because classified as filler")
+                    elif below_min:
+                        tooltip.append(
+                            f"Unchecked because duration {duration_secs:.0f}s "
+                            f"< Preferences minimum length {minlen}s"
+                        )
+                tooltip.append("(Check or uncheck freely — nothing is filtered out.)")
+                child.setToolTip(0, "\n".join(tooltip))
+
+                # Visual cue: dim+italic for rows the analyzer would hide,
+                # so the user can scan the tree and see at a glance.
+                if hidden_by_analyzer:
+                    font = child.font(0)
+                    font.setItalic(True)
+                    dim = QColor(140, 140, 140)
+                    for col in range(child.columnCount()):
+                        child.setFont(col, font)
+                        child.setForeground(col, dim)
+
+                item.addChild(child)
+
+            # `selected_titles=None` means "use all checked children"; the
+            # _on_item_checked handler keeps job.selected_titles in sync as
+            # the user toggles.
+            self._set_parent_check_from_children(item)
+            self._on_item_checked(item, 0) if False else None  # no-op: handler runs on user events
+            # Initialize job.selected_titles from current child check states.
+            selected = set()
+            checkable = 0
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                if ch.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                    checkable += 1
+                    if ch.checkState(0) == Qt.CheckState.Checked:
+                        try:
+                            selected.add(int(ch.text(0).split()[0].lstrip("#")))
+                        except (ValueError, IndexError):
+                            pass
+            job.selected_titles = None if (checkable > 0 and len(selected) == checkable) else selected
 
         finally:
             self._updating_checks = False
@@ -358,7 +436,10 @@ class FFmpegDVDGUIWidget(QWidget):
                     checkable_child_count += 1
                     if child.checkState(0) == Qt.CheckState.Checked:
                         try:
-                            selected_titles.add(int(child.text(0)[1:]))
+                            # Title cell may include trailing reason text like
+                            # "#5  ↳ duplicate of #4" — extract the leading
+                            # "#N" token only.
+                            selected_titles.add(int(child.text(0).split()[0].lstrip("#")))
                         except (ValueError, IndexError):
                             pass
                     else:
@@ -398,7 +479,7 @@ class FFmpegDVDGUIWidget(QWidget):
             return
 
         try:
-            t_idx = int(cur.text(0)[1:])
+            t_idx = int(cur.text(0).split()[0].lstrip("#"))
         except (ValueError, IndexError):
             self.details.clear()
             return
