@@ -54,6 +54,41 @@ class DetailsPanel(QTreeWidget):
         if info.get("subtitle_count"):
             QTreeWidgetItem(title_node, ["Subtitle Tracks", str(info["subtitle_count"])])
 
+        # Analyzer fields — surface the "why" for every title so the user can
+        # always understand why a title was or wasn't auto-checked.
+        analyzer_lines: list[tuple[str, str]] = []
+        if (vts := info.get("vts")) is not None:
+            analyzer_lines.append(
+                ("VTS / PGC", f"VTS {vts}, PGC {info.get('pgc', '?')}, "
+                              f"{info.get('num_cells', 0)} cell(s)")
+            )
+        if cls := info.get("classification"):
+            analyzer_lines.append(("Classification", cls))
+        if (dup_of := info.get("duplicate_of")) is not None:
+            basis = info.get("duplicate_basis") or ""
+            extra = f"  (matched on: {basis})" if basis else ""
+            analyzer_lines.append(("Duplicate of", f"#{dup_of}{extra}"))
+        if contains := info.get("contains_titles"):
+            analyzer_lines.append(
+                ("Contains titles", ", ".join(f"#{n}" for n in contains))
+            )
+        if cc := info.get("closed_caption_channels"):
+            analyzer_lines.append(("Closed Captions", ", ".join(cc)))
+        if info.get("hidden_by_default"):
+            analyzer_lines.append(
+                ("Hidden by default", "Yes — unchecked but selectable; check to include")
+            )
+
+        if analyzer_lines:
+            analyzer_node = QTreeWidgetItem(["Analysis", ""])
+            self.addTopLevelItem(analyzer_node)
+            for label, value in analyzer_lines:
+                row = QTreeWidgetItem(analyzer_node, [label, value])
+                if label == "Duplicate of":
+                    row.setForeground(1, QColor(255, 180, 100))
+                elif label == "Hidden by default":
+                    row.setForeground(1, QColor(180, 180, 180))
+
         # Stream details grouped by type
         stream_groups = {}
         for s in info.get("streams", []):

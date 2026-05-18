@@ -5,7 +5,8 @@ DEFAULTS = {
     "ffmpeg_path": "ffmpeg",
     "ffprobe_path": "ffprobe",
     "mkvpropedit_path": "mkvpropedit",
-    "minlength": 60,  # 1 minute minimum (user preference)
+    "minlength": 120,  # 2 minutes — matches MakeMKV's default auto-skip threshold
+    "use_native_probe": True,  # libdvdread+analyzer backend; False = old ffprobe-dvdvideo path
     "enable_preindex": True,  # Use -preindex for accurate chapters
     "trim_padding": True,  # Use -trim option
     "default_region": 0,  # 0 = world/auto
