@@ -321,6 +321,17 @@ class FakeCellAnalysis:
 #: ``percentage < 0x1a`` literal.)
 FAKE_CELL_PCT_THRESHOLD = 26.0
 
+#: Minimum "outside" fraction for the dominant-VOB anti-rip pattern to
+#: count. Below this floor, the outlier is just legit DVD authoring
+#: noise (e.g. TERRA_NOVA T2's 0.5s trailer cell at 0.01% of a 5180s
+#: PGC, T7's 0.5s outro at 1.94%). MakeMKV's cellwalk_primary appears
+#: to gate decider-3 on the PGC having a "meaningfully distributed"
+#: multi-VOB structure; 5% empirically matches MakeMKV's behaviour on
+#: the corpus. The companion check is the outlier-cell-count >= 3
+#: requirement (anti-rip discs use many fake cells, legit DVDs use
+#: 1-2 trailer stubs).
+FAKE_CELL_PCT_FLOOR = 5.0
+
 
 def fake_cell_detector(cells: List[CellMeta]) -> FakeCellAnalysis:
     """Port of FUN_007f1b40 — detect anti-rip dummy cells.
@@ -359,6 +370,14 @@ def fake_cell_detector(cells: List[CellMeta]) -> FakeCellAnalysis:
     confidence = (dominant_dur / total) * 100.0
     outside_pct = ((total - dominant_dur) / total) * 100.0
     if outside_pct >= FAKE_CELL_PCT_THRESHOLD:
+        return FakeCellAnalysis(confidence_pct=confidence)
+    # Noise floor: a single short outlier cell at sub-1% of total duration
+    # is almost always a legit fade-out (TERRA_NOVA T2: 0.5s fade after a
+    # 5180s 3-episode PGC). Anti-rip patterns insert MANY dummy cells —
+    # if the outlier vob has ≥3 cells the rule kicks in regardless of
+    # duration percentage.
+    outlier_cell_count = sum(1 for c in cells if c.vob_id_nr != dominant_vob)
+    if outside_pct < FAKE_CELL_PCT_FLOOR and outlier_cell_count < 3:
         return FakeCellAnalysis(confidence_pct=confidence)
 
     # Compute the dominant cell range (first..last cell that's in the
@@ -444,29 +463,148 @@ def angle_block_validator(cells: List[CellMeta], cell_index: int,
 # trim decider 3 (FUN_007f1070) — fake-cell-aware trim
 # ---------------------------------------------------------------------------
 
-def find_fake_cell_trim(cells: List[CellMeta]) -> Tuple[int, int]:
-    """Port of FUN_007f1070 — trim cells flagged by fake_cell_detector.
+#: A "dummy" cell range is small enough to be just MPEG-PS headers + a
+#: handful of VOBU markers — no real video. 16 sectors = 32 KB,
+#: corresponding to ~0.5s of MPEG-2 at low bitrates. DRAGONAUT_P2 T31
+#: anti-rip cells are 7 sectors (sectors 0..6).
+_DUMMY_RANGE_MAX_SECTORS = 16
 
-    Computes the start/end trim counts that would remove all fake cells
-    while keeping the dominant run intact. Trims only contiguous fake
-    cells from each end (cells in the MIDDLE of the run stay; the rip
-    just produces a smaller dominant range).
+
+#: Max duration in seconds that a "dummy" cell holds. Anti-rip dummy cells
+#: are typically 0.4-0.5s — one or two GOP boundaries' worth of MPEG-2
+#: header + padding. Real content cells run multiple seconds at minimum.
+_DUMMY_MAX_DURATION_S = 0.6
+
+#: Sector gap above which a short cell is considered "non-contiguous"
+#: with its predecessor and therefore a trailer / stub. 100 sectors =
+#: 200 KB — far beyond any legitimate authoring rounding.
+_DUMMY_DISCONTIG_THRESHOLD = 100
+
+
+def find_dummy_sector_cells(cells: List[CellMeta]) -> FrozenSet[int]:
+    """Identify cells whose ``first_sector``/``last_sector`` ranges and
+    duration are clear anti-rip dummies:
+
+        1. Cells with ``first_sector == 0`` AND a small range
+           (≤ ``_DUMMY_RANGE_MAX_SECTORS`` = 16 sectors = ≤32 KB).
+           A legit content cell never starts at sector 0 of a
+           VTS title-VOB.
+        2. Cells whose (first_sector, last_sector) range is **small** AND
+           shared by ≥3 OTHER cells in the same PGC. Legit DVD authoring
+           assigns unique ranges per cell, but anti-rip discs replay the
+           same tiny fragment N times.
+        3. Cells with **short duration** (≤ ``_DUMMY_MAX_DURATION_S``)
+           AND **small sector extent** (≤ ``_DUMMY_RANGE_MAX_SECTORS``).
+           Catches cells 1, 2 of DRAGONAUT_P2 T31 (each 0.4s × 16
+           sectors, but starting at sectors 7 and 23 — past sector-0
+           but still authoring-noise).
+
+    Returns the 1-based set of cell indices flagged as dummies.
+    """
+    if not cells:
+        return frozenset()
+    out: set = set()
+    # Pattern 1: zero-sector range with a small extent.
+    for c in cells:
+        size = c.last_sector - c.first_sector
+        if c.first_sector == 0 and size <= _DUMMY_RANGE_MAX_SECTORS:
+            out.add(c.index)
+    # Pattern 2: ≥3 cells sharing the exact same SMALL sector range.
+    by_range: dict[Tuple[int, int], List[int]] = {}
+    for c in cells:
+        size = c.last_sector - c.first_sector
+        if size > _DUMMY_RANGE_MAX_SECTORS:
+            continue
+        sig = (c.first_sector, c.last_sector)
+        by_range.setdefault(sig, []).append(c.index)
+    for sig, indices in by_range.items():
+        if len(indices) >= 3:
+            out.update(indices)
+    # Pattern 3: short-duration small-range cells, but only when there
+    # are ≥3 such cells in the PGC (= anti-rip pattern, not a single
+    # legit trailer / fade cell). ANGEL_S1D1 T1's last cell is 0.501s
+    # × 5 sectors and is a real fade — keeping it. DRAGONAUT_P2 T31 has
+    # 92 such cells — clearly anti-rip.
+    pattern3_candidates = [
+        c.index for c in cells
+        if (c.last_sector - c.first_sector) <= _DUMMY_RANGE_MAX_SECTORS
+        and c.duration_s <= _DUMMY_MAX_DURATION_S
+    ]
+    if len(pattern3_candidates) >= 3:
+        out.update(pattern3_candidates)
+    # Pattern 4: short-duration cell with SUBSTANTIAL data (range
+    # > _DUMMY_RANGE_MAX_SECTORS) whose first_sector is FAR from
+    # the previous cell's last_sector + 1. This is the "real-data
+    # trailer stored elsewhere on the disc" pattern.
+    #
+    # DRAGONAUT_P2 T32 cell 7: dur=0.5s, range=195 sectors, gap=2.2M
+    # sectors after cell 6. Real trailer. MakeMKV trims it (MSG:3038).
+    #
+    # TERRA_NOVA T2 cell 34: dur=0.5s, range=4 sectors, gap=980K
+    # sectors. Looks similar BUT range is tiny (4 sectors = 8KB)
+    # — that's a nav-only marker, not a trailer. MakeMKV keeps it.
+    # The range > _DUMMY_RANGE_MAX_SECTORS check distinguishes.
+    #
+    # TERRA_NOVA T7 cell 2 is contiguous (gap == 0) — not flagged.
+    for i in range(1, len(cells)):
+        c = cells[i]
+        prev = cells[i - 1]
+        if c.duration_s > _DUMMY_MAX_DURATION_S:
+            continue
+        size = c.last_sector - c.first_sector
+        if size <= _DUMMY_RANGE_MAX_SECTORS:
+            # Tiny stubs are already covered by patterns 1-3.
+            # Skip — don't double-flag and avoid TERRA_NOVA T2 false-pos.
+            continue
+        gap = c.first_sector - (prev.last_sector + 1)
+        if gap > _DUMMY_DISCONTIG_THRESHOLD:
+            out.add(c.index)
+    return frozenset(out)
+
+
+def find_fake_cell_trim(cells: List[CellMeta]) -> Tuple[int, int]:
+    """Port of FUN_007f1070 — trim cells flagged as fake.
+
+    Combines two detection signals:
+
+        1. VOB-ID grouping (``fake_cell_detector``): cells outside the
+           dominant-by-duration VOB ID group. Catches anti-rip discs that
+           interleave decoy VOBs.
+        2. Sector-range signature (``find_dummy_sector_cells``): cells
+           whose physical sector range is invalid (sector 0) or
+           duplicated. Catches the DRAGONAUT_P2 T31 pattern (92 fake
+           cells all pointing at sectors 0..6).
+
+    Trims only contiguous fake cells from each end; never trims a
+    cell in the middle of the dominant run.
 
     Returns (start_trim_cells, end_trim_cells).
     """
+    sector_fakes = find_dummy_sector_cells(cells)
     analysis = fake_cell_detector(cells)
-    if not analysis.fake_indices or analysis.dominant_range is None:
+    fake_set = set(analysis.fake_indices) | set(sector_fakes)
+    if not fake_set:
         return 0, 0
-    dom_start, dom_end = analysis.dominant_range
+
+    # Compute a "real-content" range: the contiguous run between the
+    # first and last non-fake cell.
+    real_cells = [c for c in cells if c.index not in fake_set]
+    if not real_cells:
+        # Whole title is fake — don't trim everything; let the analyzer
+        # mark this as a fake title higher up.
+        return 0, 0
+    dom_start = real_cells[0].index
+    dom_end = real_cells[-1].index
+
     start_trim = 0
     end_trim = 0
     for c in cells:
-        if c.index < dom_start and c.index in analysis.fake_indices:
+        if c.index < dom_start and c.index in fake_set:
             start_trim += 1
         else:
             break
     for c in reversed(cells):
-        if c.index > dom_end and c.index in analysis.fake_indices:
+        if c.index > dom_end and c.index in fake_set:
             end_trim += 1
         else:
             break
@@ -505,6 +643,17 @@ class TrimDecision:
         return self.start_trim > 0 or self.end_trim > 0
 
 
+def _is_content_for_trim(cell: CellMeta, all_cells: List[CellMeta], pgc) -> bool:
+    """Match MakeMKV's content classifier used during trim: the
+    "byzantine" cell_validator_primary port (not the simpler lenient
+    classifier). MakeMKV's FUN_007f7940 internally invokes
+    FUN_007ea3d0 (cell_validator_primary). Using the lenient classifier
+    here makes us miss short trailer cells (DRAGONAUT_P2 T31's cell 100
+    at 0.5005s would otherwise pass cell_is_content's 0.5 threshold).
+    """
+    return cell_is_content_byzantine(cell, all_cells, pgc)
+
+
 def find_short_content_runs(cells: List[CellMeta], pgc,
                             *, threshold_s: float = TRIM_5SEC_THRESHOLD_S,
                             ) -> Tuple[int, int]:
@@ -518,11 +667,10 @@ def find_short_content_runs(cells: List[CellMeta], pgc,
 
     Returns (start_trim_cells, end_trim_cells).
 
-    Note: MakeMKV's exact algorithm operates on a list of "cell pairs"
-    (consecutive cells that differ in VOB id) and accumulates duration
-    via the FUN_007ea3d0 + BCD-decode loop. Our simpler 1-cell-step
-    walk is the same idea applied per-cell; equivalent behaviour on
-    almost all real DVDs we've inspected (validated empirically).
+    Uses ``cell_is_content_byzantine`` (matches MakeMKV's FUN_007ea3d0
+    invocation pattern in FUN_007f7940). The plain ``cell_is_content``
+    has a more permissive 0.5s cutoff that lets 0.5005s trailer cells
+    pass — too lenient for the trim path.
     """
     n = len(cells)
     if n == 0:
@@ -592,7 +740,208 @@ def find_3_or_4_cell_marker_trim(cells: List[CellMeta], pgc) -> Tuple[int, int]:
     return start_trim, end_trim
 
 
-def decide_trim(cells: List[CellMeta], pgc) -> TrimDecision:
+#: Tolerance (seconds) when matching a cell range's summed duration
+#: against PGC.playback_time. Empirically MakeMKV's selection on
+#: DRAGONAUT_P2 T31 is within ~5s of declared PGC time on a 1456s
+#: range (cells 93-99 sum to 1460.73s).
+_PGC_TIME_MATCH_TOLERANCE_S = 10.0
+
+#: Below this ratio between cell_sum and pgc_time, we DON'T invoke the
+#: PGC-time-driven trim — the small mismatch is just BCD rounding noise.
+#: At >= this ratio the cell list contains genuinely-extra material that
+#: needs trimming to match the declared title.
+_PGC_TIME_MISMATCH_RATIO = 1.5
+
+#: Threshold for a vob_id_nr run to count as a "content segment" in a
+#: compilation PGC. Less than this and it's just dummy / transition
+#: cells. MakeMKV's MSG:3037/3038 on DRAGONAUT_P2 T31 trims around
+#: cells 93-98 (vob_id 23, totaling 1429s); the shorter "fake" runs
+#: between episodes (vob_id 4, 7, 10, etc. each contain a single full
+#: episode of ~1450s) are NOT trimmed because each is itself a
+#: substantial content segment — but a multi-episode PGC of this kind
+#: triggers MakeMKV's "pick latest" path.
+_COMPILATION_SEGMENT_MIN_S = 60.0
+
+#: How many distinct vob_id_nr groups, each meeting
+#: ``_COMPILATION_SEGMENT_MIN_S``, qualify a PGC as a "compilation"
+#: (multiple logical titles played back-to-back as a single PGC).
+#: DRAGONAUT_P2 T31 has 7 such groups.
+_COMPILATION_MIN_SEGMENTS = 3
+
+#: Compilation PGCs have dummy cells inserted between each segment to
+#: prevent linear-rip tools from grabbing the whole concatenation as
+#: one video. ANGEL_S1D1 T1 has 8 vob_id groups (one per chapter) but
+#: ZERO dummies — it's a single-episode movie, NOT a compilation.
+#: DRAGONAUT_P2 T31 has 56 dummy cells across its 100-cell PGC, clearly
+#: anti-rip authoring. Require at least this many dummies before the
+#: compilation-trim path fires.
+_COMPILATION_MIN_DUMMIES = 10
+
+#: Adjacent-cell duration cutoff when expanding the chosen content
+#: segment outward. Cells in [_MIN, _MAX) are short trailers / fades /
+#: outros — included if directly adjacent. Cells at or above _MAX
+#: are themselves substantial content and act as a boundary. Cells
+#: BELOW _MIN are too tiny (trailer stubs / 0.5s nubs) — also
+#: boundaries. DRAGONAUT_P2 T31's cell 100 at 0.5s sits below _MIN
+#: and is correctly excluded; cell 99 at 10s sits in [_MIN, _MAX)
+#: and is pulled into the segment.
+_COMPILATION_EXPAND_MIN_S = 1.0
+_COMPILATION_EXPAND_MAX_S = 30.0
+
+
+def find_compilation_pgc_trim(cells: List[CellMeta]) -> Tuple[int, int]:
+    """Compilation PGC trim — port of MakeMKV's FUN_007f1070 (trim decider 3)
+    when applied to a PGC that holds multiple logical titles played
+    back-to-back.
+
+    Trigger: ``>= _COMPILATION_MIN_SEGMENTS`` distinct vob_id_nr groups
+    each holding ``>= _COMPILATION_SEGMENT_MIN_S`` of duration.
+    DRAGONAUT_P2 T31 has 7 such groups (vob_id 4, 7, 10, 13, 16, 20, 23
+    each at ~1450s); a single-episode PGC has 1 such group.
+
+    Algorithm (matches MakeMKV's "Cells 1-92 removed from title start /
+    Cells 100-100 removed from title end" on T31):
+
+        1. Group cells by vob_id_nr.
+        2. Identify "content segments" — vob_id groups whose cell run
+           sums to >= _COMPILATION_SEGMENT_MIN_S.
+        3. If <_COMPILATION_MIN_SEGMENTS qualify, this PGC is NOT a
+           compilation — return (0, 0). The normal trim deciders apply.
+        4. Pick the LATEST content segment by cell index (matches
+           MakeMKV's MSG:3037/3038 emission on T31).
+        5. Expand the segment's range OUTWARD to include adjacent
+           short-content cells (each < _COMPILATION_EXPAND_MAX_S).
+           Cell 99 of DRAGONAUT T31 (10s, vob_id 24) gets pulled in
+           this way.
+        6. Return (start_trim_cells_count, end_trim_cells_count) such
+           that the kept range is [start+1 .. n-end].
+    """
+    n = len(cells)
+    if n == 0:
+        return 0, 0
+
+    # 1. Group by vob_id_nr; collect (vob_id, total_duration, cell_indices)
+    by_vob: dict[int, list[CellMeta]] = {}
+    for c in cells:
+        by_vob.setdefault(c.vob_id_nr, []).append(c)
+
+    # 2. Identify content segments.
+    segments: list[Tuple[int, int, int, float]] = []   # (vob_id, first_idx, last_idx, dur_s)
+    for vob_id, group in by_vob.items():
+        dur = sum(c.duration_s for c in group)
+        if dur < _COMPILATION_SEGMENT_MIN_S:
+            continue
+        idx_first = min(c.index for c in group)
+        idx_last = max(c.index for c in group)
+        segments.append((vob_id, idx_first, idx_last, dur))
+
+    # 3. Trigger checks. Compilation PGCs (a) have multiple long segments
+    # AND (b) are separated by dummy-cell padding. Non-compilation
+    # multi-chapter movies (ANGEL_S1D1 T1 — 8 chapters, one per vob_id)
+    # fail the dummy-count check.
+    sector_fakes_pretest = find_dummy_sector_cells(cells)
+    if len(segments) < _COMPILATION_MIN_SEGMENTS:
+        return 0, 0
+    if len(sector_fakes_pretest) < _COMPILATION_MIN_DUMMIES:
+        return 0, 0
+
+    # 4. Pick the LATEST segment (max idx_last).
+    segments.sort(key=lambda s: s[2])
+    chosen_vob, seg_first, seg_last, seg_dur = segments[-1]
+
+    # 5. Expand range backward (include adjacent short-content cells).
+    # Cells qualify if: NOT a sector-dummy AND duration is in the
+    # "trailer / fade" band (_MIN <= dur < _MAX). Cells below _MIN
+    # are tiny stubs (don't include); cells at _MAX or above are
+    # substantial-neighbour boundaries (stop).
+    sector_fakes = find_dummy_sector_cells(cells)
+    expand_start = seg_first
+    i = seg_first - 1
+    while i >= 1:
+        c = cells[i - 1]  # 0-based access
+        if c.index in sector_fakes:
+            break
+        if c.duration_s >= _COMPILATION_EXPAND_MAX_S:
+            break
+        if c.duration_s < _COMPILATION_EXPAND_MIN_S:
+            break
+        expand_start = i
+        i -= 1
+    # 5b. Expand range forward (same logic).
+    expand_end = seg_last
+    i = seg_last + 1
+    while i <= n:
+        c = cells[i - 1]
+        if c.index in sector_fakes:
+            break
+        if c.duration_s >= _COMPILATION_EXPAND_MAX_S:
+            break
+        if c.duration_s < _COMPILATION_EXPAND_MIN_S:
+            break
+        expand_end = i
+        i += 1
+
+    start_trim = expand_start - 1
+    end_trim = n - expand_end
+    return start_trim, end_trim
+
+
+def find_pgc_time_match_trim(cells: List[CellMeta], pgc) -> Tuple[int, int]:
+    """Find the LATEST contiguous cell run whose summed duration matches
+    PGC.playback_time within tolerance. Returns (start_trim, end_trim).
+
+    On DRAGONAUT_P2 T31: PGC declares 1456s, cell-sum is 10187s. Cells
+    93-99 sum to 1460.7s ≈ 1456s. MakeMKV trims cells 1-92 from start
+    and cell 100 from end. This algorithm replicates that selection.
+
+    Returns (0, 0) when:
+      * cell_sum / pgc_time < 1.5 (small mismatch — let the other
+        deciders handle it)
+      * no contiguous range matches within tolerance
+    """
+    n = len(cells)
+    if n == 0:
+        return 0, 0
+    try:
+        target = _dvdtime_to_seconds(pgc.playback_time)
+    except Exception:
+        return 0, 0
+    if target <= 0:
+        return 0, 0
+    # Prefix sums for O(1) range duration queries.
+    prefix = [0.0]
+    for c in cells:
+        prefix.append(prefix[-1] + c.duration_s)
+    total = prefix[-1]
+    if total <= 0:
+        return 0, 0
+    if total < target * _PGC_TIME_MISMATCH_RATIO:
+        return 0, 0   # Mismatch too small; not a candidate.
+    # Search for the LATEST contiguous (start, end) where the range
+    # duration ≈ target.
+    best: Optional[Tuple[int, int]] = None
+    for end in range(n, 0, -1):
+        for start in range(end, 0, -1):
+            run_sum = prefix[end] - prefix[start - 1]
+            if run_sum > target + _PGC_TIME_MATCH_TOLERANCE_S:
+                # Run is too long; making it longer (smaller start) only
+                # makes it worse — bail out of this `end` loop.
+                break
+            if abs(run_sum - target) <= _PGC_TIME_MATCH_TOLERANCE_S:
+                best = (start, end)
+                break
+        if best is not None:
+            break
+    if best is None:
+        return 0, 0
+    start, end = best
+    return start - 1, n - end
+
+
+def decide_trim(cells: List[CellMeta], pgc, *,
+                title_id: Optional[int] = None,
+                vts_no: Optional[int] = None,
+                pgc_no: Optional[int] = None) -> TrimDecision:
     """Top-level trim selector. Runs the three deciders + fake-cell
     detector and combines their results.
 
@@ -608,22 +957,51 @@ def decide_trim(cells: List[CellMeta], pgc) -> TrimDecision:
     s1, e1 = find_short_content_runs(cells, pgc)
     s2, e2 = find_3_or_4_cell_marker_trim(cells, pgc)
     s3, e3 = find_fake_cell_trim(cells)
+    s4, e4 = find_pgc_time_match_trim(cells, pgc)
+    s5, e5 = find_compilation_pgc_trim(cells)
     out = TrimDecision()
-    out.start_trim = max(s1, s2, s3)
-    out.end_trim   = max(e1, e2, e3)
-    # Reason picking: prefer the decider that contributed the max.
-    if out.start_trim == s3 and s3 > 0:
-        out.reason_start = "fake-cell-outside-dominant-run"
-    elif out.start_trim == s2 and s2 > 0:
-        out.reason_start = "3-4-cell-marker"
-    elif out.start_trim > 0:
-        out.reason_start = "short-content-run<5s"
-    if out.end_trim == e3 and e3 > 0:
-        out.reason_end = "fake-cell-outside-dominant-run"
-    elif out.end_trim == e2 and e2 > 0:
-        out.reason_end = "3-4-cell-marker"
-    elif out.end_trim > 0:
-        out.reason_end = "short-content-run<5s"
+    # Compilation trim wins outright when it fires — MakeMKV's
+    # MSG:3037/3038 on multi-episode PGCs picks the latest segment
+    # regardless of what the other deciders said.
+    if s5 > 0 or e5 > 0:
+        out.start_trim = s5
+        out.end_trim = e5
+        out.reason_start = "compilation-pgc-last-segment" if s5 > 0 else ""
+        out.reason_end = "compilation-pgc-last-segment" if e5 > 0 else ""
+    else:
+        out.start_trim = max(s1, s2, s3, s4)
+        out.end_trim   = max(e1, e2, e3, e4)
+        # Reason picking: prefer the most-specific decider that fired.
+        if out.start_trim == s4 and s4 > 0:
+            out.reason_start = "pgc-time-match"
+        elif out.start_trim == s3 and s3 > 0:
+            out.reason_start = "fake-cell-outside-dominant-run"
+        elif out.start_trim == s2 and s2 > 0:
+            out.reason_start = "3-4-cell-marker"
+        elif out.start_trim > 0:
+            out.reason_start = "short-content-run<5s"
+        if out.end_trim == e4 and e4 > 0:
+            out.reason_end = "pgc-time-match"
+        elif out.end_trim == e3 and e3 > 0:
+            out.reason_end = "fake-cell-outside-dominant-run"
+        elif out.end_trim == e2 and e2 > 0:
+            out.reason_end = "3-4-cell-marker"
+        elif out.end_trim > 0:
+            out.reason_end = "short-content-run<5s"
+
+    # Emit MakeMKV-equivalent MSG:3037/3038 for cross-validation.
+    # Runs for ALL trim paths (compilation, fake-cell, etc.).
+    if title_id is not None and (out.start_trim > 0 or out.end_trim > 0):
+        from . import mkv_msg_log
+        n = len(cells)
+        if out.start_trim > 0:
+            mkv_msg_log.emit(3037, out.start_trim,
+                             title=title_id, vts=vts_no, pgc=pgc_no,
+                             reason=out.reason_start)
+        if out.end_trim > 0:
+            mkv_msg_log.emit(3038, n - out.end_trim + 1, n,
+                             title=title_id, vts=vts_no, pgc=pgc_no,
+                             reason=out.reason_end)
     return out
 
 
@@ -709,6 +1087,9 @@ __all__ = [
     "FakeCellAnalysis",
     "AngleBlockReport",
     "fake_cell_detector",
+    "find_dummy_sector_cells",
+    "find_pgc_time_match_trim",
+    "find_compilation_pgc_trim",
     "angle_block_validator",
     "find_fake_cell_trim",
     "find_short_content_runs",

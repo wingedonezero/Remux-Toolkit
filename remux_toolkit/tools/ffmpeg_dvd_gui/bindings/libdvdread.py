@@ -598,6 +598,39 @@ _lib.ifoOpen.restype = POINTER(IfoHandle)
 _lib.ifoClose.argtypes = [POINTER(IfoHandle)]
 _lib.ifoClose.restype = None
 
+# UDFFindFile is a public libdvdread API exposed in dvdread/dvd_udf.h:
+#     uint32_t UDFFindFile(dvd_reader_t*, const char *filename, uint32_t *size);
+# Returns the PHYSICAL sector (LBA) of the named file on disc, plus its
+# size in bytes via the out-param. Used to verify the BUP's actual on-disc
+# position against the IFO's declared layout — MakeMKV's MSG:3002 check.
+_lib.UDFFindFile.argtypes = [DvdReaderP, c_char_p, POINTER(c_uint32)]
+_lib.UDFFindFile.restype = c_uint32
+
+
+def udf_find_file(dvd: DvdReaderP, filename: str) -> Optional[tuple[int, int]]:
+    """Look up ``filename`` (DVD-internal path, e.g.
+    ``/VIDEO_TS/VTS_01_0.BUP``) in the disc's UDF filesystem.
+
+    Returns ``(lba, size_bytes)`` on success, ``None`` when:
+      * the file isn't on the disc, OR
+      * the source isn't a UDF-formatted disc (folder rip, raw VIDEO_TS
+        directory). libdvdread's UDFFindFile signals this by returning
+        ``0`` for not-found and a negative value (which surfaces as
+        ``0xFFFFFFFF``-ish after the ``uint32_t`` cast) when it can't
+        even read a sector.
+
+    The LBA is the physical sector position on the disc; useful for
+    verifying the BUP file's location against the IFO's declared layout.
+    """
+    size = c_uint32(0)
+    lba = _lib.UDFFindFile(dvd, filename.encode("utf-8"), ctypes.byref(size))
+    lba = int(lba)
+    # 0 = not found.  Values >= 0x80000000 are negative ints cast to
+    # uint32 — libdvdread's "read failed" path (folder source, no UDF).
+    if lba == 0 or lba >= 0x80000000:
+        return None
+    return lba, int(size.value)
+
 
 # ---------------------------------------------------------------------------
 # Pythonic helpers
@@ -706,13 +739,24 @@ def _lang_code_to_str(lang_code: int) -> str:
     return ""
 
 
+def lang_code_to_iso639(lang_code: int) -> str:
+    """ISO-639-2 normalised: any non-printable / zero / out-of-range two-letter
+    code becomes ``und`` (matroska "undetermined"). MakeMKV emits ``und`` for
+    these cases and Matroska/MKV readers (mkvmerge, ffprobe, Plex) treat an
+    empty string as malformed. Use this for output destined for an MKV track."""
+    raw = _lang_code_to_str(lang_code).strip().lower()
+    if len(raw) != 2 or not raw.isalpha():
+        return "und"
+    return raw
+
+
 def audio_attr_to_dict(a: AudioAttr) -> dict:
     return {
         "codec":      _AUDIO_FORMAT.get(a.audio_format, f"unknown_{a.audio_format}"),
         "channels":   a.channels + 1,  # field stores N-1
         "sample_rate": _AUDIO_SAMPLE.get(a.sample_frequency, "?"),
         "quantization": _AUDIO_QUANT.get(a.quantization, "?"),
-        "language":   _lang_code_to_str(a.lang_code),
+        "language":   lang_code_to_iso639(a.lang_code),
         "lang_type":  _AUDIO_LANG_TYPE.get(a.lang_type, "?"),
         "app_mode":   _AUDIO_APPMODE.get(a.application_mode, "?"),
         "multichannel_extension": bool(a.multichannel_extension),
@@ -722,7 +766,7 @@ def audio_attr_to_dict(a: AudioAttr) -> dict:
 
 def subp_attr_to_dict(s: SubpAttr) -> dict:
     return {
-        "language":      _lang_code_to_str(s.lang_code),
+        "language":      lang_code_to_iso639(s.lang_code),
         "type":          _SUBP_TYPE.get(s.type, f"unknown_{s.type}"),
         "code_mode":     _SUBP_CODE_MODE.get(s.code_mode, f"unknown_{s.code_mode}"),
         "code_extension": s.code_extension,
@@ -747,6 +791,56 @@ def open_vob(dvd: DvdReaderP, vts_number: int, *, menu: bool = False) -> Iterato
         raise DvdReadError(f"DVDOpenFile(vts={vts_number}, domain={domain}) failed")
     try:
         yield f
+    finally:
+        _lib.DVDCloseFile(f)
+
+
+# ---------------------------------------------------------------------------
+# Raw IFO / BUP probing
+# ---------------------------------------------------------------------------
+#
+# `ifoOpen()` returns one handle; if the main IFO fails to open, libdvdread
+# silently falls back to the BUP. Callers can't tell which file was used, and
+# can't detect the "main IFO opened but its contents are corrupt" case at all.
+# These helpers let callers probe the raw .IFO and .BUP files directly so
+# higher layers can do their own divergence checks.
+
+def probe_ifo_size(dvd: DvdReaderP, title: int, *, backup: bool = False) -> int:
+    """Return the size of VIDEO_TS.IFO / VTS_xx_0.IFO (or .BUP if backup=True)
+    in bytes, or ``-1`` if the file can't be opened. Does not raise."""
+    domain = DvdReadDomain.INFO_BACKUP_FILE if backup else DvdReadDomain.INFO_FILE
+    f = _lib.DVDOpenFile(dvd, title, domain)
+    if not f:
+        return -1
+    try:
+        size_blocks = _lib.DVDFileSize(f)
+        if size_blocks < 0:
+            return -1
+        return int(size_blocks) * DVD_VIDEO_LB_LEN
+    finally:
+        _lib.DVDCloseFile(f)
+
+
+def probe_ifo_blocks(dvd: DvdReaderP, title: int, *,
+                     backup: bool = False, n_blocks: int = 1) -> Optional[bytes]:
+    """Read the first ``n_blocks`` 2048-byte logical blocks of the IFO (or BUP).
+    Returns ``None`` if the file can't be opened; raises ``DvdReadError`` on a
+    mid-read failure."""
+    domain = DvdReadDomain.INFO_BACKUP_FILE if backup else DvdReadDomain.INFO_FILE
+    f = _lib.DVDOpenFile(dvd, title, domain)
+    if not f:
+        return None
+    try:
+        size_blocks = _lib.DVDFileSize(f)
+        if size_blocks <= 0:
+            return None
+        count = min(int(size_blocks), int(n_blocks))
+        buf = (c_uint8 * (count * DVD_VIDEO_LB_LEN))()
+        got = _lib.DVDReadBlocks(f, 0, count, buf)
+        if got < 0:
+            raise DvdReadError(
+                f"DVDReadBlocks failed for IFO title={title} backup={backup}")
+        return bytes(buf)[: got * DVD_VIDEO_LB_LEN]
     finally:
         _lib.DVDCloseFile(f)
 

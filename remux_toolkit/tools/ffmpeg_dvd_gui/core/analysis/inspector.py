@@ -25,6 +25,7 @@ from typing import Optional
 
 from ...bindings import libdvdread as dr
 from ...utils.paths import find_dvd_roots_with_structure
+from . import ifo_validate as ifov
 
 
 SCHEMA = "remux-toolkit/dvd-inspector/v1"
@@ -34,15 +35,29 @@ SCHEMA = "remux-toolkit/dvd-inspector/v1"
 # Disc → dict
 # ---------------------------------------------------------------------------
 
-def inspect_disc(path: str | Path, *, include_cells: bool = True) -> dict:
+def inspect_disc(path: str | Path, *, include_cells: bool = True,
+                 filter_phantom_streams: bool = False) -> dict:
     """
     All IFO-derived values must be copied out of libdvdread's struct memory
     *before* the corresponding ifoClose() runs, otherwise we read freed memory.
+
+    ``filter_phantom_streams``: when True, the inspector scans each title's
+    VOB sectors (up to ~8 MB per title) and drops audio / subtitle streams
+    that the IFO declares but the VOB never delivers. This is what MakeMKV
+    does — its audio/sub counts reflect the post-scan reality, not the
+    pre-scan IFO declaration. Default False for speed (typical use); the
+    cross-validation harness sets True.
     """
     path = str(path)
+    css_state = ifov.detect_css(path)
     with dr.open_disc(path) as dvd:
         vol_id, vol_set = dr.get_volume_info(dvd)
         disc_id = dr.get_disc_id(dvd)
+
+        # Probe + validate VMG before we read its contents — captures
+        # main-vs-BUP divergence and impossible counts. Always runs;
+        # cheap (≤2 sector reads).
+        vmg_report = ifov.inspect_ifo_source(dvd, 0, is_vmg=True)
 
         with dr.open_ifo(dvd, 0) as vmg:
             vmgi = vmg.contents.vmgi_mat.contents
@@ -58,6 +73,7 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True) -> dict:
                 "provider_identifier": bytes(vmgi.provider_identifier).decode("latin-1", errors="replace").strip("\x00 "),
                 "first_play_pgc_offset": int(vmgi.first_play_pgc),
                 "vmg_category": int(vmgi.vmg_category),
+                "ifo_validation": ifov.report_to_dict(vmg_report),
             }
 
             raw_titles = [
@@ -73,17 +89,43 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True) -> dict:
             ]
 
         title_sets: list[dict] = []
+        vts_reports: list[ifov.IfoReport] = []
         for vts_no in range(1, num_vts + 1):
+            vts_report = ifov.inspect_ifo_source(dvd, vts_no, is_vmg=False)
+            vts_reports.append(vts_report)
             try:
                 with dr.open_ifo(dvd, vts_no) as vts_ifo:
-                    title_sets.append(_vts_to_dict(vts_no, vts_ifo, include_cells=include_cells))
+                    d = _vts_to_dict(vts_no, vts_ifo, include_cells=include_cells)
+                    d["ifo_validation"] = ifov.report_to_dict(vts_report)
+                    title_sets.append(d)
             except dr.DvdReadError as e:
                 title_sets.append({
                     "vts": vts_no,
                     "error": str(e),
+                    "ifo_validation": ifov.report_to_dict(vts_report),
                 })
 
         titles = [_resolve_title(t, title_sets) for t in raw_titles]
+
+        if filter_phantom_streams:
+            from . import stream_presence as sp
+            _apply_phantom_filter_to_titles(dvd, titles)
+
+        all_reports = [vmg_report, *vts_reports]
+        ifo_summary = {
+            "main_used": sum(1 for r in all_reports
+                             if r.probe.effective_source == "main"),
+            "bup_fallback": sum(1 for r in all_reports
+                                if r.probe.effective_source == "bup"),
+            "missing": sum(1 for r in all_reports
+                           if r.probe.effective_source == "missing"),
+            "diverged": sum(1 for r in all_reports
+                            if r.probe.content_matches is False),
+            "errors": sum(1 for r in all_reports
+                          for i in r.issues if i.severity == "error"),
+            "warnings": sum(1 for r in all_reports
+                            for i in r.issues if i.severity == "warn"),
+        }
 
         return {
             "schema": SCHEMA,
@@ -91,9 +133,11 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True) -> dict:
             "volume_id": vol_id,
             "volume_set_id_hex": vol_set.hex() if vol_set else "",
             "disc_id_md5": disc_id,
+            "css": css_state,
             "vmg": vmg_info,
             "title_sets": title_sets,
             "titles": titles,
+            "ifo_summary": ifo_summary,
         }
 
 
@@ -190,6 +234,62 @@ def _pgc_to_dict(pgc_idx: int, pgc, *, include_cells: bool) -> dict:
     return out
 
 
+def _apply_phantom_filter_to_titles(dvd, titles: list[dict]) -> None:
+    """Mutates each title in-place to drop AUDIO streams that the VOB
+    doesn't actually carry. Called when ``inspect_disc`` was invoked with
+    ``filter_phantom_streams=True``.
+
+    Why audio-only:
+      * Audio PES are dense (every ~100 ms on a typical 256-kbps AC3
+        track) — if we scan 32 MB and don't see audio for slot N, that
+        slot is genuinely missing. Confidence is high.
+      * Subtitle PES are sparse — one per signage card / dialogue. A
+        sparse sub may first appear minutes into a long title. We'd
+        need to scan the entire VOB to be sure, which is too slow for
+        the inspector. Instead the phantom report is surfaced as
+        diagnostic metadata and the rip pipeline can choose whether to
+        act on it.
+
+    Slow path: opens each title's VTS VOBs and scans up to 32 MB. Skip
+    titles with zero declared audio (no point scanning).
+    """
+    from . import stream_presence as sp
+
+    for t in titles:
+        vts = t.get("vts")
+        pgc = t.get("pgc")
+        if not vts or not pgc:
+            continue
+        n_audio = len(t.get("audio_streams", []))
+        n_sub = len(t.get("subtitle_streams", []))
+        if n_audio == 0 and n_sub == 0:
+            continue
+        try:
+            rep = sp.detect_phantom_streams(dvd, vts, pgc)
+        except Exception:
+            # Phantom detection is best-effort; on failure, leave the
+            # title's stream lists as the IFO declared them.
+            continue
+        t["stream_presence"] = sp.report_to_dict(rep)
+        if not rep.missing_audio_indices:
+            continue
+        # Audio-only filter: drop tracks for slots not seen in the
+        # post-scan observed set.
+        active_audio = t.get("active_audio_slots") or list(range(n_audio))
+        a_missing = set(rep.missing_audio_indices)
+        kept_audio = []
+        for i, s in enumerate(t.get("audio_streams", [])):
+            slot = active_audio[i] if i < len(active_audio) else i
+            if slot in a_missing:
+                continue
+            kept_audio.append(s)
+        t["audio_streams"] = kept_audio
+        t["phantoms_dropped"] = {
+            "audio": len(rep.missing_audio_indices),
+            "subtitle_diagnostic": len(rep.missing_subp_indices),
+        }
+
+
 def _resolve_title(title: dict, title_sets: list[dict]) -> dict:
     """Inline VTS metadata + PGC timing onto each title row, filtering streams
     by the PGC's active audio/subp masks. The VTS declares M streams; the PGC
@@ -231,6 +331,13 @@ def _resolve_title(title: dict, title_sets: list[dict]) -> dict:
             out["duration_seconds_cell_sum"] = pgc.get("duration_seconds_cell_sum")
             out["num_cells"] = pgc["num_cells"]
             out["frame_rate"] = pgc["frame_rate"]
+            # Prefer PGC.nr_of_programs over tt_srpt.nr_of_ptts for the
+            # chapter count: PTT entries can be repeated pointers to the
+            # same program (ANGEL T5 declares 2 PTTs, PGC has 1 program).
+            # MakeMKV reports nr_of_programs as the chapter count, and
+            # mkvmerge / players show one chapter per program.
+            if pgc.get("num_programs") is not None:
+                out["num_chapters"] = pgc["num_programs"]
 
             active_audio_idx = pgc.get("active_audio_stream_indices", [])
             active_subp_idx  = pgc.get("active_subtitle_stream_indices", [])
@@ -240,6 +347,14 @@ def _resolve_title(title: dict, title_sets: list[dict]) -> dict:
                                     if i < len(declared_audio)]
             out["subtitle_streams"] = [declared_subp[i] for i in active_subp_idx
                                        if i < len(declared_subp)]
+            # Preserve the slot indices in IFO order so the phantom-stream
+            # filter can map back to the declared-slot index used by the
+            # VOB scan (which uses 0xBD+0x80+slot for audio, 0x20+slot
+            # for subs).
+            out["active_audio_slots"] = [i for i in active_audio_idx
+                                         if i < len(declared_audio)]
+            out["active_subp_slots"] = [i for i in active_subp_idx
+                                        if i < len(declared_subp)]
     return out
 
 
