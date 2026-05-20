@@ -466,7 +466,12 @@ def _to_gui_title(title: dict) -> dict:
         "duration":             _seconds_to_hms(mm_dur),
         "duration_seconds":     mm_dur,
         "duration_seconds_pgc": round(pgc_dur, 3),
-        "chapters":         title.get("num_chapters", 0),
+        # MakeMKV reports post-trim chapter count; we mirror that on
+        # ``chapters``. The pre-trim count (from tt_srpt) is kept on
+        # ``chapters_raw`` for callers that need the IFO-declared value.
+        "chapters":         title.get(
+            "num_chapters_post_trim", title.get("num_chapters", 0)),
+        "chapters_raw":     title.get("num_chapters", 0),
         "video_codec":      (video.get("codec") or "").upper(),
         "audio_count":      len(title.get("audio_streams", [])),
         # MakeMKV emits a single CC subtitle stream per title regardless
@@ -595,25 +600,84 @@ def analyze(report: dict, *, dvd_path: Optional[str] = None) -> dict:
     vts_by_no = {ts.get("vts"): ts for ts in title_sets}
 
     # Pre-compute the MakeMKV-equivalent display duration per title:
-    # sum(int(cell.duration_s)) — what MakeMKV prints in MSG:3028
-    # "Title #N was added (M cell(s), H:MM:SS)" and in its title list
-    # JSON. Our analyzer also exposes the full-precision pgc.playback_time
-    # via duration_seconds_pgc for callers that need it.
+    # sum(int(cell.duration_s)) AFTER applying trim — what MakeMKV
+    # prints in MSG:3028 "Title #N was added (M cell(s), H:MM:SS)" and
+    # in its title list JSON. Our analyzer also exposes the
+    # full-precision pgc.playback_time via duration_seconds_pgc.
+    #
+    # Group A1: also compute post-trim chapter count by counting the
+    # PTTs whose first program's first cell falls within the kept cell
+    # range. MakeMKV's chapter count reflects the trimmed title.
+    from . import cell_trim as _ct
+    from .title_pre_filter import (
+        _cell_dict_to_meta as _cell_to_meta,
+        _annotate_block_ranges as _annot,
+        _DictPgcProxy as _PgcProxy,
+    )
     for t in raw_titles:
         pgc_no = t.get("pgc")
-        vts = vts_by_no.get(t.get("vts"), {}) or {}
+        vts_no = t.get("vts")
+        vts = vts_by_no.get(vts_no, {}) or {}
         cells = []
+        pgc_dict = None
         for p in vts.get("pgcs", []):
             if p.get("pgc") == pgc_no:
                 cells = p.get("cells") or []
+                pgc_dict = p
                 break
-        if cells:
-            t["duration_seconds_int_cell_sum"] = sum(
-                int(c.get("duration_seconds", 0) or 0) for c in cells
-            )
-        else:
+        if not cells:
             t["duration_seconds_int_cell_sum"] = int(
                 t.get("duration_seconds", 0) or 0)
+            t["num_chapters_post_trim"] = int(t.get("num_chapters", 0) or 0)
+            continue
+
+        # Run the trim deciders to get the kept cell range.
+        cells_meta = [_cell_to_meta(c) for c in cells]
+        _annot(cells_meta)
+        pgc_proxy = _PgcProxy(pgc_dict or {})
+        try:
+            trim = _ct.decide_trim(cells_meta, pgc_proxy)
+        except Exception:
+            trim = _ct.TrimDecision()
+        start_trim = trim.start_trim
+        end_trim = trim.end_trim
+        n = len(cells)
+        kept = cells[start_trim:n - end_trim] if (start_trim or end_trim) else cells
+        if not kept:
+            kept = cells
+
+        # MakeMKV-equivalent duration = sum of int(cell.duration) over
+        # the post-trim kept range.
+        t["duration_seconds_int_cell_sum"] = sum(
+            int(c.get("duration_seconds", 0) or 0) for c in kept
+        )
+
+        # Post-trim chapter count: count PTTs whose program's first cell
+        # falls within the kept range. Uses the PGC's program_map (now
+        # exposed by inspector — entry N is the 1-based cell number
+        # where program N starts) for correct cell mapping on
+        # compilation-pattern PGCs (DRAGONAUT_P2 T31 is the canonical
+        # case: 44 programs distributed unevenly across 100 cells, where
+        # MakeMKV reports 7 chapters because only programs 38-44 start
+        # in the kept cell range 93-99).
+        vts_ttn = int(t.get("vts_ttn") or 0)
+        ptts = (vts.get("ptt_map", {}) or {}).get(vts_ttn, [])
+        program_map = (pgc_dict or {}).get("program_map", []) or []
+        if (start_trim or end_trim) and ptts and program_map:
+            kept_first_cell = start_trim + 1  # 1-based cell index
+            kept_last_cell = n - end_trim     # 1-based inclusive
+            kept_ptts = 0
+            for ptt in ptts:
+                if int(ptt.get("pgc", 0)) != pgc_no:
+                    continue
+                prog = int(ptt.get("program", 1))  # 1-based
+                if 1 <= prog <= len(program_map):
+                    prog_first_cell = program_map[prog - 1]
+                    if kept_first_cell <= prog_first_cell <= kept_last_cell:
+                        kept_ptts += 1
+            t["num_chapters_post_trim"] = kept_ptts or 1
+        else:
+            t["num_chapters_post_trim"] = int(t.get("num_chapters", 0) or 0)
 
     # ``analyze`` requires the inspector's title_sets to run the
     # FUN_007ec6f0 port (PTT/PGC walk + cellwalk gate). Without it,

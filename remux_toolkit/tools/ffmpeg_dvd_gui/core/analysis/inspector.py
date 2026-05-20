@@ -410,10 +410,29 @@ def _pgc_to_dict(pgc_idx: int, pgc, *, include_cells: bool) -> dict:
     active_audio = [i for i in range(8) if pgc.audio_control[i] & 0x8000]
     active_subp  = [i for i in range(32) if pgc.subp_control[i] & 0x80000000]
 
+    # program_map: PGC.program_map[N-1] = 1-based cell number where
+    # program N starts. Needed for the analyzer's post-trim chapter
+    # count on compilation-pattern PGCs (DRAGONAUT_P2 T31 is the
+    # corpus example — 44 programs unevenly distributed across 100
+    # cells, where MakeMKV's chapter count reflects how many programs'
+    # first cells fall in the kept post-trim cell range). Exposed
+    # as a list of 1-based cell-start indices, one per program.
+    program_map: list[int] = []
+    if pgc.program_map and int(pgc.nr_of_programs) > 0:
+        import ctypes as _ctypes
+        npg = int(pgc.nr_of_programs)
+        # program_map is uint8*; each byte is a 1-based cell number.
+        program_map_buf = _ctypes.cast(
+            pgc.program_map,
+            _ctypes.POINTER(_ctypes.c_uint8 * npg),
+        ).contents
+        program_map = [int(program_map_buf[i]) for i in range(npg)]
+
     out = {
         "pgc": pgc_idx,
         "num_programs": int(pgc.nr_of_programs),
         "num_cells": int(pgc.nr_of_cells),
+        "program_map": program_map,
         "duration_seconds": round(pgc.playback_time.total_seconds, 3),
         "duration_seconds_cell_sum": round(cell_sum_s, 3),
         "frame_rate": round(pgc.playback_time.frame_rate, 3),

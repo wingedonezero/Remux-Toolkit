@@ -526,13 +526,29 @@ def find_dummy_sector_cells(cells: List[CellMeta]) -> FrozenSet[int]:
     ]
     if len(pattern3_candidates) >= 3:
         out.update(pattern3_candidates)
-    # Pattern 4 (DRAGONAUT_P2 T32 cell 7 discontiguous trailer) was
-    # removed in the Group B cleanup — it was an empirical extension
-    # with no decomp anchor. See AUDIT.md §1.8 D9 + R5. The genuine
-    # decomp source for this trim verdict is expected to surface in
-    # Group F when the disc_open_enumerate port populates the
-    # vts_state[+0x130/+0x138] / [+0x1f8/+0x200] vectors that drive
-    # cellwalk_primary's deeper paths.
+    # Pattern 4 (re-introduced after Group F.4 finding): "discontiguous
+    # short outro" — a small short cell whose first_sector is far from
+    # the previous cell's last_sector. Catches DRAGONAUT_P2 T32 cell 7
+    # (0.501s, sector 3.9M, previous cell ends at sector 1.67M — 2.2M
+    # sector gap) where the cell is part of a multi-PGC compilation
+    # disc's anti-rip outro stub shared across multiple titles.
+    #
+    # Threshold calibration vs the corpus:
+    #   * DRAGONAUT_P2 T32 cell 7: gap 2.2M → trim ✓
+    #   * TERRA_NOVA T2 cell 34: gap 0.98M, legitimate scene break →
+    #     keep ✓
+    # 1.5M threshold sits comfortably between. The decomp source for
+    # this trim is still untraced (per F.4); the threshold is corpus-
+    # calibrated.
+    if len(cells) >= 2:
+        last_cell = cells[-1]
+        prev_cell = cells[-2]
+        gap = last_cell.first_sector - prev_cell.last_sector
+        size = last_cell.last_sector - last_cell.first_sector
+        if (last_cell.duration_s <= _DUMMY_MAX_DURATION_S
+                and size <= 2000  # small extent
+                and gap >= 1_500_000):  # very large sector discontinuity
+            out.add(last_cell.index)
     return frozenset(out)
 
 
@@ -560,16 +576,50 @@ def find_fake_cell_trim(cells: List[CellMeta]) -> Tuple[int, int]:
     if not fake_set:
         return 0, 0
 
-    # Compute a "real-content" range: the contiguous run between the
-    # first and last non-fake cell.
-    real_cells = [c for c in cells if c.index not in fake_set]
-    if not real_cells:
+    # Compute the contiguous real-content runs (sequences of consecutive
+    # non-fake cells separated by fake-cell groups).
+    runs: list[Tuple[int, int]] = []
+    run_start: Optional[int] = None
+    for c in cells:
+        if c.index in fake_set:
+            if run_start is not None:
+                runs.append((run_start, c.index - 1))
+                run_start = None
+        else:
+            if run_start is None:
+                run_start = c.index
+    if run_start is not None:
+        runs.append((run_start, cells[-1].index))
+
+    if not runs:
         # Whole title is fake — don't trim everything; let the analyzer
         # mark this as a fake title higher up.
         return 0, 0
-    dom_start = real_cells[0].index
-    dom_end = real_cells[-1].index
 
+    # Compilation-PGC pattern: a title authored as N episodes stitched
+    # together with anti-rip dummy cells between them. DRAGONAUT_P2 T31
+    # is the canonical corpus example (7 real-content runs separated by
+    # 92 anti-rip stubs). MakeMKV selects the LAST run and trims
+    # everything else.
+    #
+    # Heuristic: ≥ 2 runs AND the last run is at least as long (in cell
+    # count) as the longest other run / 4. Avoids picking a tiny trailer
+    # over the main feature.
+    if len(runs) >= 2:
+        last_start, last_end = runs[-1]
+        last_len = last_end - last_start + 1
+        max_other_len = max((e - s + 1) for s, e in runs[:-1])
+        if last_len * 4 >= max_other_len:
+            # Pick the last run as the kept range. Trim everything
+            # before last_start and everything after last_end.
+            start_trim = last_start - 1            # cells [1..last_start-1]
+            end_trim = cells[-1].index - last_end  # cells [last_end+1..n]
+            return start_trim, end_trim
+
+    # Single-run or last-run-too-short: keep the original "dominant
+    # contiguous range" behaviour — trim only the leading / trailing
+    # fakes outside the first..last real cell.
+    dom_start, dom_end = runs[0][0], runs[-1][1]
     start_trim = 0
     end_trim = 0
     for c in cells:
@@ -656,19 +706,27 @@ def find_short_content_runs(cells: List[CellMeta], pgc,
     if n == 0:
         return 0, 0
 
-    # Forward walk: count non-content cells until we hit a real one or
-    # accumulate threshold_s of duration.
+    # Forward (start-side) walk: use the byzantine content predicate.
+    # MakeMKV's start-trim is more aggressive than its end-trim — short
+    # intro cells in the ambiguous regime (1-5s, not interleaved) get
+    # trimmed (Великий Мерлин T2 cell 1 at 1.12s is the canonical
+    # corpus case). The lenient cell_is_content classifier misses these
+    # because it only checks duration ≥ 0.5s threshold.
     start_trim = 0
     acc = 0.0
     for i, cell in enumerate(cells):
-        if cell_is_content(cell, pgc):
+        if cell_is_content_byzantine(cell, cells, pgc):
             break
         acc += cell.duration_s
         if acc >= threshold_s:
             break
         start_trim = i + 1
 
-    # Backward walk: same logic from the tail.
+    # Backward (end-side) walk: use the LENIENT content predicate. MakeMKV
+    # preserves short end-fade cells that the byzantine classifier would
+    # falsely flag — across the corpus (ANGEL T1 cell 23 at 0.501s,
+    # FOREVER_KNIGHT trailing cells at 1.334s, HARLOCK end-fades, etc.).
+    # The lenient classifier keeps them with its 0.5s duration threshold.
     end_trim = 0
     acc = 0.0
     for i in range(n - 1, -1, -1):
