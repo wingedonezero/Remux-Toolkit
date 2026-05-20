@@ -80,6 +80,17 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True,
             num_titles = int(tt_srpt.nr_of_srpts)
             vmg_last_sector = int(vmgi.vmg_last_sector)
 
+            # MSG:3004 — "Number of titlesets in VMG is invalid" (decomp
+            # FUN_007d98d0 line 1050). MakeMKV gates on
+            # ``vmg_nr_of_title_sets > 99``; the DVD-Video spec caps
+            # title sets at 99 so this catches structurally-broken
+            # discs. The decomp aborts disc open on this trigger; our
+            # port emits the warning + keeps walking so partial
+            # inspection still completes.
+            if num_vts > 99:
+                mkv_msg_log.emit(3004, num_vts,
+                                 num_title_sets=num_vts, source=path)
+
             vmg_info = {
                 "identifier": bytes(vmgi.vmg_identifier).decode("latin-1", errors="replace").strip("\x00 "),
                 "specification_version": int(vmgi.specification_version),
@@ -103,6 +114,28 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True,
                 }
                 for i in range(num_titles)
             ]
+
+            # MSG:3005 — "Titleset N for title M is invalid" (decomp
+            # FUN_007d98d0 line 580). Fires per-title when the title's
+            # title_set_nr references a VTS that doesn't exist:
+            #
+            #   * title_set_nr >= 100 (decomp byte-range gate
+            #     ``(byte)(bVar12 + 0x9c) < 0x9d`` — wraps into the
+            #     invalid range for any value >= 100), OR
+            #   * title_set_nr > num_title_sets (references past the
+            #     end of the declared VTS list).
+            #
+            # The decomp also gates on FUN_007e8c00(param_1) == 0
+            # ("VTS doesn't exist") — same condition expressed via
+            # our per-VTS open loop; if title_set_nr is in valid range
+            # but the VTS open failed, that's caught by the
+            # MSG:3008 / VTS error path further down (not this MSG).
+            for t in raw_titles:
+                ts_nr = int(t["vts"])
+                if ts_nr >= 100 or ts_nr > num_vts:
+                    mkv_msg_log.emit(3005, ts_nr,
+                                     title=t["title"], vts=ts_nr,
+                                     num_title_sets=num_vts)
 
             # Build a vts_no → declared_title_set_sector map from
             # tt_srpt for the MSG:3008 check below. Every title that
