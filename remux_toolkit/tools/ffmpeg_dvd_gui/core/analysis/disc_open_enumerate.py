@@ -98,6 +98,36 @@ class DiscState:
     # failure case from disc_open_enumerate's open loop.
     vts_failed: Dict[int, bool] = field(default_factory=dict)
 
+    # ---- F.2: UDF mount + region + CSS init state --------------------------
+
+    # ``True`` iff a libdvdread handle was successfully obtained for the
+    # disc (either passed in via ``dvd_handle`` or opened by F.2). Mirrors
+    # the success of decomp line 269's ``(**(code **)*param_2)(param_2,0)``
+    # call. ``False`` means the rest of the state is the empty default.
+    disc_opened: bool = False
+
+    # Output of ``ifo_validate.detect_css`` — ``{"scrambled": bool|None,
+    # "detected_by": "libdvdcss"|"unavailable"}``. The decomp's CSS init
+    # at decomp lines 184-200 is handled inside libdvdread/libdvdcss for
+    # us; this surface is diagnostic only (matches inspector report's
+    # ``css`` field).
+    css_state: Optional[Dict[str, Any]] = None
+
+    # VMG IFO ``vmg_category`` field (uint32). The DVD-Video spec packs
+    # the region-restrictions byte into bits 16-23 (set bit = region
+    # blocked). Exposed raw for diagnostics; we don't enforce a region
+    # gate (libdvdread internally surfaces read failures for blocked
+    # discs).
+    vmg_category: int = 0
+
+    # Volume identifier from ``DVDUDFVolumeInfo`` / ISO fallback. Empty
+    # string when the open failed.
+    volume_id: str = ""
+
+    # Disc-id MD5 (hex string) from ``DVDDiscID`` — 16 IFO bytes hashed.
+    # Empty when unavailable.
+    disc_id_md5: str = ""
+
     # ---- Convenience accessors ---------------------------------------------
 
     def vts_claim_list_nonempty(self, vts_no: int) -> bool:
@@ -113,6 +143,15 @@ class DiscState:
         title-state ``+0xd8 = 1`` placeholder for ``vts_no``.
         """
         return bool(self.vts_failed.get(vts_no))
+
+    @property
+    def region_restrictions(self) -> int:
+        """The 8-bit region-restrictions mask extracted from
+        ``vmg_category`` per DVD-Video spec (bits 16-23). A set bit at
+        position N means region (N+1) is BLOCKED. ``0`` ⇒ all-regions
+        playable.
+        """
+        return (self.vmg_category >> 16) & 0xFF
 
 
 # A shared empty-state singleton. Use this when no disc state is available
@@ -134,36 +173,76 @@ def disc_open_enumerate(
     """Port of ``FUN_007d98d0`` — UDF mount, VMG read, per-VTS IFO walk,
     state-vector population.
 
-    **F.1 status:** stub. Returns an empty ``DiscState`` whose presence
-    in the analyzer wiring is observationally indistinguishable from the
-    pre-F.1 hardcoded defaults.
+    **F.2 status:** populates UDF / region / CSS state. F.3-F.5 will
+    add per-VTS IFO walk + state-vector populators.
 
-    F.2-F.5 progressively fill in:
+    Resolution priority for state population:
 
-      * F.2 — verify UDF mount + region + CSS init (most already done by
-        ``libdvdread.open_disc`` / ``ifo_validate.detect_css``; this slice
-        will route the results into ``DiscState``).
-      * F.3 — per-VTS IFO load loop mirroring decomp lines 1442-1597.
-      * F.4 — disc-skip-list populator (``+0x130 / +0x138``).
-      * F.5 — title-claim-list populator (``+0x1f8 / +0x200``) +
-        ``title_state[+0xd8]`` binsearch wire-up.
+      1. ``report`` (inspector dict) is the cheapest source — IFO parse
+         already happened. F.2 reads ``report['css']``, ``report['vmg']``,
+         ``report['volume_id']``, ``report['disc_id_md5']``.
+      2. ``dvd_path`` triggers a fresh open via
+         ``libdvdread.open_disc`` + a single VMG IFO read for the
+         category byte. Used when callers (e.g. unit tests) bypass the
+         inspector.
+      3. Neither → empty state (matches pre-Group-F behaviour exactly).
+
+    The ``dvd_handle`` kwarg is accepted but not consumed in F.2; F.3+
+    will use it to avoid double-open during the per-VTS IFO walk.
 
     Args:
         dvd_path: filesystem path to the disc, ISO, or VIDEO_TS folder.
-            Optional — F.1 stub ignores it.
         dvd_handle: optional pre-opened libdvdread ``DVDReader *``.
             ``analyzer.analyze`` opens one for the phantom-scan loop;
-            passing it through avoids a double-open.
-        report: optional inspector report dict. Once F.3 lands, the
-            populator will reuse the inspector's parsed VMG / title_sets
-            data instead of re-walking the IFO files.
+            F.3+ will reuse it for the per-VTS walk.
+        report: optional inspector report dict. When supplied, F.2 reads
+            CSS / VMG / volume info from it instead of re-walking the
+            IFOs.
 
     Returns:
-        A populated ``DiscState``. F.1 returns ``EMPTY_STATE`` (an empty
-        instance, not the module singleton — callers may mutate freely).
+        A ``DiscState`` populated as far as the current F-slice allows.
+        Empty state when no source is available.
     """
-    _ = (dvd_path, dvd_handle, report)  # consumed by F.2-F.5
-    return DiscState()
+    state = DiscState()
+
+    # ---- Source 1: inspector report (the cheapest path) --------------------
+    if report:
+        state.disc_opened = True
+        css = report.get("css")
+        if isinstance(css, dict):
+            state.css_state = css
+        vmg = report.get("vmg") or {}
+        state.vmg_category = int(vmg.get("vmg_category") or 0)
+        state.volume_id = str(report.get("volume_id") or "")
+        state.disc_id_md5 = str(report.get("disc_id_md5") or "")
+        return state
+
+    # ---- Source 2: fresh libdvdread open ----------------------------------
+    if dvd_path:
+        from ...bindings import libdvdread as _dr
+        from . import ifo_validate as _ifov
+        try:
+            state.css_state = _ifov.detect_css(dvd_path)
+            with _dr.open_disc(dvd_path) as dvd:
+                state.disc_opened = True
+                vol_id, _vol_set = _dr.get_volume_info(dvd)
+                state.volume_id = vol_id
+                state.disc_id_md5 = _dr.get_disc_id(dvd)
+                try:
+                    with _dr.open_ifo(dvd, 0) as vmg:
+                        state.vmg_category = int(
+                            vmg.contents.vmgi_mat.contents.vmg_category)
+                except _dr.DvdReadError:
+                    # VMG IFO unreadable — leave vmg_category at 0.
+                    pass
+        except (_dr.DvdReadError, OSError):
+            # Disc open failed entirely; leave defaults.
+            state.disc_opened = False
+        return state
+
+    # ---- Source 3: nothing to read; return empty defaults ------------------
+    _ = dvd_handle  # consumed by F.3+
+    return state
 
 
 __all__ = [
