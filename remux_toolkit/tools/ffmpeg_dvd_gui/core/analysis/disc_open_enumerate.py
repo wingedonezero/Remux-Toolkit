@@ -1,38 +1,43 @@
 """
-disc_open_enumerate — port of MakeMKV's ``FUN_007d98d0`` (28,812 B).
+disc_open_enumerate — scaffold for MakeMKV's ``FUN_007d98d0`` (28,812 B).
 
-The 28-KB top-level DVD-open orchestrator that runs UDF mount + VMG/per-VTS
-IFO loading + state-vector population + post-walk dedup. Emits MSG:3004,
-3005, 3006, 3008, 3027, 4041 from its inner loops.
+The 28-KB top-level DVD-open orchestrator that runs UDF mount + VMG /
+per-VTS IFO loading + post-walk dedup. Emits MSG:3004, 3005, 3006, 3008,
+3027, 4041 from its inner loops.
 
-This module is the Group F port (AUDIT.md §4). It exists to populate the
-two ``param_1`` state vectors that cellwalk_primary's IF/ELSE split and
-title_init_validator's ``+0xd8`` binsearch consult:
+Group F was originally specified to populate two state vectors at
+``param_1[+0x130/+0x138]`` (disc-skip-list) and ``[+0x1f8/+0x200]``
+(per-VTS title-claim list) that cellwalk_primary's IF/ELSE split and
+title_init_validator's ``+0xd8`` binsearch consult.
 
-  - ``+0x130 / +0x138`` — disc-level skip-list (vector start/end pair).
-    Cellwalk_primary's iVar30 selection consults this; non-empty disables
-    the iVar29 = 2 fallback in the IF branch.
+**Group F finding (F.4 mid-session correction):** the two state vectors
+are *never written* anywhere in disc_open_enumerate's depth-6 call tree
+(234 functions audited, including dev-key-gated paths). Both callers of
+disc_open_enumerate (FUN_007d9370 / FUN_007e34f0) ``malloc(0x218)`` and
+explicitly zero-init the vectors; nothing else touches them. The 14
+consumer reads in vts_title_scan + cellwalk_primary all evaluate
+``(start == end) == True`` in the public binary.
 
-  - ``+0x1f8 / +0x200`` — per-VTS title-claim list (vector start/end
-    pair). title_init_validator binsearches this to write
-    ``*(title_state + 0xd8)``; the resulting flag drives cellwalk_primary
-    and structural_validator's deferred sub-codes 0x473a5c8c +
-    0x4cb427d9.
+Consequence: cellwalk_primary's ``disc_skip_list_nonempty`` and
+``vts_state_skip_list_nonempty`` parameters are *provably* False in the
+public binary. The hardcoded ``enter_if_branch = True`` is correct, not
+an approximation. Reproduce the finding via
+``research/validate_disc_state_writers.py``.
 
-This is the F.1 scaffold: ``DiscState`` is the data contract, and
-``disc_open_enumerate()`` returns an empty state. F.2–F.5 fill in:
+This module still exists because:
 
-  - F.2 — UDF mount + region check + CSS init verification.
-  - F.3 — per-VTS IFO load loop (decomp lines 1442–1597).
-  - F.4 — disc-skip-list populator (``+0x130 / +0x138``).
-  - F.5 — title-claim-list populator (``+0x1f8 / +0x200``) +
-    title_init_validator binsearch wire-up writing
-    ``title_state[+0xd8]``.
+  * The F.1-F.3 scaffold (DiscState + UDF/region/CSS state + per-VTS IFO
+    load metadata) is useful as a typed handle for analyzer wiring, and
+    F.5+ will hang the cellwalk depth-4/5 helper port off the same
+    surface.
+  * The disc_state surface is forward-compatible with dev-build use of
+    the binary (which might populate the skip-list).
+  * Future MSG:3004/3005 emit work (F.8) needs a place to hang.
 
-Behaviour with the empty state matches the pre-F.1 hardcoded defaults
-(``disc_skip_list_nonempty=False`` + ``vts_state_skip_list_nonempty=False``
-in cellwalk_primary), so wiring F.1 introduces no observable cross-val
-delta.
+DiscState's ``disc_skip_list_nonempty`` and ``vts_claim_lists`` fields
+stay as part of the public surface (they're observable through
+``cellwalk_primary``); their default-empty state is the only state the
+public binary ever produces.
 """
 from __future__ import annotations
 
@@ -63,26 +68,32 @@ class DiscState:
     # ``param_1[+0x130 / +0x138]`` — disc-level skip-list vector pair
     # (start_ptr / end_ptr). Equality ⇒ vector is empty.
     #
+    # **Always False in the public binary** — Group F's
+    # ``validate_disc_state_writers.py`` confirms zero writers exist
+    # anywhere in disc_open_enumerate's depth-6 call tree (234
+    # functions, including dev-key-gated paths). Kept on DiscState for
+    # surface symmetry with the decomp + future dev-build compatibility.
+    #
     # Read by vts_title_scan @ decomp line 4181 and cellwalk_primary @
-    # decomp lines 5306, 5320, 5363, 6615. Cellwalk's IF branch sets
-    # ``iVar30 = 2`` when this vector is empty, otherwise picks
-    # ``iVar30 = iVar29 = (claim_list_empty) + 1``.
+    # decomp lines 5306, 5320, 5363, 6615. All 14 read sites evaluate
+    # ``(start == end) == True``.
     disc_skip_list_nonempty: bool = False
 
     # ``param_1[+0x1f8 / +0x200]`` — per-VTS title-claim list vector
-    # pair. Holds per-VTS title-claim records that title_init_validator
-    # binsearches to write ``*(title_state + 0xd8)``.
+    # pair. Same Group F finding: no public-binary writers, stays empty
+    # forever.
     #
     # Read by vts_title_scan @ decomp lines 4010-4011, 4149-4150 and
     # title_init_validator (FUN_007ed1f0 — port at
-    # ``title_pre_filter.validate_title_init``, currently missing the
-    # binsearch — see AUDIT.md U4/U5).
+    # ``title_pre_filter.validate_title_init``). In the public binary
+    # the title_init_validator binsearch loop (init_validator.md
+    # lines 200-240) is gated on ``0 < (end - start)``; with the vector
+    # empty, the loop is skipped and the binsearch always writes
+    # ``title_state[+0xd8] = 0``. Our Python port skipping that write
+    # entirely is equivalent.
     #
-    # Keyed by 1-based VTS number; missing key OR empty list means the
-    # claim list is empty for that VTS (cellwalk's iVar29 = 2).
-    #
-    # Element shape will be defined when F.5 ports the populator. For
-    # F.1 the dict stays empty.
+    # Kept on DiscState for surface symmetry. Element shape is opaque;
+    # populating would only matter in a dev-build context.
     vts_claim_lists: Dict[int, List[Any]] = field(default_factory=dict)
 
     # ``title_state[+0xd8]`` written = 1 by disc_open_enumerate's
@@ -183,7 +194,7 @@ EMPTY_STATE = DiscState()
 
 
 # ---------------------------------------------------------------------------
-# Port entry point (F.1 stub — F.2-F.5 fill in the body)
+# Port entry point
 # ---------------------------------------------------------------------------
 
 def disc_open_enumerate(
@@ -193,33 +204,36 @@ def disc_open_enumerate(
     report: Optional[dict] = None,
 ) -> DiscState:
     """Port of ``FUN_007d98d0`` — UDF mount, VMG read, per-VTS IFO walk,
-    state-vector population.
+    disc-state surfacing.
 
-    **F.2 status:** populates UDF / region / CSS state. F.3-F.5 will
-    add per-VTS IFO walk + state-vector populators.
+    **Current scope:** populates UDF / region / CSS state + per-VTS IFO
+    load metadata from the inspector report. The two state-vector
+    populators originally specified for Group F (``+0x130/+0x138`` and
+    ``+0x1f8/+0x200``) turned out to be never-executed code in the
+    public binary — see module docstring for the analysis.
 
     Resolution priority for state population:
 
       1. ``report`` (inspector dict) is the cheapest source — IFO parse
-         already happened. F.2 reads ``report['css']``, ``report['vmg']``,
-         ``report['volume_id']``, ``report['disc_id_md5']``.
+         already happened.
       2. ``dvd_path`` triggers a fresh open via
          ``libdvdread.open_disc`` + a single VMG IFO read for the
          category byte. Used when callers (e.g. unit tests) bypass the
          inspector.
-      3. Neither → empty state (matches pre-Group-F behaviour exactly).
+      3. Neither → empty state (matches pre-F.1 behaviour exactly).
 
-    The ``dvd_handle`` kwarg is accepted but not consumed in F.2; F.3+
-    will use it to avoid double-open during the per-VTS IFO walk.
+    The ``dvd_handle`` kwarg is accepted for future expansion (e.g. a
+    per-VTS IFO walk that wants to avoid double-open) but currently
+    unused.
 
     Args:
         dvd_path: filesystem path to the disc, ISO, or VIDEO_TS folder.
         dvd_handle: optional pre-opened libdvdread ``DVDReader *``.
             ``analyzer.analyze`` opens one for the phantom-scan loop;
-            F.3+ will reuse it for the per-VTS walk.
-        report: optional inspector report dict. When supplied, F.2 reads
-            CSS / VMG / volume info from it instead of re-walking the
-            IFOs.
+            reserved for future per-VTS walks.
+        report: optional inspector report dict. When supplied, reads
+            CSS / VMG / volume / per-VTS info from it instead of
+            re-walking the IFOs.
 
     Returns:
         A ``DiscState`` populated as far as the current F-slice allows.
