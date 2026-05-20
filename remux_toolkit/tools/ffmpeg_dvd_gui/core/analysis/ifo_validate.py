@@ -390,6 +390,26 @@ def inspect_ifo_source(dvd, title: int, *, is_vmg: bool) -> IfoReport:
     _check_ifo_self_declared_size(dvd, title, is_vmg=is_vmg,
                                   probe=probe, issues=issues)
 
+    # Emit MakeMKV-equivalent MSG codes for the issues we detected.
+    # MSG:3002 = "Calculated %s offset for VTS #%d does not match one
+    #             in IFO header" — fires for bup_offset_mismatch AND
+    #             content-diverged issues (MakeMKV uses 3002 for any
+    #             main-vs-BUP discrepancy, whether by size/offset or
+    #             by content).
+    # MSG:3003 = "Using BUP for VTS X" — when main is missing.
+    # MSG:3042 = "IFO/BUP repair: %s — needs VOB scan" — only when
+    #             main IFO is corrupt and we'd fall back via VOB scan
+    #             (NOT for normal IFO/BUP content differences).
+    from . import mkv_msg_log
+    for issue in issues:
+        if issue.category in ("bup_offset_mismatch", "diverged"):
+            mkv_msg_log.emit(3002, "BUP", title,
+                              vts=title, severity=issue.severity,
+                              reason=issue.message)
+        elif issue.category == "missing_main" and probe.bup_present:
+            mkv_msg_log.emit(3003, title,
+                              vts=title, reason=issue.message)
+
     try:
         with dr.open_ifo(dvd, title) as ifo:
             issues.extend(validate_ifo_handle(ifo, is_vmg=is_vmg))
