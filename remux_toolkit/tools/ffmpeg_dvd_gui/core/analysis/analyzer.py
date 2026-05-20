@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional
 
+from . import disc_open_enumerate as _doe
 from . import title_pre_filter as _pf
 
 
@@ -67,7 +68,11 @@ def _classify_secondary(title: dict) -> str:
     return "feature"
 
 
-def _evaluate_title_for_analyzer(title: dict, vts: dict) -> _pf.EvaluatorResult:
+def _evaluate_title_for_analyzer(
+    title: dict,
+    vts: dict,
+    disc_state: Optional[_doe.DiscState] = None,
+) -> _pf.EvaluatorResult:
     """Run title_pre_filter.evaluate_title with cellwalk-equivalent
     inputs derived from the inspector dict.
 
@@ -113,6 +118,7 @@ def _evaluate_title_for_analyzer(title: dict, vts: dict) -> _pf.EvaluatorResult:
         title, vts,
         cells_after_trim=cells_after_trim,
         actual_duration_after_trim_s=float(actual or 0.0),
+        disc_state=disc_state,
     )
     _trace_log.debug(
         "title=%d vts=%s pgc=%s %s",
@@ -521,6 +527,17 @@ def analyze(report: dict, *, dvd_path: Optional[str] = None) -> dict:
         except Exception:
             dvd_handle = None
 
+    # Group F (F.1): build the disc-enumeration state once per
+    # analyze() call. Threaded into title_pre_filter / cellwalk_primary
+    # so the IF/ELSE split + iVar30 selection can become data-driven.
+    # F.1 returns an empty DiscState (matches pre-Group-F defaults);
+    # F.2-F.5 progressively fill in the state vectors.
+    disc_state = _doe.disc_open_enumerate(
+        resolved_path or None,
+        dvd_handle=dvd_handle,
+        report=report,
+    )
+
     try:
         # First pass: run the FUN_007ec6f0 port for each title. MSG:3009/
         # 3010/3011/3012/3015/3016/3025/3026/3028/3040/3041 are emitted
@@ -528,7 +545,7 @@ def analyze(report: dict, *, dvd_path: Optional[str] = None) -> dict:
         # gate fires; we record the verdict + the GUI classification.
         for t in raw_titles:
             vts = vts_by_no.get(t.get("vts"), {}) or {}
-            verdict = _evaluate_title_for_analyzer(t, vts)
+            verdict = _evaluate_title_for_analyzer(t, vts, disc_state=disc_state)
             t["evaluator_verdict"] = verdict.classification
             t["evaluator_msg_code"] = verdict.msg_code
             t["evaluator_reason"] = verdict.reason

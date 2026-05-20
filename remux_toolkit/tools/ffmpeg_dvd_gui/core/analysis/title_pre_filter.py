@@ -47,6 +47,7 @@ from . import mkv_msg_log
 from . import cell_trim
 from . import cell_validator
 from . import cellwalk_primary as _cwp
+from . import disc_open_enumerate as _doe
 
 
 _log = logging.getLogger("remux_toolkit.title_pre_filter")
@@ -571,7 +572,8 @@ class _DictPgcProxy:
 def evaluate_title(title: dict, vts: dict, *,
                    cells_after_trim: Optional[int] = None,
                    actual_duration_after_trim_s: Optional[float] = None,
-                   has_active_audio: Optional[bool] = None) -> EvaluatorResult:
+                   has_active_audio: Optional[bool] = None,
+                   disc_state: Optional[_doe.DiscState] = None) -> EvaluatorResult:
     """Port of FUN_007ec6f0 ("title_evaluator", 2802 B).
 
     Drives the MSG:3015/3016/3025/3026/3028 emission for a title.
@@ -615,6 +617,11 @@ def evaluate_title(title: dict, vts: dict, *,
         has_active_audio: if None, derived from
             ``len(title['audio_streams']) > 0`` falling back to
             ``len(vts['audio_streams']) > 0``.
+        disc_state: optional ``DiscState`` from
+            ``disc_open_enumerate.disc_open_enumerate``. Feeds
+            cellwalk_primary's ``disc_skip_list_nonempty`` and
+            ``vts_state_skip_list_nonempty`` kwargs. When ``None``, both
+            default to ``False`` — matching the pre-Group-F behaviour.
     """
     title_no = int(title.get("title") or 0)
     vts_no = int(title.get("vts") or 0)
@@ -738,11 +745,16 @@ def evaluate_title(title: dict, vts: dict, *,
         pgc_proxy = _DictPgcProxy(pgc_dict)
         vts_pgcs_count = len(vts.get("pgcs") or [])
         vts_audio_count = len(vts.get("audio_streams") or [])
+        # Group F: thread disc-level state from disc_open_enumerate
+        # into cellwalk's IF/ELSE split. With an empty DiscState (F.1
+        # default) the kwargs evaluate to False — same observable as
+        # the pre-Group-F hardcoded edge.
+        ds = disc_state or _doe.EMPTY_STATE
         cw = _cwp.cellwalk_primary(
             cells_meta, pgc_proxy,
             title_id=title_no, vts_no=vts_no, pgc_no=pgcn,
-            disc_skip_list_nonempty=False,
-            vts_state_skip_list_nonempty=False,
+            disc_skip_list_nonempty=ds.disc_skip_list_nonempty,
+            vts_state_skip_list_nonempty=ds.vts_claim_list_nonempty(vts_no),
             vts_has_audio=(vts_audio_count > 0),
             vts_pgc_count=vts_pgcs_count,
         )
