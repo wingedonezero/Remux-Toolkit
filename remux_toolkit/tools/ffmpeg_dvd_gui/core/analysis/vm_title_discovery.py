@@ -1,5 +1,6 @@
 """
-VM-driven title discovery — port of MakeMKV's FUN_007ff000.
+VM-driven title discovery — Group E partial port of MakeMKV's
+FUN_007fdc50 chain (see research/AUDIT.md §1.4).
 
 MakeMKV silently drops titles whose **DVD-VM pre-commands jump away before
 the title's cells ever play**. A title where ``LinkPGCN`` / ``CallSS_VMGM_PGC``
@@ -7,6 +8,12 @@ fires in the pre-command sequence — and the called PGC never returns control
 to the original title — is an authoring stub, not a real title. This module
 replicates that filter using a pure-Python port of libdvdnav's DVD VM
 (see :mod:`dvd_vm`).
+
+Group E status: the PCI button-graph walker (FUN_00800aa0 + FUN_00800cc0
++ FUN_007fdc10, ~720 B) is ported here as ``button_graph_closure`` and
+``button_graph_walk``. The full FUN_007fdc50 forward-walk + FUN_007ff000
+VM-step engine (~10 KB combined, tightly coupled with disc_open_enumerate
+state) is deferred to a follow-up that lands alongside Group F.
 
 ## Algorithm
 
@@ -33,6 +40,7 @@ suppresses MSG:3026 for them.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -396,19 +404,344 @@ def _walk_global_nav_graph(reader,
     return reached
 
 
+# ---------------------------------------------------------------------------
+# Port of FUN_007fdc10 — strict-weak ordering comparator over anchor keys
+# ---------------------------------------------------------------------------
+
+def _anchor_key_lt(a: tuple[int, int, int, int],
+                    b: tuple[int, int, int, int]) -> bool:
+    """Port of FUN_007fdc10 (36 B).
+
+    Strict-weak-less over an 8-byte anchor key encoded as the 4-tuple
+    ``(pgcn_or_lba: u32, ptt_or_cell: u16, mode: u8, cell_n_minus_1: u8)``.
+    Comparison order matches the decomp's lexicographic walk:
+    ``(mode, ptt_or_cell, pgcn_or_lba, cell_n_minus_1)`` — note that
+    the decomp's "byte+6" tuple member sorts first; that maps to our
+    ``mode`` (the third tuple field) per the anchor key layout in the
+    walker. See research/AUDIT.md §1.4 Group E + subagent decomp report.
+    """
+    if a[2] != b[2]:        # mode (byte at +6)
+        return a[2] < b[2]
+    if a[1] != b[1]:        # ptt_or_cell (short at +4)
+        return a[1] < b[1]
+    if a[0] != b[0]:        # pgcn_or_lba (uint at +0)
+        return a[0] < b[0]
+    return a[3] < b[3]      # cell_n_minus_1 (byte at +7)
+
+
+# ---------------------------------------------------------------------------
+# Port of FUN_00800cc0 — recursive button-graph transitive closure
+# ---------------------------------------------------------------------------
+
+#: Max valid button count in a PCI HLI table (per DVD-Video spec: 36).
+_MAX_BUTTONS = 36
+
+
+def button_graph_closure(button_links: dict[int, tuple[int, int, int, int]],
+                          start_button: int) -> set[int]:
+    """Port of FUN_00800cc0 (151 B).
+
+    Walks the HLI button neighbour graph and returns every button
+    reachable from ``start_button`` via up/down/left/right links.
+
+    Args:
+        button_links: Dict mapping 1-based button index → (up, down,
+            left, right) tuple of 1-based neighbour button indices.
+            Use ``bindings.libdvdnav.pci_button_links`` to populate.
+        start_button: 1-based button index to start walking from.
+
+    The decomp's recursion:
+
+        void closure(uint64_t *bitmap, btni_t *hli, byte cur_button):
+            while cur_button != 0:
+                if cur_button > 0x24 or cur_button > nbtn: return
+                bit = cur_button - 1
+                if (*bitmap >> bit) & 1: return     # visited
+                *bitmap |= 1 << bit
+                base = hli[bit].btni_t + 0x32
+                closure(bitmap, hli, base.up)
+                closure(bitmap, hli, base.down)
+                closure(bitmap, hli, base.left)
+                cur_button = base.right             # tail call
+
+    The Python port uses an explicit work-list to avoid hitting
+    Python's recursion limit on densely-connected button graphs.
+    """
+    if start_button < 1 or start_button > _MAX_BUTTONS:
+        return set()
+    visited: set[int] = set()
+    work: list[int] = [start_button]
+    while work:
+        cur = work.pop()
+        if cur < 1 or cur > _MAX_BUTTONS:
+            continue
+        if cur in visited:
+            continue
+        if cur not in button_links:
+            continue
+        visited.add(cur)
+        up, down, left, right = button_links[cur]
+        # Match the decomp's traversal order: up, down, left, then right
+        # tail-called (LIFO via append/pop reverses, but the visited set
+        # makes order semantically equivalent).
+        if up:
+            work.append(up)
+        if down:
+            work.append(down)
+        if left:
+            work.append(left)
+        if right:
+            work.append(right)
+    return visited
+
+
+# ---------------------------------------------------------------------------
+# Port of FUN_00800aa0 — per-PCI button-walker
+# ---------------------------------------------------------------------------
+
+def button_graph_walk(pci_addr: int) -> list[bytes]:
+    """Port of FUN_00800aa0 (531 B).
+
+    For one PCI's HLI button table, walk every button reachable from
+    the default selected button (forcedly-selected, or 1 if none), then
+    return the 8-byte VM commands embedded in each reachable button's
+    btni_t.cmd field. Caller can feed each command through
+    ``dvd_vm.vm_eval_cmds`` to discover its link target.
+
+    Args:
+        pci_addr: opaque pointer to a pci_t (from
+            ``bindings.libdvdnav.get_current_nav_pci``).
+
+    Returns:
+        List of 8-byte ``vm_cmd_t`` blobs, one per reachable button.
+        Empty if the PCI has no buttons.
+
+    The decomp's algorithm:
+
+        nbtn = HLI.btn_ns          # number of buttons
+        if nbtn == 0: return
+        default = HLI.fosl_btnn or 1, clamped to nbtn
+        reach = closure(start=default)
+        for btn in reverse(reach):
+            anchor = pack(cell metadata + btn)
+            if anchor not in dedup_set:
+                VM step to button btn (vt[0x28](dom, 5, btn))
+                if anchor STILL not in dedup_set:
+                    log; push anchor
+
+    Our port skips the dedup_set + VM-step coupling (those are
+    FUN_007fec70 + FUN_007fedf0, which need the full walker state).
+    Instead we return the button cmd bytes so callers can integrate
+    into their own reachability model.
+    """
+    from ...bindings import libdvdnav as ldn
+    import ctypes
+
+    if pci_addr == 0:
+        return []
+    nbtn = ldn.pci_button_count(pci_addr)
+    if nbtn == 0:
+        return []
+
+    # Default start button = forcedly-selected, or 1 if FOSL is 0 / out
+    # of range. The decomp clamps via "min(default, nbtn)".
+    default = ldn.pci_force_selected_button(pci_addr)
+    if default < 1 or default > nbtn:
+        default = 1
+
+    # Build the button-link dict by querying the binding for each
+    # button.
+    button_links: dict[int, tuple[int, int, int, int]] = {}
+    for i in range(1, nbtn + 1):
+        button_links[i] = ldn.pci_button_links(pci_addr, i)
+
+    reach = button_graph_closure(button_links, default)
+    if not reach:
+        return []
+
+    # Extract the 8-byte vm_cmd_t from each reachable button's btni_t.
+    # btni_t layout (18 bytes total): 4 bytes geometry, 4 bytes
+    # geometry, 4 bytes UDLR links, 8 bytes vm_cmd_t at offset 0x0a.
+    # The cmd is at PCI_BTNIT_OFFSET + (btn-1) * PCI_BTNI_SIZE + 10.
+    cmds: list[bytes] = []
+    for btn in sorted(reach):
+        cmd_offset = (
+            ldn.PCI_BTNIT_OFFSET
+            + (btn - 1) * ldn.PCI_BTNI_SIZE
+            + 10  # offset of vm_cmd_t within btni_t
+        )
+        cmd_bytes_ptr = ctypes.cast(
+            pci_addr + cmd_offset, ctypes.POINTER(ctypes.c_ubyte * 8)
+        )
+        cmd_bytes = bytes(cmd_bytes_ptr[0])
+        cmds.append(cmd_bytes)
+    return cmds
+
+
+# ---------------------------------------------------------------------------
+# Disc-wide button-graph reachability via libdvdnav playback
+# ---------------------------------------------------------------------------
+
+def _walk_button_graph(disc_path: str,
+                       ttsrpt_map: dict[int, tuple[int, int]],
+                       ) -> set[tuple[int, int]]:
+    """Drive a libdvdnav session through every menu and collect PCI
+    button commands. Return the set of (vts, pgcn) targets reachable
+    via any menu button on the disc.
+
+    This is the integration point for the FUN_00800aa0 / 00800cc0 port.
+    Unlike libdvdread (IFO-only), libdvdnav surfaces PCI button data
+    as it plays through NAV packets — we walk every menu PGC briefly
+    and extract its button command set.
+
+    Strategy:
+
+      1. Open the disc with libdvdnav.
+      2. For each top-level menu invocation
+         (DVD_MENU_Title / Root / Subpicture / Audio / Angle / Chapter),
+         step through up to ``_BUTTON_GRAPH_BLOCK_LIMIT`` blocks, collecting
+         every PCI we see.
+      3. For each PCI, call ``button_graph_walk`` to extract reachable
+         button commands.
+      4. Run each command through ``dvd_vm.vm_eval_cmds`` to determine
+         its link target. Add resolved (vts, pgcn) targets to ``reach``.
+
+    The walk is bounded — we stop at STILL_FRAME / WAIT / STOP events,
+    don't infinite-loop on menu graphs, and skip menus that fail to
+    open.
+    """
+    from ...bindings import libdvdnav as ldn
+
+    reach: set[tuple[int, int]] = set()
+    _BLOCK_LIMIT_PER_STAGE = 512
+    # DVD-Video menu IDs (libdvdnav's DVDMenuID_t).
+    _MENU_IDS = (
+        2,  # Title
+        3,  # Root
+        4,  # Subpicture
+        5,  # Audio
+        6,  # Angle
+        7,  # Part (Chapter)
+    )
+
+    def _drain_pcis(nav, block_limit: int) -> set[int]:
+        """Step through blocks, return the set of PCI pointers encountered.
+        Stops on STOP, exits early when no new PCI for 64 consecutive blocks."""
+        buf = (ctypes.c_uint8 * ldn.DVD_VIDEO_LB_LEN)()
+        pcis: set[int] = set()
+        idle_streak = 0
+        for _ in range(block_limit):
+            try:
+                evt, _length = ldn.get_next_block(nav, buf)
+            except Exception:
+                break
+            if evt == ldn.DVDNAV_STOP:
+                break
+            if evt == ldn.DVDNAV_STILL_FRAME:
+                try:
+                    ldn.still_skip(nav)
+                except Exception:
+                    break
+            elif evt == ldn.DVDNAV_WAIT:
+                try:
+                    ldn.wait_skip(nav)
+                except Exception:
+                    break
+            elif evt == ldn.DVDNAV_NAV_PACKET:
+                pci = ldn.get_current_nav_pci(nav)
+                if pci and pci not in pcis:
+                    pcis.add(pci)
+                    idle_streak = 0
+                else:
+                    idle_streak += 1
+            else:
+                idle_streak += 1
+            if idle_streak > 64:
+                break
+        return pcis
+
+    def _resolve_button_cmds(pcis: set[int],
+                             current_vts: int) -> None:
+        for pci in pcis:
+            for cmd in button_graph_walk(pci):
+                try:
+                    link, _regs = dvd_vm.vm_eval_cmds([cmd])
+                except Exception:
+                    continue
+                resolved = _resolve_link_target(
+                    link, current_vts=current_vts, ttsrpt_map=ttsrpt_map,
+                )
+                if resolved is not None:
+                    reach.add((resolved.vts, resolved.pgcn))
+
+    try:
+        with ldn.open_disc(disc_path) as nav:
+            # Stage 1: Drive First-Play (which auto-runs on open). This
+            # gets the VM into the FP_PGC → (typically) VMGM root menu.
+            fp_pcis = _drain_pcis(nav, _BLOCK_LIMIT_PER_STAGE)
+            _resolve_button_cmds(fp_pcis, current_vts=0)
+            # Stage 2: Visit each top-level menu via dvdnav_menu_call.
+            for menu in _MENU_IDS:
+                try:
+                    ok = ldn.menu_call(nav, menu)
+                except Exception:
+                    ok = False
+                if not ok:
+                    continue
+                menu_pcis = _drain_pcis(nav, _BLOCK_LIMIT_PER_STAGE)
+                _resolve_button_cmds(menu_pcis, current_vts=0)
+            # Stage 3: Visit each title's VTSM by walking into each VTS
+            # via title_play, then menu_call. This catches per-VTS menu
+            # buttons whose targets aren't reachable from the root.
+            try:
+                n_titles = ldn.get_number_of_titles(nav)
+            except Exception:
+                n_titles = 0
+            for tt in range(1, min(n_titles, 99) + 1):
+                try:
+                    if not ldn.title_play(nav, tt):
+                        continue
+                except Exception:
+                    continue
+                # Brief title play to land in VTS, then call VTSM root menu.
+                _drain_pcis(nav, 32)  # warmup
+                for menu in (3,):  # Root menu within current VTS
+                    try:
+                        ok = ldn.menu_call(nav, menu)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        continue
+                    vts_pcis = _drain_pcis(nav, _BLOCK_LIMIT_PER_STAGE)
+                    # Best-effort: assume current VTS from the title number.
+                    # ttsrpt_map maps tt → (vts, pgcn).
+                    current_vts = ttsrpt_map.get(tt, (0, 0))[0]
+                    _resolve_button_cmds(vts_pcis, current_vts=current_vts)
+    except Exception as e:
+        _log.debug("button-graph walk could not open %s: %s", disc_path, e)
+    return reach
+
+
 def discover_reachable_titles(disc_path: str | Path,
                               titles: list[tuple[int, int]],
                               *,
                               use_global_nav_graph: bool = False,
+                              use_button_graph: bool = False,
                               ) -> set[tuple[int, int]]:
     """Run VM-driven title discovery for every (vts, pgcn) in ``titles``.
 
     Args:
         disc_path: Path to disc (folder, ISO, or device).
         titles: List of (vts_no, pgcn) pairs derived from TT_SRPT.
-        use_global_nav_graph: If True (default), also union with the
-            global nav-graph closure — catches titles reachable via menu
-            commands even though their own pre-commands jump away.
+        use_global_nav_graph: also union with the global nav-graph closure
+            (catches titles reachable via menu commands even though their
+            own pre-commands jump away). Default False.
+        use_button_graph: also union with the PCI button-graph walk
+            (catches titles reachable via menu BUTTON commands rather
+            than menu PGC commands). Default False — requires opening a
+            libdvdnav session and playing through every menu PGC to
+            collect PCI button command sets. Port of FUN_00800aa0 +
+            FUN_00800cc0 (the missing D4 function per AUDIT.md §1.4).
 
     Returns:
         Set of (vts, pgcn) pairs that survive the VM-walk filter.
@@ -427,6 +760,16 @@ def discover_reachable_titles(disc_path: str | Path,
             for (vts, pgcn) in titles:
                 if (vts, pgcn) in global_reach:
                     reachable.add((vts, pgcn))
+    # Button-graph reachability requires its own dvdnav session
+    # (libdvdread alone doesn't expose PCIs without a play context).
+    if use_button_graph:
+        try:
+            button_reach = _walk_button_graph(str(disc_path), ttsrpt_map)
+            for (vts, pgcn) in titles:
+                if (vts, pgcn) in button_reach:
+                    reachable.add((vts, pgcn))
+        except Exception as e:
+            _log.warning("button-graph walk failed: %s", e)
     return reachable
 
 
