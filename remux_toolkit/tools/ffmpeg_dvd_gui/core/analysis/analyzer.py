@@ -576,9 +576,15 @@ def analyze(report: dict, *, dvd_path: Optional[str] = None) -> dict:
             survivor, basis = dup_map[t["title"]]
             t["duplicate_of"] = survivor
             t["duplicate_basis"] = basis
-            # MSG:3027 — title duplicate-of-another
-            mkv_msg_log.emit(3027, t.get("vts") or 0, survivor, t["title"],
-                             title=t["title"], duplicate_of=survivor)
+            # MSG:3027 — title duplicate-of-another. MakeMKV's format is
+            # "Title %3 in VTS %1 is equal to title %2 and was skipped"
+            # so render order is (duplicate_title, vts, survivor_title);
+            # the original implementation passed args in MakeMKV's
+            # positional order (vts, survivor, duplicate) which produced
+            # incorrect output text. Pass render order to match.
+            mkv_msg_log.emit(3027, t["title"], t.get("vts") or 0, survivor,
+                             title=t["title"], duplicate_of=survivor,
+                             vts=t.get("vts") or 0)
 
     # Compilation detection (only if cells present).
     comp_map = _find_compilations(raw_titles)

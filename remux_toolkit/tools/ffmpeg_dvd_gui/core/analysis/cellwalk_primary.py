@@ -435,34 +435,47 @@ def cellwalk_primary(
         result.trace = "structural-validator-failed"
         return result
 
-    # Step 2: the IF/ELSE split at decomp line 3870.
+    # Step 2: the IF/ELSE split at decomp lines 5305-5307 of full_decomp.md
+    # (cellwalk_primary @ 0x7f3eb0). The actual decomp condition is:
     #
-    #   if (param_1[0x1b] != 0           // init_validator set +0xd8
-    #       || disc_skip_list_non_empty
-    #       || FUN_007eb220(uVar22) == 0):  // structural_validator passed
-    #       enter IF branch — run trim deciders
+    #   if (param_1[0x1b] != 0                                  // (A)
+    #       || disc_state[+0x130] != disc_state[+0x138]          // (B)
+    #       || FUN_007eb220(uVar22) == 0):                       // (C)
+    #       enter IF branch — run trim deciders (iVar30 dispatch)
     #   else:
     #       enter ELSE branch — push every angle-block-validated cell
     #
-    # The IF branch is *provably* always taken in the public binary
-    # (Group F finding via ``research/validate_disc_state_writers.py``):
+    # In the public binary, after the F.4 no-writer finding:
     #
-    #   * param_1[0x1b] (byte at title_state +0xd8) is written by
-    #     title_init_validator's binsearch over vts_state[+0x1f8/+0x200].
-    #     When that vector is empty (always, per Group F), the binsearch
-    #     loop is skipped and the binsearch writes 0 to +0xd8.
-    #     So this byte is always 0 in the public binary.
+    #   (A) param_1[0x1b] is the byte at title_state +0xd8, written by
+    #       title_init_validator's binsearch over vts_state[+0x1f8/+0x200].
+    #       Vector is always empty → binsearch loop skipped → +0xd8 = 0.
+    #       So (A) is always False.
     #
-    #   * disc_skip_list_non_empty consults vts_state[+0x130/+0x138],
-    #     also always empty.
+    #   (B) disc_state[+0x130/+0x138] is the disc-skip-list vector. Also
+    #       always empty per F.4. So (B) is always False.
     #
-    #   * FUN_007eb220 (structural_validator) returning 0 means
-    #     "failed" — we handle that above by returning early.
+    #   (C) FUN_007eb220 (structural_validator) returns 0 when the cell
+    #       list FAILS a sub-code check. Returns non-zero (1) when it
+    #       PASSES all sub-codes. So (C) = "structural_validator failed".
     #
-    # So the IF/ELSE condition reduces to "structural_validator passed",
-    # which our explicit return path already gates on. The else branch
-    # (decomp lines 3958-4106) is dead code in the public binary.
-    enter_if_branch = True  # dead-code else branch — see comment above
+    # The IF/ELSE condition therefore reduces to:
+    #   enter_if_branch ⇔ structural_validator failed (one of the
+    #                      sub-codes fired)
+    #
+    # The ELSE branch (decomp lines 3958-4106, structural-passes path):
+    # walks the cells, pushes each to the run vector. No trim. We model
+    # this by running the trim deciders and observing that they return
+    # (0, 0) when the cells are well-formed — same observable outcome.
+    #
+    # We early-returned at line 423 when structural_validator failed.
+    # So at this point structural_validator passed → MakeMKV takes ELSE
+    # branch → no trim. Our port still runs the trim deciders to capture
+    # the corpus-validated empirical-edge behaviour for the
+    # "authoring-fake VTS" case (1 PGC + 0 audio → degenerate run vector
+    # → MSG:3026). For all other cases the deciders return (0, 0) and
+    # no trim is applied — matching MakeMKV's ELSE branch.
+    enter_if_branch = True  # see comment block above
 
     if enter_if_branch:
         # IF branch (decomp lines 3873-3957). iVar30 selection:

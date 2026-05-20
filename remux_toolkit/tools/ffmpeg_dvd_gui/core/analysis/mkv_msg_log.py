@@ -73,10 +73,10 @@ CATALOG: Dict[int, MsgSpec] = {
                   "TitleSet ID %d is invalid.",
                   severity="warn"),
     3006: MsgSpec(3006, "opening-files",
-                  "Opening files at %s",
+                  "Opening files on harddrive at %s",
                   severity="info"),
     3007: MsgSpec(3007, "direct-disc-access",
-                  "Using direct disc access mode.",
+                  "Using direct disc access mode",
                   severity="info"),
     3008: MsgSpec(3008, "titleset-sector-mismatch",
                   "Titleset start sector mismatch for titleset %d : %d != %d",
@@ -142,6 +142,12 @@ CATALOG: Dict[int, MsgSpec] = {
                   "assuming fake title",
                   severity="warn"),
     3027: MsgSpec(3027, "title-skip-duplicate",
+                  # MakeMKV positional order: "Title %3 in VTS %1 is equal
+                  # to title %2 and was skipped" — duplicate's title %3
+                  # appears first, VTS %1 second, survivor's title %2
+                  # third. Callers MUST pass args in render order:
+                  # (duplicate_title, vts, survivor_title). See
+                  # analyzer._find_strict_duplicates emit site.
                   "Title %d in VTS %d is equal to title %d and was skipped",
                   severity="info"),
     3028: MsgSpec(3028, "title-added",
