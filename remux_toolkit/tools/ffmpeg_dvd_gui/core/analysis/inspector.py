@@ -38,16 +38,24 @@ SCHEMA = "remux-toolkit/dvd-inspector/v1"
 def inspect_disc(path: str | Path, *, include_cells: bool = True,
                  filter_phantom_streams: bool = False) -> dict:
     """
+    Pure structural inspection of a DVD-Video disc: returns the parsed
+    IFO contents (VMG + per-VTS + per-PGC + per-cell) as a JSON-shaped
+    dict. The inspector does NOT open VOB sectors or read any dynamic
+    state.
+
     All IFO-derived values must be copied out of libdvdread's struct memory
     *before* the corresponding ifoClose() runs, otherwise we read freed memory.
 
-    ``filter_phantom_streams``: when True, the inspector scans each title's
-    VOB sectors (up to ~8 MB per title) and drops audio / subtitle streams
-    that the IFO declares but the VOB never delivers. This is what MakeMKV
-    does — its audio/sub counts reflect the post-scan reality, not the
-    pre-scan IFO declaration. Default False for speed (typical use); the
-    cross-validation harness sets True.
+    ``filter_phantom_streams``: **DEPRECATED no-op** since Group C. The
+    phantom-stream scan was moved to ``analyzer.analyze()`` so it only
+    runs for titles that pass the silent-drop gate — mirroring MakeMKV's
+    ``FUN_006e3240`` stream_scan_orchestrator placement (post-init,
+    post-cellwalk, pre-MSG:3028-emit). Callers that need the filtered
+    audio counts should call ``analyzer.analyze(report, dvd_path=path)``.
+    The parameter is preserved for backward compat with research
+    tooling (``cross_validation/capture_one.py``).
     """
+    _ = filter_phantom_streams  # accepted for backward compat; ignored
     path = str(path)
     # MSG:3006 — MakeMKV's "Opening files on harddrive at file://..."
     # always fires when a disc-open begins. We mirror it so the
@@ -139,9 +147,10 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True,
 
         titles = [_resolve_title(t, title_sets) for t in raw_titles]
 
-        if filter_phantom_streams:
-            from . import stream_presence as sp
-            _apply_phantom_filter_to_titles(dvd, titles)
+        # Group C: the phantom-stream scan moved to analyzer.analyze() so
+        # it only fires for titles that survive the silent-drop gate
+        # (matching FUN_006e3240's placement). The filter_phantom_streams
+        # parameter is accepted but ignored.
 
         all_reports = [vmg_report, *vts_reports]
         ifo_summary = {
