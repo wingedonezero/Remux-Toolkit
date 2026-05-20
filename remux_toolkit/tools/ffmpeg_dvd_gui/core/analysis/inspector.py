@@ -70,6 +70,7 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True,
             tt_srpt = vmg.contents.tt_srpt.contents
             num_vts = int(vmgi.vmg_nr_of_title_sets)
             num_titles = int(tt_srpt.nr_of_srpts)
+            vmg_last_sector = int(vmgi.vmg_last_sector)
 
             vmg_info = {
                 "identifier": bytes(vmgi.vmg_identifier).decode("latin-1", errors="replace").strip("\x00 "),
@@ -79,6 +80,7 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True,
                 "provider_identifier": bytes(vmgi.provider_identifier).decode("latin-1", errors="replace").strip("\x00 "),
                 "first_play_pgc_offset": int(vmgi.first_play_pgc),
                 "vmg_category": int(vmgi.vmg_category),
+                "vmg_last_sector": vmg_last_sector,
                 "ifo_validation": ifov.report_to_dict(vmg_report),
             }
 
@@ -93,6 +95,17 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True,
                 }
                 for i in range(num_titles)
             ]
+
+            # Build a vts_no → declared_title_set_sector map from
+            # tt_srpt for the MSG:3008 check below. Every title that
+            # references a given VTS carries the same title_set_sector
+            # value; first occurrence wins.
+            declared_title_set_sectors: dict[int, int] = {}
+            for i in range(num_titles):
+                vno = int(tt_srpt.title[i].title_set_nr)
+                if vno not in declared_title_set_sectors:
+                    declared_title_set_sectors[vno] = int(
+                        tt_srpt.title[i].title_set_sector)
 
         title_sets: list[dict] = []
         vts_reports: list[ifov.IfoReport] = []
@@ -110,6 +123,19 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True,
                     "error": str(e),
                     "ifo_validation": ifov.report_to_dict(vts_report),
                 })
+
+        # MSG:3008 — titleset start sector mismatch. MakeMKV emits this
+        # from disc_open_enumerate (FUN_007d98d0) when the VMG's
+        # tt_srpt.title[i].title_set_sector for a VTS doesn't match the
+        # cumulative-layout-derived expected start. Formula:
+        #   expected_VTS_1   = vmg_last_sector + 1
+        #   expected_VTS_N+1 = expected_VTS_N + vts_N_last_sector + 1
+        # On a corpus mismatch (Condor Hero VTS 1: 8 != 24), MakeMKV
+        # emits one MSG:3008 per offending VTS.
+        _check_titleset_sectors(
+            dvd, vmg_last_sector, num_vts,
+            declared_title_set_sectors, title_sets,
+        )
 
         titles = [_resolve_title(t, title_sets) for t in raw_titles]
 
@@ -147,8 +173,110 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True,
         }
 
 
+def _check_titleset_sectors(
+    dvd,
+    vmg_last_sector: int,
+    num_vts: int,
+    declared_title_set_sectors: dict[int, int],
+    title_sets: list[dict],
+) -> None:
+    """Walk per-VTS layout, emit MSG:3008 on each mismatch.
+
+    Mirror of the per-VTS check in MakeMKV's disc_open_enumerate
+    (FUN_007d98d0). Two code paths depending on source type:
+
+      * **ISO / UDF source** (UDFFindFile returns a value for the IFO
+        files): derive the disc's volume offset from
+        ``udf_find_file('/VIDEO_TS/VIDEO_TS.IFO')`` — the VMG IFO sits
+        at volume-relative sector 0 by DVD-Video spec, so its UDF LBA
+        IS the volume offset. For each VTS:
+          - expected UDF LBA = title_set_sector + volume_offset
+          - actual UDF LBA = ``udf_find_file('/VIDEO_TS/VTS_xx_0.IFO')[0]``
+          - mismatch → emit MSG:3008(N, declared, declared_eq_to_calc)
+        Verified clean on DRAGONAUT_P2 / HARLOCK / DRAGONAUT_JP ISOs.
+
+      * **Folder source** (no UDF): use cumulative-layout formula:
+          - expected VTS 1 = vmg_last_sector + 1
+          - expected VTS N+1 = expected_VTS_N + vts_N_last_sector + 1
+          - After mismatch, use the DECLARED sector as the new base so
+            subsequent VTSes don't cascade-fail off one discontinuity.
+        Verified: Condor Hero VTS 1 emits with (1, 8, 24) matching
+        MakeMKV. Other folder rips emit zero MSG:3008.
+    """
+    from . import mkv_msg_log
+
+    # Index title_sets by vts_no for fast lookup of vts_last_sector.
+    by_vts = {ts.get("vts"): ts for ts in title_sets if "error" not in ts}
+
+    # Probe VMG IFO via UDF to derive the volume offset for ISO sources.
+    # On folder rips this returns None — fall back to cumulative.
+    volume_offset: Optional[int] = None
+    try:
+        vmg_udf = dr.udf_find_file(dvd, "/VIDEO_TS/VIDEO_TS.IFO")
+        if vmg_udf is not None:
+            volume_offset = int(vmg_udf[0])
+    except Exception:
+        volume_offset = None
+
+    if volume_offset is not None:
+        # ISO path: per-VTS UDF lookup vs declared+volume_offset.
+        for vts_no in range(1, num_vts + 1):
+            declared = declared_title_set_sectors.get(vts_no)
+            if declared is None:
+                continue
+            try:
+                udf = dr.udf_find_file(
+                    dvd, f"/VIDEO_TS/VTS_{vts_no:02d}_0.IFO")
+            except Exception:
+                udf = None
+            if udf is None:
+                continue
+            actual_lba = int(udf[0])
+            expected_lba = declared + volume_offset
+            if expected_lba != actual_lba:
+                # MakeMKV format: "Titleset start sector mismatch for
+                # titleset %1 : %2 != %3". On ISO sources we surface
+                # the volume-relative calculated value (= actual - vol)
+                # and the declared value.
+                calculated_rel = actual_lba - volume_offset
+                mkv_msg_log.emit(
+                    3008, vts_no, calculated_rel, declared,
+                    vts=vts_no, expected=calculated_rel,
+                    declared=declared, source="udf")
+        return
+
+    # Folder path: cumulative formula.
+    expected_start = vmg_last_sector + 1
+    for vts_no in range(1, num_vts + 1):
+        declared = declared_title_set_sectors.get(vts_no)
+        ts = by_vts.get(vts_no)
+        if declared is None:
+            if ts is not None:
+                vts_last = ts.get("vts_last_sector")
+                if vts_last is not None:
+                    expected_start = expected_start + vts_last + 1
+            continue
+        if declared != expected_start:
+            mkv_msg_log.emit(3008, vts_no, expected_start, declared,
+                              vts=vts_no, expected=expected_start,
+                              declared=declared, source="folder")
+            expected_start = declared
+        if ts is not None:
+            vts_last = ts.get("vts_last_sector")
+            if vts_last is not None:
+                expected_start = expected_start + vts_last + 1
+
+
 def _vts_to_dict(vts_no: int, vts_ifo, *, include_cells: bool) -> dict:
     m = vts_ifo.contents.vtsi_mat.contents
+
+    # Capture vts_last_sector + vtsi_last_sector for the titleset-sector
+    # check (MSG:3008). vts_last_sector = last sector of the entire VTS
+    # group (IFO + VOBs + BUP); vtsi_last_sector = last sector of the
+    # VTSI alone. The MSG:3008 check needs cumulative VTS layout to
+    # compute each VTS's expected disc start.
+    vts_last_sector = int(m.vts_last_sector)
+    vtsi_last_sector = int(m.vtsi_last_sector)
 
     audio = [dr.audio_attr_to_dict(m.vts_audio_attr[i])
              for i in range(m.nr_of_vts_audio_streams)]
@@ -182,6 +310,8 @@ def _vts_to_dict(vts_no: int, vts_ifo, *, include_cells: bool) -> dict:
         "vts": vts_no,
         "identifier": m.vts_identifier.decode("latin-1", errors="replace").strip(),
         "specification_version": int(m.specification_version),
+        "vts_last_sector": vts_last_sector,
+        "vtsi_last_sector": vtsi_last_sector,
         "video": dr.video_attr_to_dict(m.vts_video_attr),
         "audio_streams": audio,
         "subtitle_streams": subp,
