@@ -18,7 +18,10 @@ Two important design rules from the project owner:
 """
 from __future__ import annotations
 
+import logging
 from typing import Iterable, Optional
+
+from . import title_pre_filter as _pf
 
 
 SCHEMA = "remux-toolkit/dvd-analyzer/v1"
@@ -33,80 +36,24 @@ COMPILATION_CHAPTER_RATIO = 2.0  # if T_A.chapters >= 2× T_B.chapters AND T_A
                                   # as a compilation containing T_B
 
 
+_trace_log = logging.getLogger("remux_toolkit.analyzer.title_eval")
+
+
 # ---------------------------------------------------------------------------
-# Title classification
+# Title classification — delegates fully to title_pre_filter
+# (the port of FUN_007ef130 + FUN_007ed1f0 + FUN_007ec6f0). ``analyze()``
+# requires the inspector's full ``title_sets`` list to run the PTT/PGC
+# walk; reports without that context cause an explicit error rather
+# than falling back to a heuristic.
 # ---------------------------------------------------------------------------
 
-#: Threshold below which a single-cell title is treated as a fake (menu
-#: trampoline / authoring trick). MakeMKV's title_evaluator (FUN_007ec6f0)
-#: drops these silently before MSG:3025/3026/3028 emission. Empirically
-#: 2.0s covers the corpus's silent-drop population:
-#:   DRAGONAUT_P2: 35 × 0.4s, 1 × 0.5s
-#:   ANGEL_S1D1: 1 × 0.5s (T6)
-#:   TERRA_NOVA_SEASON_1: 1 × 1.5s (T8)
-FAKE_TITLE_MAX_DURATION_S = 2.0
 
-#: Above this duration, a single-cell fake title is *visible* enough
-#: that MakeMKV emits MSG:3026 ("declared X, actual Y - assuming fake").
-#: Below it, the title is silently dropped by FUN_007ed1f0 (the init
-#: validator) and we log MSG:3016 instead. The split point is between
-#: DRAGONAUT_P2 T2 (0.4s, silent) and T5 (0.5s, MSG:3026 emitted).
-_MSG_3026_MIN_VISIBLE_DURATION_S = 0.5
-
-#: Absolute delta (seconds) between declared PGC duration and actual cell
-#: sum that MakeMKV's title_evaluator (FUN_007ec6f0 at lines 4486-4517 of
-#: full_decomp.md) requires before emitting MSG:3026 "fake title". Below
-#: this, the declared length is "close enough" — BCD rounding noise.
-#: Above, the discrepancy is significant AND must also exceed the
-#: relative threshold below.
-FAKE_TITLE_ABS_DELTA_S = 300.0
-
-#: Relative delta (percent of declared duration) above which the title
-#: is fake. MakeMKV uses ``(diff * 100) / declared_dur > 30`` (decomp
-#: literal: ``0x1e < (uVar8 * 100) / uVar5``).
-FAKE_TITLE_REL_DELTA_PCT = 30.0
-
-
-def _is_fake_title(title: dict) -> bool:
-    """True when a title matches MakeMKV's "drop silently" pattern.
-
-    Criteria (any one is sufficient):
-
-        1. ``num_cells == 1`` AND ``duration_seconds_cell_sum < 1.0`` —
-           single-cell menu trampoline. DRAGONAUT_P2 has 35 of these.
-        2. ``num_cells == 0`` — degenerate PGC pointer.
-        3. ``duration_seconds == 0`` AND ``duration_seconds_cell_sum == 0``
-           — the MSG:3026 "declared 0:00:00 / actual 0:00:00" case
-           (ANGEL T6, DRAGONAUT T5).
-        4. **MSG:3026 declared-vs-actual mismatch**: declared duration
-           (PGC.playback_time, BCD) and cell-sum duration disagree by
-           ``> FAKE_TITLE_ABS_DELTA_S`` seconds AND
-           ``> FAKE_TITLE_REL_DELTA_PCT`` percent of declared. Direct
-           port of title_evaluator's check.
+def _classify_secondary(title: dict) -> str:
+    """Pick the GUI display bucket when ``evaluate_title`` classifies a
+    title as "added". The four buckets — ``feature`` / ``short`` /
+    ``stub`` / ``filler`` — are visibility groupings only; they don't
+    affect whether the title is ripped.
     """
-    num_cells = int(title.get("num_cells") or 0)
-    dur_cell_sum = float(title.get("duration_seconds_cell_sum") or 0.0)
-    dur_pgc = float(title.get("duration_seconds") or 0.0)
-
-    if num_cells == 0:
-        return True
-    if dur_pgc == 0.0 and dur_cell_sum == 0.0:
-        return True
-    if num_cells == 1 and dur_cell_sum < FAKE_TITLE_MAX_DURATION_S:
-        return True
-    # MSG:3026 path — declared vs actual large mismatch.
-    if dur_pgc > 0:
-        diff = abs(dur_pgc - dur_cell_sum)
-        rel = (diff * 100.0) / dur_pgc
-        if diff > FAKE_TITLE_ABS_DELTA_S and rel > FAKE_TITLE_REL_DELTA_PCT:
-            return True
-    return False
-
-
-def _classify(title: dict) -> str:
-    if _is_fake_title(title):
-        return "fake_title"
-
     duration = title.get("duration_seconds", 0) or 0
     audio_count = len(title.get("audio_streams", []))
     sub_count = len(title.get("subtitle_streams", []))
@@ -118,6 +65,61 @@ def _classify(title: dict) -> str:
     if duration < SHORT_TITLE_S:
         return "short"
     return "feature"
+
+
+def _evaluate_title_for_analyzer(title: dict, vts: dict) -> _pf.EvaluatorResult:
+    """Run title_pre_filter.evaluate_title with cellwalk-equivalent
+    inputs derived from the inspector dict.
+
+    The cellwalk gate uses ``cellwalk_would_keep_any_cells`` (a
+    duration-based proxy for cell_trim's content predicate). This
+    matches MakeMKV's per-corpus behavior:
+
+      - Jack T3/T4 (0.501s, single-cell): no cells survive → silent
+        because VTS has audio.
+      - TERRA T8 (1.501s, single-cell): same.
+      - Condor T2/T3 (7-10s, single-cell): cell survives (>= 5s) → added.
+      - ANGEL T5 (7.5s, single-cell): cell survives → added.
+      - DRAGONAUT T5 / ANGEL T6 (0.501s, single-cell): no cells survive +
+        no audio in VTS → MSG:3026 fake.
+    """
+    # Collect the PGC's cells (if include_cells was on in inspector).
+    pgcn = title.get("pgc")
+    cells: list[dict] = []
+    if vts and pgcn is not None:
+        for p in vts.get("pgcs", []):
+            if p.get("pgc") == pgcn:
+                cells = p.get("cells") or []
+                break
+
+    # Mirror cell_trim's cellwalk verdict (FUN_007f3eb0 → method[0x10]
+    # → FUN_007f3e30): 0 cells "survive" when no cell passes the
+    # byzantine content predicate (cell_trim.cell_is_content_byzantine,
+    # the port of cell_validator_primary). If we don't have cell-level
+    # data (inspector run without include_cells), fall back to
+    # num_cells (be permissive — over-report MSG:3028 rather than
+    # silent-drop real content).
+    if cells:
+        has_content = _pf.cellwalk_keeps_any_cells(cells)
+        cells_after_trim = sum(1 for _ in cells) if has_content else 0
+    else:
+        cells_after_trim = int(title.get("num_cells") or 0)
+
+    actual = title.get("duration_seconds_cell_sum")
+    if actual is None:
+        actual = title.get("duration_seconds")
+
+    result = _pf.evaluate_title(
+        title, vts,
+        cells_after_trim=cells_after_trim,
+        actual_duration_after_trim_s=float(actual or 0.0),
+    )
+    _trace_log.debug(
+        "title=%d vts=%s pgc=%s %s",
+        title.get("title"), title.get("vts"), title.get("pgc"),
+        result.trace,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -403,58 +405,54 @@ def analyze(report: dict) -> dict:
           },
         }
     """
-    raw_titles = report.get("titles", [])
-
-    # First pass: classify each title + emit MakeMKV-equivalent MSGs.
-    # MakeMKV's emission rules (from title_evaluator decomp):
-    #   * MSG:3026 fires ONLY when the BCD-declared duration is 0 OR
-    #     when |cell_sum - declared| > 300s AND > 30% of declared.
-    #   * Other "drop" cases (single-cell stubs, degenerate PGCs) get
-    #     silently rejected by FUN_007ed1f0 before MSG emission. Match
-    #     that by emitting MSG:3016 ("title skipped") for our other
-    #     fake_title classifications.
     from . import mkv_msg_log
+
+    raw_titles = report.get("titles", [])
+    title_sets = report.get("title_sets", [])
+    vts_by_no = {ts.get("vts"): ts for ts in title_sets}
+
+    # ``analyze`` requires the inspector's title_sets to run the
+    # FUN_007ec6f0 port (PTT/PGC walk + cellwalk gate). Without it,
+    # there's no faithful answer to "is this title silent / fake /
+    # added" — we error explicitly rather than fall back to a
+    # heuristic.
+    if not title_sets:
+        raise ValueError(
+            "analyze() requires inspector.title_sets — got an empty list. "
+            "Build the report via inspector.inspect_disc() or supply a "
+            "matching title_sets entry for each title's vts."
+        )
+
+    # First pass: run the FUN_007ec6f0 port for each title. MSG:3009/
+    # 3010/3011/3012/3015/3016/3025/3026/3028/3040/3041 are emitted
+    # inside evaluate_title (and its callees) when the corresponding
+    # gate fires; we record the verdict + the GUI classification.
     for t in raw_titles:
-        t["classification"] = _classify(t)
-        tid = t.get("title")
-        cls = t["classification"]
-        dur_pgc = float(t.get("duration_seconds") or 0.0)
-        dur_sum = float(t.get("duration_seconds_cell_sum") or 0.0)
-        if cls == "fake_title":
-            # Decide which MSG matches MakeMKV's behaviour for this case.
-            diff = abs(dur_pgc - dur_sum)
-            rel = (diff * 100.0) / dur_pgc if dur_pgc > 0 else 0
-            # MSG:3026 fires for visible-but-fake titles:
-            #   - BCD-displayed h:m:s = 0:00:00 (frames may be > 0)
-            #     AND actual cell-sum >= _MSG_3026_MIN_VISIBLE_DURATION_S
-            #     (DRAGONAUT T5, ANGEL T6 — both 0.501s with declared
-            #     "0:00:00" / 15 frames)
-            #   - Large declared-vs-actual mismatch (300s + 30%)
-            # MSG:3016 is the "silently dropped" log for the rest
-            # (sub-0.5s stubs FUN_007ed1f0 rejects before 3026 path).
-            triggers_3026 = (
-                int(dur_pgc) == 0
-                and dur_sum >= _MSG_3026_MIN_VISIBLE_DURATION_S
-            ) or (
-                dur_pgc > 0 and diff > FAKE_TITLE_ABS_DELTA_S
-                and rel > FAKE_TITLE_REL_DELTA_PCT
-            )
-            if triggers_3026:
-                mkv_msg_log.emit(3026, tid,
-                                 _hms(dur_pgc), _hms(dur_sum),
-                                 title=tid, vts=t.get("vts"),
-                                 cells=t.get("num_cells"))
-            else:
-                mkv_msg_log.emit(3016, tid,
-                                 title=tid, vts=t.get("vts"),
-                                 cells=t.get("num_cells"),
-                                 reason="single-cell-or-degenerate")
-        elif cls in ("feature", "short", "stub"):
-            # MSG:3028 — title added (parity with MakeMKV's normal path)
-            mkv_msg_log.emit(3028, tid,
-                             int(t.get("num_cells") or 0),
-                             _hms(dur_sum),
-                             title=tid, vts=t.get("vts"))
+        vts = vts_by_no.get(t.get("vts"), {}) or {}
+        verdict = _evaluate_title_for_analyzer(t, vts)
+        t["evaluator_verdict"] = verdict.classification
+        t["evaluator_msg_code"] = verdict.msg_code
+        t["evaluator_reason"] = verdict.reason
+        t["evaluator_trace"] = verdict.trace
+        if verdict.classification in ("fake_title", "silent",
+                                      "skipped_init", "skipped_nav",
+                                      "skipped_short"):
+            t["classification"] = "fake_title"
+            # Strip phantom-drop bookkeeping for silent titles —
+            # MakeMKV doesn't emit MSG:3034 for them.
+            t.pop("_phantom_audio_slots_dropped", None)
+        else:
+            t["classification"] = _classify_secondary(t)
+            # MSG:3034 — emit only for added titles (MakeMKV's
+            # behaviour). The inspector stages the dropped slots
+            # at ``_phantom_audio_slots_dropped``; we emit + clear.
+            dropped = t.pop("_phantom_audio_slots_dropped", None)
+            if dropped:
+                for slot in dropped:
+                    mkv_msg_log.emit(3034, slot, t.get("title") or 0,
+                                      title=t.get("title"),
+                                      vts=t.get("vts"),
+                                      reason="phantom-stream-filter")
 
     # Strict-equality dedup.
     dup_map = _find_strict_duplicates(raw_titles)

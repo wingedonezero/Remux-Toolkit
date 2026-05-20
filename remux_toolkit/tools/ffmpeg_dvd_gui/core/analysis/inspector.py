@@ -49,6 +49,12 @@ def inspect_disc(path: str | Path, *, include_cells: bool = True,
     cross-validation harness sets True.
     """
     path = str(path)
+    # MSG:3006 — MakeMKV's "Opening files on harddrive at file://..."
+    # always fires when a disc-open begins. We mirror it so the
+    # cross-val log diff doesn't show it as a delta.
+    from . import mkv_msg_log
+    file_url = f"file://{path}" if not path.startswith("file://") else path
+    mkv_msg_log.emit(3006, file_url, source=path)
     css_state = ifov.detect_css(path)
     with dr.open_disc(path) as dvd:
         vol_id, vol_set = dr.get_volume_info(dvd)
@@ -197,6 +203,17 @@ def _pgc_to_dict(pgc_idx: int, pgc, *, include_cells: bool) -> dict:
             cell_secs = cp.playback_time.total_seconds
             cell_sum_s += cell_secs
             if include_cells:
+                # Capture the cell's VM command bytes if a command is
+                # attached (cell_cmd_nr > 0). Allows downstream
+                # consumers (title_pre_filter, cell_validator) to run
+                # the opcode classifier without re-opening libdvdread.
+                vm_cmd_hex: Optional[str] = None
+                if cp.cell_cmd_nr != 0 and pgc.command_tbl:
+                    tbl = pgc.command_tbl.contents
+                    if (cp.cell_cmd_nr <= tbl.nr_of_cell
+                            and tbl.cell_cmds):
+                        cmd = tbl.cell_cmds[cp.cell_cmd_nr - 1]
+                        vm_cmd_hex = bytes(cmd.bytes).hex()
                 cells_data.append({
                     "cell": ci + 1,
                     "first_sector": int(cp.first_sector),
@@ -210,6 +227,8 @@ def _pgc_to_dict(pgc_idx: int, pgc, *, include_cells: bool) -> dict:
                     "seamless_angle": bool(cp.seamless_angle),
                     "still_time": int(cp.still_time),
                     "cell_type": int(cp.cell_type),
+                    "cell_cmd_nr": int(cp.cell_cmd_nr),
+                    "vm_command_bytes": vm_cmd_hex,
                 })
 
     # Active stream masks: top bit set means the stream is active for this PGC.
@@ -274,16 +293,23 @@ def _apply_phantom_filter_to_titles(dvd, titles: list[dict]) -> None:
         if not rep.missing_audio_indices:
             continue
         # Audio-only filter: drop tracks for slots not seen in the
-        # post-scan observed set.
+        # post-scan observed set. MSG:3034 emission happens later in
+        # analyzer.analyze() — only for titles that get MSG:3028
+        # added (matches MakeMKV which doesn't run audio detection
+        # for titles it silently skips).
         active_audio = t.get("active_audio_slots") or list(range(n_audio))
         a_missing = set(rep.missing_audio_indices)
         kept_audio = []
+        dropped_slots: list[int] = []
         for i, s in enumerate(t.get("audio_streams", [])):
             slot = active_audio[i] if i < len(active_audio) else i
             if slot in a_missing:
+                dropped_slots.append(slot)
                 continue
             kept_audio.append(s)
         t["audio_streams"] = kept_audio
+        if dropped_slots:
+            t["_phantom_audio_slots_dropped"] = dropped_slots
         t["phantoms_dropped"] = {
             "audio": len(rep.missing_audio_indices),
             "subtitle_diagnostic": len(rep.missing_subp_indices),
