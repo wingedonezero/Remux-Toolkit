@@ -128,6 +128,28 @@ class DiscState:
     # Empty when unavailable.
     disc_id_md5: str = ""
 
+    # ---- F.3: per-VTS IFO load state ---------------------------------------
+
+    # Total titlesets declared in the VMG (``vmgi_mat.vmg_nr_of_title_sets``).
+    # Decomp gates titleset count to 0..99 — MSG:3004 fires above. F.8
+    # will wire that emit; for F.3 we simply record the count.
+    vts_count: int = 0
+
+    # Per-VTS metadata aggregated from the inspector's title_sets entries.
+    # Keyed by 1-based VTS number. Each value carries the small surface
+    # F.4/F.5's populators consult:
+    #
+    #   {
+    #       "pgc_count":   number of PGCs in vts_pgcit
+    #       "audio_count": declared VTSTT audio streams
+    #       "sub_count":   declared VTSTT subtitle streams
+    #       "title_count": number of titles claiming this VTS (per tt_srpt)
+    #   }
+    #
+    # Missing key ⇒ VTS not yet observed (or failed to load — see
+    # ``vts_failed`` for the explicit-failure flag).
+    vts_info: Dict[int, Dict[str, int]] = field(default_factory=dict)
+
     # ---- Convenience accessors ---------------------------------------------
 
     def vts_claim_list_nonempty(self, vts_no: int) -> bool:
@@ -215,6 +237,11 @@ def disc_open_enumerate(
         state.vmg_category = int(vmg.get("vmg_category") or 0)
         state.volume_id = str(report.get("volume_id") or "")
         state.disc_id_md5 = str(report.get("disc_id_md5") or "")
+
+        # F.3: walk per-VTS title_sets to mark failed opens + collect
+        # the small per-VTS surface F.4/F.5's populators consume.
+        state.vts_count = int(vmg.get("num_title_sets") or 0)
+        _populate_vts_info_from_report(state, report)
         return state
 
     # ---- Source 2: fresh libdvdread open ----------------------------------
@@ -241,8 +268,66 @@ def disc_open_enumerate(
         return state
 
     # ---- Source 3: nothing to read; return empty defaults ------------------
-    _ = dvd_handle  # consumed by F.3+
+    _ = dvd_handle  # consumed by F.4+
     return state
+
+
+# ---------------------------------------------------------------------------
+# F.3 helper: per-VTS IFO load state from inspector report
+# ---------------------------------------------------------------------------
+
+def _populate_vts_info_from_report(state: DiscState, report: dict) -> None:
+    """Walk ``report['title_sets']`` + ``report['titles']`` and populate
+    ``state.vts_info`` / ``state.vts_failed``.
+
+    Mirrors disc_open_enumerate's per-VTS open loop (decomp lines
+    1442-1597). The decomp's loop allocates a per-VTS ``lVar29`` title
+    state, calls ``FUN_007e46b0`` (ifo_bup_reader) to parse VMGI/VTSI,
+    and sets ``lVar29[+0xd8] = 1`` when either the open OR the IFO read
+    fails. The inspector's ``title_sets[N]['error']`` field captures the
+    same condition (libdvdread's ``open_ifo`` raised — IFO unparseable).
+
+    On success the decomp accumulates the VTS's title count via the
+    engine call at lines 1587-1591 (key ``0xee1e67ba`` =
+    ``nr_of_titles``) to advance its expected-sector cursor. We surface
+    the inspector's already-parsed counts directly.
+    """
+    title_sets = report.get("title_sets") or []
+    raw_titles = report.get("titles") or []
+
+    # Count how many titles claim each VTS — mirrors the VMG tt_srpt
+    # walk the decomp does at lines 539-606 (the MSG:3005 / MSG:3008
+    # per-title loop). Inspector already parsed tt_srpt into
+    # ``report['titles']``.
+    title_count_by_vts: Dict[int, int] = {}
+    for t in raw_titles:
+        vno = int(t.get("vts") or 0)
+        if vno > 0:
+            title_count_by_vts[vno] = title_count_by_vts.get(vno, 0) + 1
+
+    for ts in title_sets:
+        vts_no = int(ts.get("vts") or 0)
+        if vts_no <= 0:
+            continue
+        if "error" in ts:
+            # title_state[+0xd8] = 1 placeholder. The decomp's
+            # LAB_007dba21 path still registers this entry; downstream
+            # walks skip it via the flag rather than scanning past it.
+            state.vts_failed[vts_no] = True
+            state.vts_info[vts_no] = {
+                "pgc_count": 0,
+                "audio_count": 0,
+                "sub_count": 0,
+                "title_count": title_count_by_vts.get(vts_no, 0),
+            }
+            continue
+
+        state.vts_info[vts_no] = {
+            "pgc_count": len(ts.get("pgcs") or []),
+            "audio_count": len(ts.get("audio_streams") or []),
+            "sub_count": len(ts.get("subtitle_streams") or []),
+            "title_count": title_count_by_vts.get(vts_no, 0),
+        }
 
 
 __all__ = [
