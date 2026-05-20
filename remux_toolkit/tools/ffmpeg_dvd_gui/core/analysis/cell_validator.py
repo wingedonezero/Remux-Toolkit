@@ -151,10 +151,16 @@ def cell_command_at(pgc, cell_cmd_nr: int) -> Optional[bytes]:
     """Read the 8-byte VM command at ``cell_cmd_nr`` (1-based) from a
     libdvdread Pgc structure. Returns None if ``cell_cmd_nr`` is 0 or
     out of range. The bytes are returned in original DVD-Video order
-    (byte 0 = MSB of the opcode word)."""
+    (byte 0 = MSB of the opcode word).
+
+    ``pgc`` may be ``None`` (e.g. when called from
+    ``cell_validator.structural_validator``'s byzantine probe with no
+    pgc context); treat that as "no command table available" and
+    return None.
+    """
     if cell_cmd_nr == 0:
         return None
-    if not pgc.command_tbl:
+    if pgc is None or not pgc.command_tbl:
         return None
     tbl = pgc.command_tbl.contents
     if cell_cmd_nr > tbl.nr_of_cell:

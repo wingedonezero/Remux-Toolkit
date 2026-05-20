@@ -280,15 +280,76 @@ def _hidden_by_default(title: dict, *, is_duplicate: bool,
 # GUI dict shape (drop-in for DVDProbeWorker output)
 # ---------------------------------------------------------------------------
 
+# MakeMKV-equivalent codec labels per stream kind. Used to populate the
+# ``makemkv_codec`` parity field alongside our ffmpeg-style ``codec``. The
+# captured MakeMKV ``mmcon_titles.json`` for the corpus shows these exact
+# strings in the ``codec`` column.
+_MAKEMKV_VIDEO_CODEC = {
+    "mpeg1": "Mpeg1",
+    "mpeg2": "Mpeg2",
+}
+_MAKEMKV_AUDIO_CODEC = {
+    "ac3":      "DD",        # Dolby Digital
+    "mpeg1":    "MP2",       # MPEG-1 Layer II audio (audio_format=2)
+    "mpeg2ext": "MP2",       # MPEG-2 ext (audio_format=3); MakeMKV displays MP2
+    "lpcm":     "PCM",       # Linear PCM
+    "sdds":     "SDDS",      # rare
+    "dts":      "DTS",
+}
+# MakeMKV displays DVD subpicture as an empty codec string (only the
+# language is shown). Closed captions are labelled "CC" in MakeMKV's output.
+_MAKEMKV_SUB_CODEC = {
+    "dvd_subtitle": "",
+    "eia_608":      "CC",
+}
+
+# ISO 639-1 → ISO 639-2 (bibliographic) lookup. MakeMKV emits 639-2.
+# Cover the languages seen across the corpus + common ones; unknowns
+# fall back to the original 2-letter code (so we never silently drop
+# information).
+_ISO639_1_TO_2 = {
+    "en": "eng", "fr": "fre", "es": "spa", "de": "ger", "it": "ita",
+    "ja": "jpn", "ko": "kor", "zh": "chi", "ru": "rus", "pt": "por",
+    "nl": "dut", "sv": "swe", "no": "nor", "da": "dan", "fi": "fin",
+    "pl": "pol", "tr": "tur", "ar": "ara", "he": "heb", "hi": "hin",
+    "th": "tha", "vi": "vie", "el": "gre", "cs": "cze", "hu": "hun",
+    "ro": "rum", "uk": "ukr", "bg": "bul", "sk": "slo", "sl": "slv",
+    "ms": "may", "id": "ind",
+}
+
+
+def _makemkv_lang(lang: str) -> str:
+    """Match MakeMKV's language emission: ISO 639-2 (3-letter) when the
+    code resolves, empty string for 'und'/unknown."""
+    if not lang or lang.lower() == "und":
+        return ""
+    iso2 = _ISO639_1_TO_2.get(lang.lower())
+    if iso2:
+        return iso2
+    # Already 3-letter or non-standard — pass through.
+    return lang.lower()
+
+
 def _to_gui_streams(title: dict) -> list[dict]:
     """Flatten audio + subtitle streams into the GUI's expected list format.
-    Video is synthesized as the first stream from the inspector's video dict."""
+    Video is synthesized as the first stream from the inspector's video dict.
+
+    Each stream carries both our internal codec name (``codec``, ffmpeg-style
+    e.g. ``ac3``/``mpeg1``/``dvd_subtitle``) AND a MakeMKV-equivalent label
+    (``makemkv_codec``: ``DD``/``MP2``/``""``) for cross-validation parity.
+    Same for language: ``language`` is ISO 639-1 (2-letter) with ``"und"``
+    for unknown, ``makemkv_language`` is ISO 639-2 (3-letter) with ``""``
+    for unknown — matching MakeMKV's emit.
+    """
     video = title.get("video") or {}
+    video_codec = video.get("codec", "")
     streams: list[dict] = [{
         "index": 0,
         "kind": "Video",
-        "codec": video.get("codec", ""),
+        "codec": video_codec,
+        "makemkv_codec": _MAKEMKV_VIDEO_CODEC.get(video_codec, video_codec),
         "language": "",
+        "makemkv_language": "",
         "channels": 0,
         "channel_layout": "",
         "sample_rate": 0,
@@ -300,11 +361,15 @@ def _to_gui_streams(title: dict) -> list[dict]:
     idx = 1
     for s in title.get("audio_streams", []):
         chans = s.get("channels", 0)
+        codec = s.get("codec", "")
+        lang = s.get("language", "")
         streams.append({
             "index": idx,
             "kind": "Audio",
-            "codec": s.get("codec", ""),
-            "language": s.get("language", ""),
+            "codec": codec,
+            "makemkv_codec": _MAKEMKV_AUDIO_CODEC.get(codec, codec),
+            "language": lang,
+            "makemkv_language": _makemkv_lang(lang),
             "channels": chans,
             "channel_layout": f"{chans}ch" if chans else "",
             "sample_rate": 48000 if s.get("sample_rate") == "48kHz" else (96000 if s.get("sample_rate") == "96kHz" else 0),
@@ -313,11 +378,14 @@ def _to_gui_streams(title: dict) -> list[dict]:
         })
         idx += 1
     for s in title.get("subtitle_streams", []):
+        lang = s.get("language", "")
         streams.append({
             "index": idx,
             "kind": "Subtitles",
             "codec": "dvd_subtitle",
-            "language": s.get("language", ""),
+            "makemkv_codec": _MAKEMKV_SUB_CODEC["dvd_subtitle"],  # ""
+            "language": lang,
+            "makemkv_language": _makemkv_lang(lang),
             "channels": 0,
             "channel_layout": "",
             "sample_rate": 0,
@@ -325,18 +393,35 @@ def _to_gui_streams(title: dict) -> list[dict]:
             "height": 0,
         })
         idx += 1
-    for cc in title.get("closed_captions", []):
+    # MakeMKV emits a single "CC" subtitle stream when the IFO declares
+    # line21 captions, regardless of whether one or both of line21_cc_1 /
+    # line21_cc_2 are flagged. Our ``closed_captions`` list may carry both
+    # CC1 and CC2 channels; collapse them into a single track for the GUI
+    # streams view (the channel detail stays available via the
+    # ``closed_caption_channels`` field on the title).
+    ccs = title.get("closed_captions", []) or []
+    if ccs:
+        primary = ccs[0]
+        all_channels = ",".join(cc["channel"] for cc in ccs)
         streams.append({
             "index": idx,
             "kind": "Subtitles",
             "codec": "eia_608",
+            "makemkv_codec": _MAKEMKV_SUB_CODEC["eia_608"],  # "CC"
             "language": "eng",
+            "makemkv_language": "eng",
             "channels": 0,
             "channel_layout": "",
             "sample_rate": 0,
             "width": 0,
             "height": 0,
-            "extra": {"cc_channel": cc["channel"]},
+            "extra": {
+                "cc_channel": primary["channel"],
+                # Surface every CC channel the IFO declared so consumers
+                # can rip multi-channel CC data even though MakeMKV's
+                # display only lists one stream.
+                "cc_channels": all_channels,
+            },
         })
         idx += 1
     return streams
@@ -361,18 +446,35 @@ def _seconds_to_hms(s: float) -> str:
 
 def _to_gui_title(title: dict) -> dict:
     """Convert a single analyzed title into the dict shape the existing GUI
-    consumes (matches `title_info_to_dict` from ffmpeg_parser.py)."""
-    dur_s = title.get("duration_seconds", 0) or 0
+    consumes (matches `title_info_to_dict` from ffmpeg_parser.py).
+
+    Duration field semantics:
+      * ``duration_seconds`` — MakeMKV-equivalent integer seconds via
+        ``sum(int(cell.duration_s))``. Matches MakeMKV's MSG:3028 / title
+        list display. Set by ``analyze()`` as
+        ``duration_seconds_int_cell_sum`` and surfaced here.
+      * ``duration_seconds_pgc`` — full-precision ``pgc.playback_time``
+        from the IFO. Use this when sub-second accuracy matters.
+      * ``duration`` — ``H:MM:SS`` rendering of the MakeMKV-equivalent
+        integer seconds.
+    """
+    pgc_dur = float(title.get("duration_seconds", 0) or 0)
+    mm_dur = int(title.get("duration_seconds_int_cell_sum", pgc_dur))
     video = title.get("video") or {}
     return {
-        "title_num":        title["title"],
-        "duration":         _seconds_to_hms(dur_s),
-        "duration_seconds": dur_s,
+        "title_num":            title["title"],
+        "duration":             _seconds_to_hms(mm_dur),
+        "duration_seconds":     mm_dur,
+        "duration_seconds_pgc": round(pgc_dur, 3),
         "chapters":         title.get("num_chapters", 0),
         "video_codec":      (video.get("codec") or "").upper(),
         "audio_count":      len(title.get("audio_streams", [])),
+        # MakeMKV emits a single CC subtitle stream per title regardless
+        # of whether one or both line21 fields are flagged, so the count
+        # treats closed_captions as "1 if any, else 0" — matches
+        # MakeMKV's mmcon title-list ``subtitle_count``.
         "subtitle_count":   len(title.get("subtitle_streams", []))
-                            + len(title.get("closed_captions", [])),
+                            + (1 if title.get("closed_captions") else 0),
         "streams":          _to_gui_streams(title),
         # --- analyzer-specific extensions ---
         "vts":                  title.get("vts"),
@@ -491,6 +593,27 @@ def analyze(report: dict, *, dvd_path: Optional[str] = None) -> dict:
     raw_titles = report.get("titles", [])
     title_sets = report.get("title_sets", [])
     vts_by_no = {ts.get("vts"): ts for ts in title_sets}
+
+    # Pre-compute the MakeMKV-equivalent display duration per title:
+    # sum(int(cell.duration_s)) — what MakeMKV prints in MSG:3028
+    # "Title #N was added (M cell(s), H:MM:SS)" and in its title list
+    # JSON. Our analyzer also exposes the full-precision pgc.playback_time
+    # via duration_seconds_pgc for callers that need it.
+    for t in raw_titles:
+        pgc_no = t.get("pgc")
+        vts = vts_by_no.get(t.get("vts"), {}) or {}
+        cells = []
+        for p in vts.get("pgcs", []):
+            if p.get("pgc") == pgc_no:
+                cells = p.get("cells") or []
+                break
+        if cells:
+            t["duration_seconds_int_cell_sum"] = sum(
+                int(c.get("duration_seconds", 0) or 0) for c in cells
+            )
+        else:
+            t["duration_seconds_int_cell_sum"] = int(
+                t.get("duration_seconds", 0) or 0)
 
     # ``analyze`` requires the inspector's title_sets to run the
     # FUN_007ec6f0 port (PTT/PGC walk + cellwalk gate). Without it,
