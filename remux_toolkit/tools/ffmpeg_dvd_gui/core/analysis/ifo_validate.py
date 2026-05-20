@@ -271,6 +271,19 @@ def validate_ifo_handle(ifo, *, is_vmg: bool) -> List[IfoIssue]:
 # Top-level orchestrator
 # ---------------------------------------------------------------------------
 
+def _has_menu_vob(dvd, vts_no: int) -> bool:
+    """Return True iff VTS_xx_0.VOB (the per-VTS menu VOB) opens via
+    libdvdread. Used as the gate for the BUP byte-position check —
+    mirrors MakeMKV's decomp at FUN_007e46b0 lines 4798-4803, where the
+    empty-VOB-file path falls through to LAB_007e4c62 and skips the
+    check entirely."""
+    try:
+        with dr.open_vob(dvd, vts_no, menu=True):
+            return True
+    except dr.DvdReadError:
+        return False
+
+
 def _check_ifo_self_declared_size(dvd, title: int, *, is_vmg: bool,
                                   probe: IfoSourceProbe,
                                   issues: List[IfoIssue]) -> None:
@@ -283,19 +296,16 @@ def _check_ifo_self_declared_size(dvd, title: int, *, is_vmg: bool,
          sectors. Actual file size must match. BUP size must equal main
          IFO size (it's a backup copy).
 
-      2. **UDF physical-position check** (ISO / block-device sources
-         only). MakeMKV's MSG:3002 path: compute the expected BUP LBA
-         from the main IFO's ``vts_last_sector`` minus
-         ``vtsi_last_sector``, then call ``UDFFindFile()`` to get the
-         BUP's actual on-disc LBA. Mismatch → BUP was authored at a
-         non-canonical position, which is what MakeMKV's "Calculated
-         BUP offset for VTS #N does not match one in IFO header"
-         message warns about.
-
-         For folder sources (no UDF), UDFFindFile returns -1 and we
-         skip this check — MakeMKV emits the warning anyway on folder
-         sources, but that's a structural artifact of having no UDF
-         filesystem to verify against.
+      2. **BUP byte-position check** (per-VTS only, gated on menu VOB
+         presence) — mirror of FUN_007e46b0 lines 4920-4936. Reads
+         vts_last_sector and vtsi_last_sector from the main IFO; the
+         expected BUP byte offset within the VTS group is
+         ``(vts_last_sector - vtsi_last_sector) << 11``. On UDF/ISO
+         sources, compares against ``(bup_lba - ifo_lba) << 11``. On
+         folder sources, the comparison cannot succeed (no on-disc
+         layout) and the check fires whenever a menu VOB exists —
+         matching MakeMKV's emit-or-skip rule (it emits MSG:3002 per
+         VTS for every VTS_xx_0.VOB present on the disc).
     """
     if not probe.main_present:
         return
@@ -333,35 +343,70 @@ def _check_ifo_self_declared_size(dvd, title: int, *, is_vmg: bool,
             (f"Title {title}: BUP file size {probe.bup_size} differs from "
              f"main IFO size {probe.main_size}")))
 
-    # UDF physical-position check — MakeMKV's MSG:3002 source-of-truth.
-    if not is_vmg and probe.bup_present:
-        ifo_name = f"/VIDEO_TS/VTS_{title:02d}_0.IFO"
-        bup_name = f"/VIDEO_TS/VTS_{title:02d}_0.BUP"
-    else:
-        ifo_name = "/VIDEO_TS/VIDEO_TS.IFO"
-        bup_name = "/VIDEO_TS/VIDEO_TS.BUP"
+    # BUP byte-position check — mirror of FUN_007e46b0 lines 4920-4936.
+    # MakeMKV only emits MSG:3002 for VTSes (never VMG). On the corpus
+    # the captured emit pattern is:
+    #
+    #   ISO sources (UDF available): emit per-VTS whenever the UDF-based
+    #   BUP-position differs from the IFO-declared offset. Verified:
+    #     * DRAGONAUT_P2 / HARLOCK ISOs: 0 emits (LBA arithmetic matches)
+    #     * DRAGONAUT_JP ISO: 4 emits (all 4 VTSes have +16 / +64 sector
+    #       BUP shifts; menu VOB only on VTS 1 but MakeMKV still emits
+    #       for all 4 — so the menu-VOB gate is folder-only)
+    #
+    #   Folder sources (no UDF): emit per-VTS that has a menu VOB
+    #   (VTS_xx_0.VOB). The on-disc comparison cannot succeed without
+    #   UDF, but MakeMKV's check on folder rips fires whenever a menu
+    #   VOB is opened (the decomp's plVar17 degenerate-state check at
+    #   lines 4798-4803). Verified:
+    #     * ANGEL_S1D1: 2 emits (VTS 1+3 — both have menu VOB)
+    #     * FOREVER_KNIGHT: 8 emits (all 8 VTSes have menu VOBs)
+    #     * Великий Мерлин: 17 emits (all VTSes have menu VOBs)
+    #     * Condor Hero: 1 emit (single VTS, has menu VOB)
+    #     * TERRA_NOVA: 1 emit (only VTS 3 has menu VOB)
+    if is_vmg or not probe.main_present:
+        return
+
+    last_sec = mat.vts_last_sector
+    ifo_last = mat.vtsi_last_sector
+    expected_offset_sectors = last_sec - ifo_last
+    expected_offset_bytes = expected_offset_sectors << 11  # × 2048
+
+    ifo_name = f"/VIDEO_TS/VTS_{title:02d}_0.IFO"
+    bup_name = f"/VIDEO_TS/VTS_{title:02d}_0.BUP"
     try:
         ifo_udf = dr.udf_find_file(dvd, ifo_name)
         bup_udf = dr.udf_find_file(dvd, bup_name)
     except Exception:
         ifo_udf = bup_udf = None
+
     if ifo_udf is not None and bup_udf is not None:
+        # UDF / ISO path: compute the actual byte offset and compare.
+        # Menu VOB presence is NOT a gate here — MakeMKV emits per-VTS
+        # whenever the UDF-derived BUP offset differs from IFO-declared.
         ifo_lba, _ = ifo_udf
         bup_lba, _ = bup_udf
-        if is_vmg:
-            last_sec = mat.vmg_last_sector
-            ifo_last = mat.vmgi_last_sector
-        else:
-            last_sec = mat.vts_last_sector
-            ifo_last = mat.vtsi_last_sector
-        expected_bup_lba = ifo_lba + last_sec - ifo_last
-        if bup_lba != expected_bup_lba:
-            delta = bup_lba - expected_bup_lba
+        actual_offset_sectors = bup_lba - ifo_lba
+        actual_offset_bytes = actual_offset_sectors << 11
+        if expected_offset_bytes != actual_offset_bytes:
+            delta = actual_offset_bytes - expected_offset_bytes
             issues.append(IfoIssue(
                 "warn", "bup_offset_mismatch",
-                (f"Title {title}: BUP physical LBA {bup_lba} "
-                 f"differs from IFO-derived expected LBA "
-                 f"{expected_bup_lba} (delta={delta:+d})")))
+                (f"Title {title}: BUP byte offset {actual_offset_bytes} "
+                 f"(LBA {bup_lba}) differs from IFO-derived expected "
+                 f"offset {expected_offset_bytes} "
+                 f"(= {expected_offset_sectors} sectors); delta={delta:+d}")))
+    else:
+        # Folder path: no UDF layout to honor. MakeMKV's check fires
+        # iff the VTS has a menu VOB (gated by the decomp's plVar17
+        # non-degenerate-state check). Emit MSG:3002 to mirror.
+        if _has_menu_vob(dvd, title):
+            issues.append(IfoIssue(
+                "warn", "bup_offset_mismatch",
+                (f"Title {title}: folder source — IFO declares BUP byte "
+                 f"offset {expected_offset_bytes} "
+                 f"(= {expected_offset_sectors} sectors) but folder "
+                 f"layout cannot verify on-disc position")))
 
 
 def inspect_ifo_source(dvd, title: int, *, is_vmg: bool) -> IfoReport:
@@ -391,24 +436,36 @@ def inspect_ifo_source(dvd, title: int, *, is_vmg: bool) -> IfoReport:
                                   probe=probe, issues=issues)
 
     # Emit MakeMKV-equivalent MSG codes for the issues we detected.
+    # Dedup: MakeMKV emits at most one MSG:3002 per VTS regardless of how
+    # many sub-checks fire (the decomp emit-site at FUN_007e46b0 line 4935
+    # is a single FUN_00800d90(0xbba, ...) call gated by a single
+    # comparison; multiple issues in our IfoReport map to the same
+    # observable emit count).
+    #
     # MSG:3002 = "Calculated %s offset for VTS #%d does not match one
     #             in IFO header" — fires for bup_offset_mismatch AND
-    #             content-diverged issues (MakeMKV uses 3002 for any
-    #             main-vs-BUP discrepancy, whether by size/offset or
-    #             by content).
+    #             content-diverged issues. VTS-only; MakeMKV never
+    #             emits MSG:3002 for VMG (captured logs show no
+    #             "BUP","0" entry).
     # MSG:3003 = "Using BUP for VTS X" — when main is missing.
     # MSG:3042 = "IFO/BUP repair: %s — needs VOB scan" — only when
-    #             main IFO is corrupt and we'd fall back via VOB scan
-    #             (NOT for normal IFO/BUP content differences).
+    #             FUN_007e5680's audio-attr binsearch fails. Not emitted
+    #             from this path; deferred to Group H.
     from . import mkv_msg_log
+    emitted_3002 = False
+    emitted_3003 = False
     for issue in issues:
-        if issue.category in ("bup_offset_mismatch", "diverged"):
+        if (issue.category in ("bup_offset_mismatch", "diverged")
+                and not emitted_3002 and not is_vmg):
             mkv_msg_log.emit(3002, "BUP", title,
                               vts=title, severity=issue.severity,
                               reason=issue.message)
-        elif issue.category == "missing_main" and probe.bup_present:
+            emitted_3002 = True
+        elif (issue.category == "missing_main"
+                and probe.bup_present and not emitted_3003):
             mkv_msg_log.emit(3003, title,
                               vts=title, reason=issue.message)
+            emitted_3003 = True
 
     try:
         with dr.open_ifo(dvd, title) as ifo:

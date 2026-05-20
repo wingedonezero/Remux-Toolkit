@@ -384,10 +384,74 @@ def _to_gui_title(title: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Phantom-stream scan (lazy, per "added" title) — Group C
+# ---------------------------------------------------------------------------
+
+def _run_phantom_scan_for_title(dvd, title: dict) -> None:
+    """Mirror of FUN_006e3240's per-title placement of the stream-scan
+    orchestrator. Runs the IFO-vs-VOB phantom-stream filter on the
+    title's PGC, then mutates ``title["audio_streams"]`` to drop slots
+    that the VOB didn't deliver. Emits MSG:3034 per dropped slot.
+
+    Called only for titles that survived the silent-drop gate
+    (matches MakeMKV: stream scan runs post-init / post-cellwalk /
+    pre-MSG:3028). For silently-dropped titles the scan never runs,
+    so no MSG:3034 fires — matching MakeMKV's emit pattern.
+
+    Subtitle phantom detection is gathered for diagnostics but NOT
+    applied — DVD subs are sparse PES (one per signage card) and a
+    short scan window misses legit late-appearing subs. The full
+    diagnostic stays available via ``stream_presence`` directly.
+    """
+    from . import stream_presence as _sp
+    from . import mkv_msg_log
+
+    vts = title.get("vts")
+    pgc = title.get("pgc")
+    if not vts or not pgc:
+        return
+    n_audio = len(title.get("audio_streams", []))
+    n_sub = len(title.get("subtitle_streams", []))
+    if n_audio == 0 and n_sub == 0:
+        return
+    try:
+        rep = _sp.detect_phantom_streams(dvd, vts, pgc)
+    except Exception:
+        # Best-effort; leave the title's stream list as the IFO
+        # declared on scan failure (matches MakeMKV's fail-open behaviour
+        # in stream_scan_orchestrator's error paths).
+        return
+    title["stream_presence"] = _sp.report_to_dict(rep)
+    if not rep.missing_audio_indices:
+        return
+    # Filter declared audio streams down to those the VOB delivered.
+    active_audio = title.get("active_audio_slots") or list(range(n_audio))
+    a_missing = set(rep.missing_audio_indices)
+    kept_audio = []
+    dropped_slots: list[int] = []
+    for i, s in enumerate(title.get("audio_streams", [])):
+        slot = active_audio[i] if i < len(active_audio) else i
+        if slot in a_missing:
+            dropped_slots.append(slot)
+            continue
+        kept_audio.append(s)
+    title["audio_streams"] = kept_audio
+    title["phantoms_dropped"] = {
+        "audio": len(rep.missing_audio_indices),
+        "subtitle_diagnostic": len(rep.missing_subp_indices),
+    }
+    tid = title.get("title") or 0
+    for slot in dropped_slots:
+        mkv_msg_log.emit(3034, slot, tid,
+                          title=tid, vts=vts,
+                          reason="phantom-stream-filter")
+
+
+# ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
 
-def analyze(report: dict) -> dict:
+def analyze(report: dict, *, dvd_path: Optional[str] = None) -> dict:
     """Apply curation to an inspector report. Returns:
 
         {
@@ -404,8 +468,19 @@ def analyze(report: dict) -> dict:
               "compilations":   N,
           },
         }
+
+    When ``dvd_path`` is provided (or derivable from
+    ``report['source_path']``) the analyzer runs the phantom-stream
+    scan for each title that survives the silent-drop gate — mirroring
+    MakeMKV's ``FUN_006e3240`` stream_scan_orchestrator placement
+    (post-init, post-cellwalk, pre-MSG:3028-emit). Without a disc
+    handle the scan is skipped (audio counts then reflect the raw IFO
+    declaration, matching ``inspect_disc(filter_phantom_streams=False)``
+    pre-Group C behaviour).
     """
     from . import mkv_msg_log
+    from . import stream_presence as _sp
+    from ...bindings import libdvdread as _dr
 
     raw_titles = report.get("titles", [])
     title_sets = report.get("title_sets", [])
@@ -423,36 +498,59 @@ def analyze(report: dict) -> dict:
             "matching title_sets entry for each title's vts."
         )
 
-    # First pass: run the FUN_007ec6f0 port for each title. MSG:3009/
-    # 3010/3011/3012/3015/3016/3025/3026/3028/3040/3041 are emitted
-    # inside evaluate_title (and its callees) when the corresponding
-    # gate fires; we record the verdict + the GUI classification.
-    for t in raw_titles:
-        vts = vts_by_no.get(t.get("vts"), {}) or {}
-        verdict = _evaluate_title_for_analyzer(t, vts)
-        t["evaluator_verdict"] = verdict.classification
-        t["evaluator_msg_code"] = verdict.msg_code
-        t["evaluator_reason"] = verdict.reason
-        t["evaluator_trace"] = verdict.trace
-        if verdict.classification in ("fake_title", "silent",
-                                      "skipped_init", "skipped_nav",
-                                      "skipped_short"):
-            t["classification"] = "fake_title"
-            # Strip phantom-drop bookkeeping for silent titles —
-            # MakeMKV doesn't emit MSG:3034 for them.
-            t.pop("_phantom_audio_slots_dropped", None)
-        else:
-            t["classification"] = _classify_secondary(t)
-            # MSG:3034 — emit only for added titles (MakeMKV's
-            # behaviour). The inspector stages the dropped slots
-            # at ``_phantom_audio_slots_dropped``; we emit + clear.
-            dropped = t.pop("_phantom_audio_slots_dropped", None)
-            if dropped:
-                for slot in dropped:
-                    mkv_msg_log.emit(3034, slot, t.get("title") or 0,
-                                      title=t.get("title"),
-                                      vts=t.get("vts"),
-                                      reason="phantom-stream-filter")
+    # Resolve disc path for the phantom scan. Source priority:
+    #   1. Explicit ``dvd_path`` kwarg.
+    #   2. ``report['source_path']`` (set by inspector).
+    # If neither is present / openable, the scan is skipped.
+    resolved_path = dvd_path or report.get("source_path") or ""
+
+    dvd_handle = None
+    if resolved_path:
+        try:
+            # ``open_disc`` is the context-manager wrapper around
+            # DVDOpen2 with the silent-logger callback. We can't
+            # ``with``-block it across the analyze loop body, so call
+            # the underlying open directly and close in the ``finally``.
+            import ctypes as _ctypes
+            dvd_handle = _dr._lib.DVDOpen2(
+                None, _ctypes.byref(_dr._SILENT_LOGGER),
+                resolved_path.encode("utf-8"),
+            )
+            if not dvd_handle:
+                dvd_handle = None
+        except Exception:
+            dvd_handle = None
+
+    try:
+        # First pass: run the FUN_007ec6f0 port for each title. MSG:3009/
+        # 3010/3011/3012/3015/3016/3025/3026/3028/3040/3041 are emitted
+        # inside evaluate_title (and its callees) when the corresponding
+        # gate fires; we record the verdict + the GUI classification.
+        for t in raw_titles:
+            vts = vts_by_no.get(t.get("vts"), {}) or {}
+            verdict = _evaluate_title_for_analyzer(t, vts)
+            t["evaluator_verdict"] = verdict.classification
+            t["evaluator_msg_code"] = verdict.msg_code
+            t["evaluator_reason"] = verdict.reason
+            t["evaluator_trace"] = verdict.trace
+            if verdict.classification in ("fake_title", "silent",
+                                          "skipped_init", "skipped_nav",
+                                          "skipped_short"):
+                t["classification"] = "fake_title"
+                # MakeMKV doesn't run the stream scan for silently
+                # dropped titles (FUN_006e3240 only runs after the
+                # silent-drop gate passes). We mirror that — no scan,
+                # no MSG:3034.
+            else:
+                t["classification"] = _classify_secondary(t)
+                # MSG:3034 — phantom-stream scan. Only runs for titles
+                # that pass the silent-drop gate (matches MakeMKV's
+                # post-gate placement of FUN_006e3240).
+                if dvd_handle is not None:
+                    _run_phantom_scan_for_title(dvd_handle, t)
+    finally:
+        if dvd_handle is not None:
+            _dr._lib.DVDClose(dvd_handle)
 
     # Strict-equality dedup.
     dup_map = _find_strict_duplicates(raw_titles)
