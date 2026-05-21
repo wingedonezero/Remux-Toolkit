@@ -26,6 +26,7 @@ arbitrarily large titles — queues bound memory to ~64 frames per stream.
 """
 from __future__ import annotations
 
+import array
 import logging
 import queue
 import threading
@@ -38,8 +39,7 @@ from ...bindings import libdvdread as dr
 from ..demux.cell_reader import CellReader
 from ..demux.chapters import extract_chapters
 from ..demux.ps_walker import (
-    iter_es_payloads, iter_pes_in_sector, parse_lpcm_header, stream_key,
-    stream_kind, STREAM_MPEG_VIDEO, STREAM_PRIVATE_1,
+    iter_es_payloads, stream_key, stream_kind, STREAM_MPEG_VIDEO,
 )
 from ..demux.subpicture import (
     parse_subpic, build_vobsub_idx, DEFAULT_SUBPIC_DURATION_TICKS,
@@ -85,54 +85,6 @@ def _pgc_palette_bytes(pgc) -> bytes:
 
 
 _logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------
-# LPCM PES-header prescan (B2)
-# ---------------------------------------------------------------------
-
-def _prescan_lpcm_headers(
-    disc, title_num: int, vts_no: int, pgc_no: int,
-    lpcm_keys: set[tuple],
-    *, max_sectors: int = 1024,
-) -> dict[tuple, tuple[int, int, int]]:
-    """Walk up to ``max_sectors`` of a title's VOBs, looking for the first
-    LPCM PES per stream key. Returns ``{key: (sample_rate, bits, channels)}``
-    parsed from each PES's 6-byte private header.
-
-    Used to override the IFO-side ``audio_attr`` values on
-    ``_StreamPlan`` with the actual stream-on-the-wire parameters. The
-    IFO is the spec-defined index; the PES header is what the player
-    must decode against. They typically agree, but on malformed authoring
-    the PES is authoritative.
-
-    Keys absent from the return dict mean no LPCM PES was seen in the
-    scanned window (early bail).
-    """
-    if not lpcm_keys:
-        return {}
-    headers: dict[tuple, tuple[int, int, int]] = {}
-    remaining = set(lpcm_keys)
-    seen = 0
-    with CellReader(disc, title_num, vts_no=vts_no, pgc_no=pgc_no) as reader:
-        for cell, sector in reader.iter_sectors():
-            for pes in iter_pes_in_sector(sector):
-                if pes.stream_id != STREAM_PRIVATE_1 or not pes.payload:
-                    continue
-                substream_id = pes.payload[0]
-                if not (0xA0 <= substream_id <= 0xA7):
-                    continue
-                key = (STREAM_PRIVATE_1, substream_id)
-                if key not in remaining:
-                    continue
-                parsed = parse_lpcm_header(pes.payload)
-                if parsed is not None:
-                    headers[key] = parsed
-                    remaining.discard(key)
-            seen += 1
-            if not remaining or seen >= max_sectors:
-                break
-    return headers
 
 
 # ---------------------------------------------------------------------
@@ -192,16 +144,51 @@ class _PtsRebaser:
 
 
 def _codec_id_for(codec_name: str) -> str:
-    """Map our internal codec name → Matroska codec ID."""
+    """Map our internal codec name → Matroska codec ID.
+
+    LPCM note: DVD-Video LPCM is **big-endian** on the disc, so the
+    spec-correct Matroska codec_id is ``A_PCM/INT/BIG``. MakeMKV
+    nevertheless stores LPCM byte-swapped as ``A_PCM/INT/LIT``
+    (decoded audio is identical; container bytes differ). To match
+    MakeMKV's container bytes exactly, we use LIT here AND byte-swap
+    the samples in the producer before queueing — see
+    ``_lpcm_be_to_le``.
+    """
     return {
         "mpeg2video": "V_MPEG2",
         "ac3":        "A_AC3",
         "dts":        "A_DTS",
         "mp2":        "A_MPEG/L2",
         "mp1":        "A_MPEG/L2",
-        "lpcm":       "A_PCM/INT/BIG",
+        "lpcm":       "A_PCM/INT/LIT",
         "subpicture": "S_VOBSUB",
     }.get(codec_name, "")
+
+
+def _lpcm_be_to_le(data: bytes, *, bits_per_sample: int) -> bytes:
+    """Byte-swap DVD-Video LPCM samples from disc-original big-endian
+    to little-endian for storage as Matroska ``A_PCM/INT/LIT`` blocks.
+
+    Matches MakeMKV's storage convention. ``bits_per_sample`` is 16 or
+    24 in practice on DVD-Video; 20-bit LPCM (rare) is currently not
+    handled by the upstream stream-plan path.
+
+    Trailing bytes that don't form a complete sample (shouldn't happen
+    on well-authored discs) are passed through unswapped as a defensive
+    measure rather than dropped.
+    """
+    if bits_per_sample == 16:
+        pad = len(data) % 2
+        a = array.array("h", data[: len(data) - pad] if pad else data)
+        a.byteswap()
+        return a.tobytes() + (data[-pad:] if pad else b"")
+    if bits_per_sample == 24:
+        n = (len(data) // 3) * 3
+        ba = bytearray(data[:n])
+        for i in range(0, n, 3):
+            ba[i], ba[i + 2] = ba[i + 2], ba[i]
+        return bytes(ba) + data[n:]
+    return data
 
 
 # DVD-Video audio_attr.code_extension → human-readable suffix for the MKV
@@ -489,31 +476,6 @@ def open_dvd_title(
     first_pts = _prescan_first_pts(disc, title_num, vts_no, pgc_no, plan_keys)
     title_first_pts = min(first_pts.values()) if first_pts else 0
 
-    # B2: refine LPCM stream params from the PES-private header. The IFO's
-    # audio_attr declares sample_rate / quantization / channels too, but
-    # the PES header is what the player will actually decode against — on
-    # the rare malformed disc, prefer the stream over the index.
-    lpcm_keys = {p.key for p in plans if p.codec_name == "lpcm"}
-    if lpcm_keys:
-        lpcm_headers = _prescan_lpcm_headers(
-            disc, title_num, vts_no, pgc_no, lpcm_keys,
-        )
-        for plan in plans:
-            if plan.key not in lpcm_headers:
-                continue
-            sr, bits, ch = lpcm_headers[plan.key]
-            if (sr != plan.sample_rate or bits != plan.bits_per_sample
-                    or ch != plan.channels):
-                _logger.info(
-                    "LPCM key=%s: PES header (%d Hz / %d-bit / %d ch) "
-                    "differs from audio_attr (%d / %d / %d); using PES",
-                    plan.key, sr, bits, ch,
-                    plan.sample_rate, plan.bits_per_sample, plan.channels,
-                )
-            plan.sample_rate = sr
-            plan.bits_per_sample = bits
-            plan.channels = ch
-
     # Chapters → MkvChapterInfo.
     chapters_list = extract_chapters(disc, title_num, vts_no=vts_no, pgc_no=pgc_no)
     mkv_chapters: list[MkvChapterInfo] = []
@@ -777,8 +739,18 @@ def open_dvd_title(
                         # Audio — each PES is one self-contained chunk.
                         if payload.pts is None:
                             continue
+                        data = payload.es_bytes
+                        # LPCM: byte-swap from disc-original big-endian to
+                        # little-endian, matching MakeMKV's storage as
+                        # A_PCM/INT/LIT. Decoded audio is identical; this
+                        # is purely a container-byte convention.
+                        plan_obj = plan_for_key.get(key)
+                        if plan_obj is not None and plan_obj.codec_name == "lpcm":
+                            data = _lpcm_be_to_le(
+                                data, bits_per_sample=plan_obj.bits_per_sample,
+                            )
                         q.put(MkvChunk(
-                            data=payload.es_bytes,
+                            data=data,
                             timecode=rebaser.adjust(payload.pts),
                             duration=0,
                             flags=MkvChunkFlags.KEYFRAME,
