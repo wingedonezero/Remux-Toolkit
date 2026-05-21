@@ -227,6 +227,66 @@ def _split_private_stream_1(payload: bytes) -> tuple[Optional[int], bytes]:
     return (substream_id, payload[1:])
 
 
+# ---------------------------------------------------------------------------
+# DVD-Video LPCM private-stream-1 header parser (B2)
+# ---------------------------------------------------------------------------
+
+# DVD-Video LPCM sample-frequency code → Hz. Per DVD-Video Part 3 Annex A.
+_LPCM_FREQ_TABLE = (48000, 96000, 44100, 32000)
+
+# DVD-Video LPCM quantization code → bits-per-sample.
+# 0=16, 1=20, 2=24. Code 3 is reserved; we coerce to 16 as a conservative
+# fallback (16-bit is the default for DVD-Video LPCM).
+_LPCM_BITS_TABLE = (16, 20, 24, 16)
+
+
+def parse_lpcm_header(payload: bytes) -> Optional[tuple[int, int, int]]:
+    """Parse a DVD-Video LPCM private_stream_1 PES header.
+
+    The PES payload from ``iter_pes_in_sector`` starts with the
+    substream_id at offset 0, followed by the 6-byte LPCM-private header,
+    then the raw big-endian PCM samples.
+
+    Layout (per DVD-Video Part 3 §A.2.4.2):
+
+      [0]   substream_id (0xA0-0xA7)
+      [1]   LPCM-frame-counter within this PES (low byte)
+      [2]   first access unit pointer (offset to first complete
+            LPCM frame, in stream bytes)
+      [3]   audio_info_byte_1:
+              bit 7      emphasis flag
+              bit 6      mute flag
+              bit 5      reserved
+              bit 4      frame-counter high bit
+              bits 3-2   quantization (00=16, 01=20, 10=24)
+              bits 1-0   sample_freq  (00=48k, 01=96k, 10=44.1k, 11=32k)
+      [4]   audio_info_byte_2:
+              bits 7-3   reserved
+              bits 2-0   number_of_channels minus one
+      [5]   dynamic range coefficient
+      [6]   reserved
+      [7..] raw big-endian PCM samples
+
+    Returns ``(sample_rate_hz, bits_per_sample, channels)`` or ``None`` if
+    the payload is too short or the substream_id isn't an LPCM id.
+
+    Note: DVD-Video LPCM is always **big-endian**. The Matroska codec_id
+    for the resulting track must be ``A_PCM/INT/BIG`` (not ``LIT``);
+    ``core.mux.dvd_frame_source._codec_id_for`` already handles this.
+    """
+    if len(payload) < 7:
+        return None
+    substream_id = payload[0]
+    if not (0xA0 <= substream_id <= 0xA7):
+        return None
+    audio_info_1 = payload[3]
+    audio_info_2 = payload[4]
+    sample_rate = _LPCM_FREQ_TABLE[audio_info_1 & 0x03]
+    bits_per_sample = _LPCM_BITS_TABLE[(audio_info_1 >> 2) & 0x03]
+    channels = (audio_info_2 & 0x07) + 1
+    return (sample_rate, bits_per_sample, channels)
+
+
 def iter_es_payloads(
     sectors: Iterator[tuple],  # (cell, sector_bytes) from CellReader
 ) -> Iterator[ESPayload]:

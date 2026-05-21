@@ -38,7 +38,8 @@ from ...bindings import libdvdread as dr
 from ..demux.cell_reader import CellReader
 from ..demux.chapters import extract_chapters
 from ..demux.ps_walker import (
-    iter_es_payloads, stream_key, stream_kind, STREAM_MPEG_VIDEO,
+    iter_es_payloads, iter_pes_in_sector, parse_lpcm_header, stream_key,
+    stream_kind, STREAM_MPEG_VIDEO, STREAM_PRIVATE_1,
 )
 from ..demux.subpicture import (
     parse_subpic, build_vobsub_idx, DEFAULT_SUBPIC_DURATION_TICKS,
@@ -84,6 +85,54 @@ def _pgc_palette_bytes(pgc) -> bytes:
 
 
 _logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------
+# LPCM PES-header prescan (B2)
+# ---------------------------------------------------------------------
+
+def _prescan_lpcm_headers(
+    disc, title_num: int, vts_no: int, pgc_no: int,
+    lpcm_keys: set[tuple],
+    *, max_sectors: int = 1024,
+) -> dict[tuple, tuple[int, int, int]]:
+    """Walk up to ``max_sectors`` of a title's VOBs, looking for the first
+    LPCM PES per stream key. Returns ``{key: (sample_rate, bits, channels)}``
+    parsed from each PES's 6-byte private header.
+
+    Used to override the IFO-side ``audio_attr`` values on
+    ``_StreamPlan`` with the actual stream-on-the-wire parameters. The
+    IFO is the spec-defined index; the PES header is what the player
+    must decode against. They typically agree, but on malformed authoring
+    the PES is authoritative.
+
+    Keys absent from the return dict mean no LPCM PES was seen in the
+    scanned window (early bail).
+    """
+    if not lpcm_keys:
+        return {}
+    headers: dict[tuple, tuple[int, int, int]] = {}
+    remaining = set(lpcm_keys)
+    seen = 0
+    with CellReader(disc, title_num, vts_no=vts_no, pgc_no=pgc_no) as reader:
+        for cell, sector in reader.iter_sectors():
+            for pes in iter_pes_in_sector(sector):
+                if pes.stream_id != STREAM_PRIVATE_1 or not pes.payload:
+                    continue
+                substream_id = pes.payload[0]
+                if not (0xA0 <= substream_id <= 0xA7):
+                    continue
+                key = (STREAM_PRIVATE_1, substream_id)
+                if key not in remaining:
+                    continue
+                parsed = parse_lpcm_header(pes.payload)
+                if parsed is not None:
+                    headers[key] = parsed
+                    remaining.discard(key)
+            seen += 1
+            if not remaining or seen >= max_sectors:
+                break
+    return headers
 
 
 # ---------------------------------------------------------------------
@@ -439,6 +488,31 @@ def open_dvd_title(
     plan_keys = {p.key for p in plans}
     first_pts = _prescan_first_pts(disc, title_num, vts_no, pgc_no, plan_keys)
     title_first_pts = min(first_pts.values()) if first_pts else 0
+
+    # B2: refine LPCM stream params from the PES-private header. The IFO's
+    # audio_attr declares sample_rate / quantization / channels too, but
+    # the PES header is what the player will actually decode against — on
+    # the rare malformed disc, prefer the stream over the index.
+    lpcm_keys = {p.key for p in plans if p.codec_name == "lpcm"}
+    if lpcm_keys:
+        lpcm_headers = _prescan_lpcm_headers(
+            disc, title_num, vts_no, pgc_no, lpcm_keys,
+        )
+        for plan in plans:
+            if plan.key not in lpcm_headers:
+                continue
+            sr, bits, ch = lpcm_headers[plan.key]
+            if (sr != plan.sample_rate or bits != plan.bits_per_sample
+                    or ch != plan.channels):
+                _logger.info(
+                    "LPCM key=%s: PES header (%d Hz / %d-bit / %d ch) "
+                    "differs from audio_attr (%d / %d / %d); using PES",
+                    plan.key, sr, bits, ch,
+                    plan.sample_rate, plan.bits_per_sample, plan.channels,
+                )
+            plan.sample_rate = sr
+            plan.bits_per_sample = bits
+            plan.channels = ch
 
     # Chapters → MkvChapterInfo.
     chapters_list = extract_chapters(disc, title_num, vts_no=vts_no, pgc_no=pgc_no)
