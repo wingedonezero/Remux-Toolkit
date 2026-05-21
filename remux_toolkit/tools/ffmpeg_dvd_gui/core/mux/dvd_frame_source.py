@@ -522,7 +522,18 @@ def open_dvd_title(
         elif ti.type == MkvTrackType.AUDIO:
             is_first_audio = False
 
-        q: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+        # Queues are UNBOUNDED. A single producer thread pushes payloads
+        # to all per-stream queues serially, so any single bounded queue
+        # filling stalls the producer for every stream, not just the
+        # slow one — symptomatic of the LPCM hang on the orchestrator
+        # path (now fixed there too) and confirmed reproducible on
+        # multi-audio + subpicture titles (ANGEL T1: 4 AC3 + 4 subs).
+        # ``queue_maxsize`` is kept on the API for backward compatibility
+        # but no longer enforced. Memory cost is bounded by the title's
+        # total ES byte count, which stays in the low-GB range for any
+        # realistic DVD title.
+        q: queue.Queue = queue.Queue()
+        _ = queue_maxsize  # advisory only; see note above
         queues_by_key[plan.key] = q
         plan_for_key[plan.key] = plan
         sources.append(DvdFrameSource(q, ti))

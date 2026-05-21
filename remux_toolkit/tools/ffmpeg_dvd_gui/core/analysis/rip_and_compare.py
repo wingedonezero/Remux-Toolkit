@@ -171,8 +171,7 @@ def _summarize(report: dict, *, stdout=sys.stderr) -> tuple[int, int]:
             total += 1
             continue
         total += 1
-        # Only count video + audio; subtitles aren't hashed by fingerprint_mkv
-        if ours["codec_type"] not in ("video", "audio"):
+        if ours["codec_type"] not in ("video", "audio", "subtitle"):
             continue
         identical = row["all_identical"]
         marker = "OK" if identical else "DIFF"
@@ -186,10 +185,10 @@ def _summarize(report: dict, *, stdout=sys.stderr) -> tuple[int, int]:
             matched += 1
     print(file=stdout)
     if matched == total:
-        print(f"=== PASS — {matched}/{total} video/audio streams hash-match ===",
+        print(f"=== PASS — {matched}/{total} streams hash-match ===",
               file=stdout)
     else:
-        print(f"=== FAIL — {matched}/{total} video/audio streams hash-match ===",
+        print(f"=== FAIL — {matched}/{total} streams hash-match ===",
               file=stdout)
     return matched, total
 
