@@ -402,15 +402,22 @@ def cellwalk_primary(
             internal helpers need this for the time-match deciders.
         title_id / vts_no / pgc_no: optional, plumbed to MSG emissions.
         disc_skip_list_nonempty: from disc_state +0x130/+0x138.
-            Currently always False in our model (no write-sites
-            grep'd in the bulk decomp).
+            **Always False in the public binary** — Group F's
+            ``validate_disc_state_writers.py`` confirms zero writers
+            exist anywhere in disc_open_enumerate's depth-6 call tree
+            (including dev-key-gated paths). Kept as a kwarg for clarity
+            of intent and future dev-build compatibility.
         vts_state_skip_list_nonempty: from vts_state +0x1f8/+0x200.
-            Determines iVar29 = 1 (non-empty) vs 2 (empty) — feeds
-            the iVar30 decision in cellwalk's IF branch.
-        vts_has_audio / vts_pgc_count: feed the
-            ``approximate_run_vector_population`` fallback below.
-            FIXME(P1/task-E): when the full cellwalk_primary IF/ELSE
-            split is ported, these become unused.
+            **Always False in the public binary** for the same reason.
+            Determines iVar29 = 1 (non-empty) vs 2 (empty) — feeds the
+            iVar30 decision in cellwalk's IF branch.
+        vts_has_audio / vts_pgc_count: feed the "all deciders failed"
+            fallback below. The empirical edge they drive (1-PGC +
+            0-audio → degenerate run-vector entry → MSG:3026) is
+            observationally correct on the corpus; the actual MakeMKV
+            mechanism lives in the cellwalk's deeper run-vector
+            population (depth-4/5 helpers — Group F pivot is porting
+            those).
     """
     result = CellwalkResult()
 
@@ -428,19 +435,47 @@ def cellwalk_primary(
         result.trace = "structural-validator-failed"
         return result
 
-    # Step 2: the IF/ELSE split at decomp line 3870.
+    # Step 2: the IF/ELSE split at decomp lines 5305-5307 of full_decomp.md
+    # (cellwalk_primary @ 0x7f3eb0). The actual decomp condition is:
     #
-    #   if (param_1[0x1b] != 0           // init_validator set +0xd8
-    #       || disc_skip_list_non_empty
-    #       || FUN_007eb220(uVar22) == 0):  // structural_validator passed
-    #       enter IF branch — run trim deciders
+    #   if (param_1[0x1b] != 0                                  // (A)
+    #       || disc_state[+0x130] != disc_state[+0x138]          // (B)
+    #       || FUN_007eb220(uVar22) == 0):                       // (C)
+    #       enter IF branch — run trim deciders (iVar30 dispatch)
     #   else:
     #       enter ELSE branch — push every angle-block-validated cell
     #
-    # For our typical inputs (init_validator passed → param_1[0x1b] != 0),
-    # the IF branch is always taken. We hardcode that. The ELSE branch
-    # is unreachable in our model; documented for completeness.
-    enter_if_branch = True  # param_1[0x1b] != 0 always true after init
+    # In the public binary, after the F.4 no-writer finding:
+    #
+    #   (A) param_1[0x1b] is the byte at title_state +0xd8, written by
+    #       title_init_validator's binsearch over vts_state[+0x1f8/+0x200].
+    #       Vector is always empty → binsearch loop skipped → +0xd8 = 0.
+    #       So (A) is always False.
+    #
+    #   (B) disc_state[+0x130/+0x138] is the disc-skip-list vector. Also
+    #       always empty per F.4. So (B) is always False.
+    #
+    #   (C) FUN_007eb220 (structural_validator) returns 0 when the cell
+    #       list FAILS a sub-code check. Returns non-zero (1) when it
+    #       PASSES all sub-codes. So (C) = "structural_validator failed".
+    #
+    # The IF/ELSE condition therefore reduces to:
+    #   enter_if_branch ⇔ structural_validator failed (one of the
+    #                      sub-codes fired)
+    #
+    # The ELSE branch (decomp lines 3958-4106, structural-passes path):
+    # walks the cells, pushes each to the run vector. No trim. We model
+    # this by running the trim deciders and observing that they return
+    # (0, 0) when the cells are well-formed — same observable outcome.
+    #
+    # We early-returned at line 423 when structural_validator failed.
+    # So at this point structural_validator passed → MakeMKV takes ELSE
+    # branch → no trim. Our port still runs the trim deciders to capture
+    # the corpus-validated empirical-edge behaviour for the
+    # "authoring-fake VTS" case (1 PGC + 0 audio → degenerate run vector
+    # → MSG:3026). For all other cases the deciders return (0, 0) and
+    # no trim is applied — matching MakeMKV's ELSE branch.
+    enter_if_branch = True  # see comment block above
 
     if enter_if_branch:
         # IF branch (decomp lines 3873-3957). iVar30 selection:
@@ -526,45 +561,37 @@ def cellwalk_primary(
         # returning 0 makes title_evaluator emit MSG:3015 "navigation
         # error" and silently skip.
         #
-        # BUT — observation on the 10-disc corpus: MakeMKV does NOT
-        # emit MSG:3015 for any of our silent-drop cases (Jack T3/T4,
-        # TERRA T8, DRAGONAUT T2/6-40, etc.). It also doesn't emit
-        # MSG:3015 for the MSG:3026 cases (DRAGONAUT T5, ANGEL T6).
-        # That means MakeMKV's cellwalk does NOT fall to LAB_007f62db
-        # for any of these — it takes a different path that returns
-        # success with either an empty or degenerate-non-empty
-        # +0xe0/+0xe8 vector.
+        # Observation on the 10-disc corpus: MakeMKV does NOT emit
+        # MSG:3015 for any of our silent-drop cases (Jack T3/T4, TERRA
+        # T8, DRAGONAUT T2/6-40, etc.). It also doesn't emit MSG:3015
+        # for the MSG:3026 cases (DRAGONAUT T5, ANGEL T6). So MakeMKV's
+        # cellwalk does NOT fall to LAB_007f62db for any of these — it
+        # takes a different path that returns success with either an
+        # empty or degenerate-non-empty +0xe0/+0xe8 vector.
         #
-        # The mechanism: FUN_007f3eb0 lines 3870-3957 have a complex
-        # IF/ELSE structure gated by:
-        #   - param_1[0x1b] (set by init_validator's binary search
-        #     into vts_state[+0x1f8/+0x200] for the current title)
-        #   - vts_state[+0x130/+0x138] (a per-VTS skip-list)
-        #   - vts_state[+0x1f8/+0x200] (a per-VTS title-claim list)
+        # Earlier hypothesis (wrong): the divergent path was driven by
+        # disc-level state vectors vts_state[+0x130/+0x138] and
+        # [+0x1f8/+0x200], which we assumed disc_open_enumerate
+        # populated. Group F's depth-6 callgraph audit (see
+        # research/validate_disc_state_writers.py) proved no writers
+        # exist anywhere in the public binary's disc_open_enumerate
+        # tree. Both vectors are always empty.
         #
-        # Both +0x1f8/+0x200 and +0x130/+0x138 are populated by
-        # disc_open_enumerate (FUN_007d98d0, 28812 B — MASTER_MAP's
-        # "biggest single function in DVD pipeline", explicitly marked
-        # as "we use libdvdread, no need to port literally"). We don't
-        # replicate this disc-level state.
+        # So the real mechanism behind the divergent path lives in the
+        # cellwalk's deeper run-vector population — likely
+        # FUN_007f1d20 (range_iterate_helper) or FUN_007ead10
+        # (cell_test_helper). Porting those is the Group F pivot.
         #
-        # Inherent gap: the silent-vs-MSG:3026 discriminator depends
-        # on disc-level state populated by code we deliberately don't
-        # port. The empirical rule captures the OBSERVABLE behaviour
-        # MakeMKV produces on the corpus (10/10 match across 106
-        # decisions including MSG:3015):
+        # In the meantime, the empirical edge below stays. It captures
+        # the observable behaviour MakeMKV produces (10/10 corpus match
+        # across 106 decisions including MSG:3015):
         #
-        #   VTS has 1 PGC + 0 audio → MakeMKV's disc_open_enumerate
-        #     marks this as an "authoring-fake VTS" via the
-        #     vts_state[+0x130/+0x138] skip-list (one of the writers
-        #     we don't model). title_evaluator's cellwalk takes a path
-        #     that leaves +0xe0/+0xe8 non-empty with a degenerate
-        #     zero-length entry → FUN_007f3e30 returns 1 → MSG:3026.
+        #   VTS has 1 PGC + 0 audio → degenerate run-vector entry →
+        #     FUN_007f3e30 returns 1 → MSG:3026 path.
         #
-        #   Otherwise → cellwalk returns success with empty
-        #     +0xe0/+0xe8 → method[0x10]=0 + FUN_007f3e30=0 →
-        #     title_evaluator's proceed gate fails → silent skip
-        #     (LAB_007ecc0c debug print only, no user-visible MSG).
+        #   Otherwise → empty run vector → method[0x10]=0 +
+        #     FUN_007f3e30=0 → title_evaluator's proceed gate fails →
+        #     silent skip (LAB_007ecc0c debug print only).
         if vts_pgc_count == 1 and not vts_has_audio:
             # Authoring-fake VTS — emit degenerate entry.
             result.run_vector_nonempty = True
@@ -574,9 +601,10 @@ def cellwalk_primary(
             result.ok = True
             result.decider_used = "authoring-fake-vts"
             result.trace = (
-                "all-deciders-failed + 1-pgc + 0-audio → cellwalk "
-                "approximation: leave degenerate run-vector entry "
-                "(FIXME P1/task-E: needs FUN_007eb220 port)")
+                "all-deciders-failed + 1-pgc + 0-audio → degenerate "
+                "run-vector entry (empirical edge; Group F pivot will "
+                "trace the real mechanism via FUN_007f1d20 / "
+                "FUN_007ead10)")
             return result
 
         # Normal silent path: cellwalk succeeds with empty vector.

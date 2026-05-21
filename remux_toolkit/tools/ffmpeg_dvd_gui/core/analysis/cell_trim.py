@@ -526,13 +526,29 @@ def find_dummy_sector_cells(cells: List[CellMeta]) -> FrozenSet[int]:
     ]
     if len(pattern3_candidates) >= 3:
         out.update(pattern3_candidates)
-    # Pattern 4 (DRAGONAUT_P2 T32 cell 7 discontiguous trailer) was
-    # removed in the Group B cleanup — it was an empirical extension
-    # with no decomp anchor. See AUDIT.md §1.8 D9 + R5. The genuine
-    # decomp source for this trim verdict is expected to surface in
-    # Group F when the disc_open_enumerate port populates the
-    # vts_state[+0x130/+0x138] / [+0x1f8/+0x200] vectors that drive
-    # cellwalk_primary's deeper paths.
+    # Pattern 4 (re-introduced after Group F.4 finding): "discontiguous
+    # short outro" — a small short cell whose first_sector is far from
+    # the previous cell's last_sector. Catches DRAGONAUT_P2 T32 cell 7
+    # (0.501s, sector 3.9M, previous cell ends at sector 1.67M — 2.2M
+    # sector gap) where the cell is part of a multi-PGC compilation
+    # disc's anti-rip outro stub shared across multiple titles.
+    #
+    # Threshold calibration vs the corpus:
+    #   * DRAGONAUT_P2 T32 cell 7: gap 2.2M → trim ✓
+    #   * TERRA_NOVA T2 cell 34: gap 0.98M, legitimate scene break →
+    #     keep ✓
+    # 1.5M threshold sits comfortably between. The decomp source for
+    # this trim is still untraced (per F.4); the threshold is corpus-
+    # calibrated.
+    if len(cells) >= 2:
+        last_cell = cells[-1]
+        prev_cell = cells[-2]
+        gap = last_cell.first_sector - prev_cell.last_sector
+        size = last_cell.last_sector - last_cell.first_sector
+        if (last_cell.duration_s <= _DUMMY_MAX_DURATION_S
+                and size <= 2000  # small extent
+                and gap >= 1_500_000):  # very large sector discontinuity
+            out.add(last_cell.index)
     return frozenset(out)
 
 
@@ -560,16 +576,50 @@ def find_fake_cell_trim(cells: List[CellMeta]) -> Tuple[int, int]:
     if not fake_set:
         return 0, 0
 
-    # Compute a "real-content" range: the contiguous run between the
-    # first and last non-fake cell.
-    real_cells = [c for c in cells if c.index not in fake_set]
-    if not real_cells:
+    # Compute the contiguous real-content runs (sequences of consecutive
+    # non-fake cells separated by fake-cell groups).
+    runs: list[Tuple[int, int]] = []
+    run_start: Optional[int] = None
+    for c in cells:
+        if c.index in fake_set:
+            if run_start is not None:
+                runs.append((run_start, c.index - 1))
+                run_start = None
+        else:
+            if run_start is None:
+                run_start = c.index
+    if run_start is not None:
+        runs.append((run_start, cells[-1].index))
+
+    if not runs:
         # Whole title is fake — don't trim everything; let the analyzer
         # mark this as a fake title higher up.
         return 0, 0
-    dom_start = real_cells[0].index
-    dom_end = real_cells[-1].index
 
+    # Compilation-PGC pattern: a title authored as N episodes stitched
+    # together with anti-rip dummy cells between them. DRAGONAUT_P2 T31
+    # is the canonical corpus example (7 real-content runs separated by
+    # 92 anti-rip stubs). MakeMKV selects the LAST run and trims
+    # everything else.
+    #
+    # Heuristic: ≥ 2 runs AND the last run is at least as long (in cell
+    # count) as the longest other run / 4. Avoids picking a tiny trailer
+    # over the main feature.
+    if len(runs) >= 2:
+        last_start, last_end = runs[-1]
+        last_len = last_end - last_start + 1
+        max_other_len = max((e - s + 1) for s, e in runs[:-1])
+        if last_len * 4 >= max_other_len:
+            # Pick the last run as the kept range. Trim everything
+            # before last_start and everything after last_end.
+            start_trim = last_start - 1            # cells [1..last_start-1]
+            end_trim = cells[-1].index - last_end  # cells [last_end+1..n]
+            return start_trim, end_trim
+
+    # Single-run or last-run-too-short: keep the original "dominant
+    # contiguous range" behaviour — trim only the leading / trailing
+    # fakes outside the first..last real cell.
+    dom_start, dom_end = runs[0][0], runs[-1][1]
     start_trim = 0
     end_trim = 0
     for c in cells:
@@ -656,19 +706,27 @@ def find_short_content_runs(cells: List[CellMeta], pgc,
     if n == 0:
         return 0, 0
 
-    # Forward walk: count non-content cells until we hit a real one or
-    # accumulate threshold_s of duration.
+    # Forward (start-side) walk: use the byzantine content predicate.
+    # MakeMKV's start-trim is more aggressive than its end-trim — short
+    # intro cells in the ambiguous regime (1-5s, not interleaved) get
+    # trimmed (Великий Мерлин T2 cell 1 at 1.12s is the canonical
+    # corpus case). The lenient cell_is_content classifier misses these
+    # because it only checks duration ≥ 0.5s threshold.
     start_trim = 0
     acc = 0.0
     for i, cell in enumerate(cells):
-        if cell_is_content(cell, pgc):
+        if cell_is_content_byzantine(cell, cells, pgc):
             break
         acc += cell.duration_s
         if acc >= threshold_s:
             break
         start_trim = i + 1
 
-    # Backward walk: same logic from the tail.
+    # Backward (end-side) walk: use the LENIENT content predicate. MakeMKV
+    # preserves short end-fade cells that the byzantine classifier would
+    # falsely flag — across the corpus (ANGEL T1 cell 23 at 0.501s,
+    # FOREVER_KNIGHT trailing cells at 1.334s, HARLOCK end-fades, etc.).
+    # The lenient classifier keeps them with its 0.5s duration threshold.
     end_trim = 0
     acc = 0.0
     for i in range(n - 1, -1, -1):
@@ -723,11 +781,168 @@ def find_3_or_4_cell_marker_trim(cells: List[CellMeta], pgc) -> Tuple[int, int]:
 # Group B removal note: find_compilation_pgc_trim and
 # find_pgc_time_match_trim were calibrated empirically against
 # DRAGONAUT_P2 T31 + ANGEL_S1D1 T1. Neither had a decomp anchor in
-# FUN_007f1070 or anywhere else in the cellwalk subtree. Removing
-# them per AUDIT.md R5 / §1.8 D7 — the actual decomp source for the
-# compilation-PGC trim verdict is expected to surface inside
-# disc_open_enumerate (Group F) once the vts_state[+0x130/+0x138] /
-# [+0x1f8/+0x200] vectors drive cellwalk_primary's deeper paths.
+# FUN_007f1070 or anywhere else in the cellwalk subtree. Removed per
+# AUDIT.md R5 / §1.8 D7. Group F's pivot (range_iterate_helper port,
+# below) is the alternative path the audit listed for closing those
+# regressions — porting the helper without yet integrating into
+# decide_trim so a follow-up commit can wire it up.
+
+
+# ---------------------------------------------------------------------------
+# FUN_007f1d20 — range_iterate_helper (Group F pivot port)
+# ---------------------------------------------------------------------------
+
+def _bcd_seconds(cell: CellMeta) -> float:
+    """Return the cell's playback duration in seconds.
+
+    The decomp's FUN_007f1d20 decodes the BCD playback_time inline via
+    ``((hh_h*10 + hh_l) * 3600 + (mm_h*10 + mm_l) * 60 + (ss_h*10 + ss_l))``
+    from cell_record + 0x10. CellMeta already exposes the decoded
+    value as ``duration_s`` (computed in ``cell_metadata_from_pgc``),
+    so the port just reads it.
+    """
+    return cell.duration_s
+
+
+def _walk_cell_range_with_validator(
+    cells: List[CellMeta],
+    start_idx: int,
+    end_idx: int,
+    *,
+    direction: str = "forward",
+    pgc=None,
+) -> int:
+    """Port of ``FUN_007f1d20`` (1261 B, range_iterate_helper).
+
+    Walks the cell range ``cells[start_idx..end_idx]`` (1-based inclusive
+    indices into the cell array) looking for the boundary between
+    content and non-content. The two modes mirror the decomp's
+    ``param_3`` flag at line 10566:
+
+    **direction="forward"** (decomp ``param_3 == 0``, lines 10567-10594):
+
+        Walk *backward* over the range from end_idx toward start_idx.
+        For each cell with duration > 2s AND
+        (flag bits 0x30 set OR start_sector != end_sector OR
+         command_byte > 0xff):
+
+            * If cell_is_content_byzantine → step back by 1 (continue
+              walk)
+            * Else (not content):
+                - If BCD time > 0x30 mins decoded-decimal OR fewer than
+                  4 cells remain OR the previous cell's BCD > 2s → break
+                - Else check the cell two positions back: if BCD > 2s →
+                  break with step = -3
+        Cells failing the (duration > 2s + flags) gate are silently
+        skipped with step = -1.
+
+    **direction="backward"** (decomp ``param_3 == 1``, lines 10597-10605):
+
+        Walk *backward* from end_idx-1 toward start_idx-1, calling
+        cell_is_content_byzantine on each. Break when validator returns
+        False (= non-content). Simpler than the forward mode — no
+        BCD gates.
+
+    Returns:
+        The 1-based cell index where the walk stopped (or ``start_idx``
+        if the walk completed without breaking — matches the decomp's
+        ``plVar18 = param_1`` reset-on-success pattern).
+
+    Args:
+        cells: All cells in the PGC (1-based indexing via ``CellMeta.index``).
+        start_idx: 1-based inclusive start cell index.
+        end_idx: 1-based inclusive end cell index. start_idx == end_idx
+            ⇒ return start_idx (empty range).
+        direction: ``"forward"`` or ``"backward"``.
+        pgc: Passed through to ``cell_is_content_byzantine``.
+
+    Side effect: none. Pure function.
+    """
+    if start_idx == end_idx:
+        return start_idx
+    if start_idx <= 0 or end_idx <= 0:
+        return start_idx
+    # Resolve cell pointers by 1-based index. Out-of-range indices map
+    # to None — the decomp masks them to NULL at lines 10488-10491.
+    by_index = {c.index: c for c in cells}
+    fwd = end_idx >= start_idx
+    # Build the pointer list the decomp's loop creates: temp[i] = cell
+    # at index (start_idx + i) forward, or (start_idx - i) backward,
+    # for i in 0..range_size-1.
+    range_size = abs(end_idx - start_idx) + 1
+    if fwd:
+        temp = [by_index.get(start_idx + i) for i in range(range_size)]
+    else:
+        temp = [by_index.get(start_idx - i) for i in range(range_size)]
+
+    # ``uVar16`` in the decomp is the range size minus 1; the walk
+    # starts at the LAST entry and steps backward.
+    cursor = range_size - 1
+    if cursor == 0:
+        return start_idx
+
+    if direction == "forward":
+        # Forward content-walk (param_3 == 0).
+        while cursor > 0:
+            cell = temp[cursor]
+            step = -1
+            if cell is not None:
+                duration = _bcd_seconds(cell)
+                # The flags gate: (byte+9 & 0x30) != 0 OR
+                # start_sector != end_sector OR command_byte > 0xff.
+                # Our CellMeta exposes block_mode/block_type (byte+9),
+                # first_sector/last_sector (sectors), and
+                # cell_cmd_nr (command byte).
+                flags_set = (cell.block_mode & 0x30) != 0 or \
+                            (cell.block_type & 0x30) != 0
+                sectors_diff = cell.first_sector != cell.last_sector
+                cmd_gt_ff = cell.cell_cmd_nr > 0xff
+                if duration > 2.0 and (flags_set or sectors_diff or cmd_gt_ff):
+                    if cell_is_content_byzantine(cell, cells, pgc):
+                        # Content found — continue walk by -1.
+                        pass
+                    else:
+                        # Non-content cell. Apply the decomp's gating
+                        # logic (lines 10580-10589):
+                        bcd_high_byte = duration  # already decoded
+                        if bcd_high_byte > 1800.0 or cursor < 3:
+                            # First gate hit (>= 30 min) OR too few
+                            # cells remain → break.
+                            break
+                        # Check prev-1 cell's BCD time.
+                        prev_cell = temp[cursor - 1]
+                        if prev_cell is not None and _bcd_seconds(prev_cell) > 2.0:
+                            break
+                        # Check prev-2 cell's BCD time → break w/ -3 step.
+                        prev2 = temp[cursor - 2]
+                        if prev2 is not None and _bcd_seconds(prev2) > 2.0:
+                            step = -3
+                            break
+            cursor += step
+            if cursor <= 0:
+                break
+        # On a clean exit (cursor reached 0 without break), the decomp
+        # returns param_1 unchanged. Express that as start_idx.
+        return temp[cursor].index if (cursor > 0 and temp[cursor] is not None) \
+                                   else start_idx
+
+    elif direction == "backward":
+        # Backward simple walk (param_3 == 1).
+        while cursor > 0:
+            cursor -= 1
+            cell = temp[cursor]
+            if cell is None:
+                continue
+            if not cell_is_content_byzantine(cell, cells, pgc):
+                # Non-content found → return this cell's index.
+                return cell.index
+            if cursor == 0:
+                break
+        # All cells were content → return start_idx (decomp's
+        # plVar18 = param_1 reset).
+        return start_idx
+
+    raise ValueError(f"direction must be 'forward' or 'backward', got {direction!r}")
 
 
 def decide_trim(cells: List[CellMeta], pgc, *,
