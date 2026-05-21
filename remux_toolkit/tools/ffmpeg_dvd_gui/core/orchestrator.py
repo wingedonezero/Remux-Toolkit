@@ -557,6 +557,24 @@ def _build_ffmpeg_cmd(ffmpeg_bin: str, output: Path,
 
     cmd += ["-c", "copy"]
 
+    # MakeMKV compatibility: LPCM is byte-swapped to little-endian for
+    # storage in Matroska as A_PCM/INT/LIT (despite DVD-Video LPCM being
+    # natively big-endian per spec). To match MakeMKV's container bytes
+    # exactly, override `-c copy` for LPCM streams to transcode from the
+    # disc-original pcm_s{N}be (declared via -f s{N}be on input) to
+    # pcm_s{N}le on output. The byte-swap is the only operation, no
+    # quality impact.
+    a_idx = 0
+    for i, p in enumerate(pipes):
+        if p.plan.is_video:
+            continue
+        if p.plan.codec_name == "dvd_subtitle":
+            continue
+        if p.plan.codec_name == "lpcm":
+            target = "pcm_s24le" if p.plan.bits_per_sample == 24 else "pcm_s16le"
+            cmd += [f"-c:a:{a_idx}", target]
+        a_idx += 1
+
     if opts.write_color_metadata:
         cmd += [
             "-color_primaries:v", color.primaries,
@@ -643,14 +661,21 @@ def rip_title(disc, title_num: int, output_path: Path,
     elif opts.include_subpictures and opts.log_callback:
         opts.log_callback("info", "subs requested but disc_source_path not supplied; skipping")
 
-    # Set up per-stream pipes
+    # Set up per-stream pipes. Queue is UNBOUNDED: a single producer
+    # pushes to all stream queues serially, so any single bounded queue
+    # filling (e.g., audio backed up because ffmpeg's video probe is
+    # buffering 5MB before it begins muxing) stalls the producer and
+    # starves the OTHER pipes too. This deadlocks LPCM-heavy titles
+    # where the audio stream is a large fraction of total bytes. With
+    # an unbounded queue, the producer never blocks; in practice the
+    # per-stream queues stay small once ffmpeg's mux is flowing.
     pipes: list[_PipeState] = []
     for plan in plans:
         r, w = os.pipe()
         os.set_inheritable(r, True)
         pipes.append(_PipeState(
             plan=plan, read_fd=r, write_fd=w,
-            q=queue.Queue(maxsize=128),
+            q=queue.Queue(),
         ))
 
     cmd = _build_ffmpeg_cmd(ffmpeg_bin, output_path, pipes, framerate,
