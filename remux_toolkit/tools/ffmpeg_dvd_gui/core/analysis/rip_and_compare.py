@@ -92,10 +92,13 @@ def rip_with_makemkv(disc: Path, mkv_title: int, output_dir: Path,
 def rip_with_ours(disc: Path, our_title: int, output_mkv: Path,
                   *, include_subs: bool = False,
                   stdout=sys.stderr) -> Path:
-    """Drive our native ``rip_title`` to rip one title."""
-    from ...bindings import libdvdread as dr
+    """Drive our native ``rip_title_native`` to rip one title.
+
+    Uses the MakeMKV-equivalent native pipeline (CellReader → ps_walker →
+    DvdFrameSource → MkvWriter → libmkv_shim). No ffmpeg subprocess.
+    """
     from .inspector import _resolve_disc_path
-    from ..orchestrator import RipOptions, rip_title
+    from ..native_rip import NativeRipOptions, rip_title_native
 
     src = _resolve_disc_path(disc)
     if src is None or isinstance(src, list):
@@ -104,23 +107,26 @@ def rip_with_ours(disc: Path, our_title: int, output_mkv: Path,
     def log(sev: str, line: str) -> None:
         print(f"[ours:{sev}] {line}", file=stdout)
 
-    opts = RipOptions(
+    opts = NativeRipOptions(
         include_subpictures=include_subs,
+        # CC merging happens post-rip via ccextractor + mkvmerge; turn off
+        # for the byte-compare harness so the post-pass doesn't alter the
+        # MKV (CC merging rewrites it).
+        include_closed_captions=False,
         write_chapters=True,
         log_callback=log,
     )
     output_mkv.parent.mkdir(parents=True, exist_ok=True)
     print(f"[ours] ripping title {our_title} → {output_mkv}", file=stdout)
     t0 = time.monotonic()
-    with dr.open_disc(str(src)) as disc_handle:
-        result = rip_title(disc_handle, our_title, output_mkv,
-                           options=opts, disc_source_path=str(src))
+    result = rip_title_native(
+        str(src), our_title, output_mkv, options=opts,
+        title_name=f"Title {our_title}",
+    )
     elapsed = time.monotonic() - t0
-    print(f"[ours] rc={result.ffmpeg_returncode} in {elapsed:.1f}s", file=stdout)
-    if result.ffmpeg_returncode != 0 or result.error:
-        raise RuntimeError(
-            f"native rip failed: rc={result.ffmpeg_returncode} err={result.error}"
-        )
+    print(f"[ours] success={result.success} in {elapsed:.1f}s", file=stdout)
+    if not result.success:
+        raise RuntimeError(f"native rip failed: {result.error_message}")
     return output_mkv
 
 
