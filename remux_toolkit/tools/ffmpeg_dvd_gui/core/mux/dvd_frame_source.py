@@ -95,6 +95,53 @@ def _pts_to_ns(pts_90khz: int) -> int:
     return (pts_90khz * 100_000) // 9
 
 
+# ---------------------------------------------------------------------
+# STC discontinuity rebasing
+# ---------------------------------------------------------------------
+
+@dataclass
+class _PtsRebaser:
+    """Maps raw PES PTSes to a monotonic output timeline, handling STC
+    resets at DVD-Video cell boundaries.
+
+    A DVD cell can declare ``stc_discontinuity=True``, meaning the System
+    Time Clock resets at the cell boundary. After such a reset, PTSes in
+    the new cell are anchored to a different master clock — naively
+    subtracting ``title_first_pts`` produces a garbage timestamp.
+
+    The fix: at each STC boundary, re-anchor on the new cell's first
+    PES PTS, and reset the cumulative-output-time to the sum of all prior
+    cells' (IFO-declared) durations. Within an STC era, the math reduces
+    to the pre-existing ``(raw - base)`` subtraction.
+
+    Single instance per producer, shared across streams: STC is a
+    PROGRAM STREAM-level clock, not per-stream, so a single rebaser keeps
+    inter-stream offsets (audio-video skew) preserved.
+    """
+    base_ticks: int                         # subtracted from raw PTS in current era
+    cumulative_ns: int = 0                  # added to (raw - base) ns post-conversion
+    pending_cumulative_ticks: Optional[int] = None  # queued by STC boundary; consumed
+                                                     # on the next PTS-bearing PES
+
+    def queue_rebase(self, cumulative_ticks_at_cell_start: int) -> None:
+        """Note that the next PTS-bearing PES will reopen the rebaser
+        anchored at the given cumulative-ticks position."""
+        self.pending_cumulative_ticks = cumulative_ticks_at_cell_start
+
+    def adjust(self, raw_pts_ticks: int) -> int:
+        """Map a raw PES PTS (90 kHz ticks) → output timecode (ns).
+
+        On the first call after ``queue_rebase``, the raw PTS becomes the
+        new era's base and the queued cumulative becomes the era's offset.
+        """
+        if self.pending_cumulative_ticks is not None:
+            self.base_ticks = raw_pts_ticks
+            self.cumulative_ns = _pts_to_ns(self.pending_cumulative_ticks)
+            self.pending_cumulative_ticks = None
+        rel_ticks = max(0, raw_pts_ticks - self.base_ticks)
+        return _pts_to_ns(rel_ticks) + self.cumulative_ns
+
+
 def _codec_id_for(codec_name: str) -> str:
     """Map our internal codec name → Matroska codec ID."""
     return {
@@ -522,9 +569,8 @@ def open_dvd_title(
             # Flush whatever was already pending (use this event's PTS
             # as the lookahead bound).
             _emit_sub(key, cur["pts"])
-            rel_pts = max(0, cur["pts"] - title_first_pts)
             pending_sub[key] = {
-                "timecode_ns": _pts_to_ns(rel_pts),
+                "timecode_ns": rebaser.adjust(cur["pts"]),
                 "data": ev.data,
                 "duration_ticks": ev.duration_ticks,
                 "pts": cur["pts"],
@@ -546,14 +592,24 @@ def open_dvd_title(
             ):
                 q.put(chunk)
 
+        # Always load cell metadata + raw STC flag table. Cell durations
+        # feed the STC-discontinuity rebase anchor; trim/angle filtering
+        # is computed in the same pass.
+        with dr.open_ifo(disc, vts_no) as _vts:
+            _pgc = _vts.contents.vts_pgcit.contents.pgci_srp[pgc_no - 1].pgc.contents
+            _total = int(_pgc.nr_of_cells)
+            _cells_meta = cell_metadata_from_pgc(_pgc)
+            # stc_discontinuity isn't a CellMeta field; read direct from
+            # the cell_playback array.
+            stc_disc_by_cell = {
+                i + 1: bool(_pgc.cell_playback[i].stc_discontinuity)
+                for i in range(_total)
+            }
+
         # Compute the cell_filter from trim + angle filters. None ↔
         # "include everything" (the CellReader default).
         cell_filter: Optional[set[int]] = None
         if (trim is not None and trim.any_trim) or angle != 1:
-            with dr.open_ifo(disc, vts_no) as _vts:
-                _pgc = _vts.contents.vts_pgcit.contents.pgci_srp[pgc_no - 1].pgc.contents
-                _total = int(_pgc.nr_of_cells)
-                _cells_meta = cell_metadata_from_pgc(_pgc)
             # Trim window first (defaults to all cells).
             if trim is not None and trim.any_trim:
                 lo = trim.start_trim + 1
@@ -567,9 +623,43 @@ def open_dvd_title(
             angle_set = cells_for_angle(_cells_meta, angle=angle)
             cell_filter = trim_set & angle_set if angle_set else trim_set
 
+        # Cumulative-duration anchor for STC-rebasing. Keyed by the
+        # 1-based cell index in playback order; the value is the number
+        # of 90 kHz ticks of (IFO-declared) duration consumed before this
+        # cell starts. Computed over the SET of cells we'll actually
+        # play (i.e., post-trim).
+        cells_by_index = {c.index: c for c in _cells_meta}
+        played_cells_in_order = sorted(
+            c.index for c in _cells_meta
+            if cell_filter is None or c.index in cell_filter
+        )
+        cumulative_ticks_at_cell_start: dict[int, int] = {}
+        _acc_ticks = 0
+        for _idx in played_cells_in_order:
+            cumulative_ticks_at_cell_start[_idx] = _acc_ticks
+            _acc_ticks += int(round(cells_by_index[_idx].duration_s * 90000))
+
+        # Single rebaser shared across streams. Initial state matches the
+        # pre-B1 behaviour: subtract title_first_pts, no cumulative offset.
+        # Crossing into an STC-discontinuity cell queues a rebase that
+        # the next PTS-bearing PES consumes.
+        rebaser = _PtsRebaser(base_ticks=title_first_pts, cumulative_ns=0)
+        last_seen_cell: Optional[int] = None
+
         try:
             with CellReader(disc, title_num, cell_filter=cell_filter) as cr:
                 for payload in iter_es_payloads(cr.iter_sectors()):
+                    # Track cell transitions for STC-discontinuity rebasing.
+                    # Done before the is_nav skip so VOBUs led by a NAV pack
+                    # still trigger the boundary queue.
+                    if payload.cell_index != last_seen_cell:
+                        if (last_seen_cell is not None
+                                and stc_disc_by_cell.get(payload.cell_index, False)):
+                            cum = cumulative_ticks_at_cell_start.get(payload.cell_index)
+                            if cum is not None:
+                                rebaser.queue_rebase(cum)
+                        last_seen_cell = payload.cell_index
+
                     if payload.is_nav:
                         continue
                     key = stream_key(payload.stream_id, payload.substream_id)
@@ -585,9 +675,8 @@ def open_dvd_title(
                         if payload.pts is not None:
                             # New picture group — flush prior, start new
                             _emit_pictures(key)
-                            rel_pts = max(0, payload.pts - title_first_pts)
                             group[key] = {
-                                "pts_ns": _pts_to_ns(rel_pts),
+                                "pts_ns": rebaser.adjust(payload.pts),
                                 "bufs": [payload.es_bytes],
                             }
                         else:
@@ -614,10 +703,9 @@ def open_dvd_title(
                         # Audio — each PES is one self-contained chunk.
                         if payload.pts is None:
                             continue
-                        rel_pts = max(0, payload.pts - title_first_pts)
                         q.put(MkvChunk(
                             data=payload.es_bytes,
-                            timecode=_pts_to_ns(rel_pts),
+                            timecode=rebaser.adjust(payload.pts),
                             duration=0,
                             flags=MkvChunkFlags.KEYFRAME,
                         ))
