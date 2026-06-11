@@ -2,9 +2,9 @@
 Native DVD title probe using libdvdread directly (via the ctypes binding
 under ../bindings/libdvdread.py) plus the Phase 2 analyzer brain.
 
-Drop-in for the existing `DVDProbeWorker` from info_probe.py — same class
-name, same Qt signal signature, same .probe(row, job) entry point — but
-faster, more deterministic, and decoupled from any FFmpeg dvdvideo bugs.
+Exposes `DVDProbeWorker` with the Qt signal signature and .probe(row, job)
+entry point the GUI expects. Probing is metadata-only and independent of
+the FFmpeg dvdvideo demuxer used for ripping.
 
 The pure-Python probe function `probe_disc()` is split out so it can be
 unit-tested without a Qt event loop.
