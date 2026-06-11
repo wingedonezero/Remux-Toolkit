@@ -26,6 +26,7 @@ arbitrarily large titles — queues bound memory to ~64 frames per stream.
 """
 from __future__ import annotations
 
+import array
 import logging
 import queue
 import threading
@@ -95,17 +96,70 @@ def _pts_to_ns(pts_90khz: int) -> int:
     return (pts_90khz * 100_000) // 9
 
 
+# STC discontinuity note: ``CellPlayback.stc_discontinuity`` is a 1-bit
+# flag in the IFO that, per the DVD-Video spec, says "the System Time
+# Clock resets at this cell boundary". In practice on commercial DVDs
+# (verified against MakeMKV's behaviour on ANGEL_S1D1 T1, which has 9
+# STC-flagged cells), the PES PTSes are continuous across these cell
+# boundaries — the flag is set for seamless-playback authoring hints,
+# not because the clock actually resets. MakeMKV trusts the raw PTSes
+# and never rebases on this flag; we do the same. A prior B1 commit
+# added an IFO-cell-duration-based rebaser, but the IFO duration is
+# BCD frame-precision (29.97 fps quantised) while the actual PTS gaps
+# are exact 90 kHz frame multiples, and the small drift compounded
+# across multiple flagged cells caused block re-ordering on extraction
+# and broke byte parity with MakeMKV. If/when a true STC-reset disc
+# enters the corpus, handling needs to detect the actual PTS reset
+# (large negative delta in raw PES PTS across the boundary) rather
+# than trust the flag.
+
+
 def _codec_id_for(codec_name: str) -> str:
-    """Map our internal codec name → Matroska codec ID."""
+    """Map our internal codec name → Matroska codec ID.
+
+    LPCM note: DVD-Video LPCM is **big-endian** on the disc, so the
+    spec-correct Matroska codec_id is ``A_PCM/INT/BIG``. MakeMKV
+    nevertheless stores LPCM byte-swapped as ``A_PCM/INT/LIT``
+    (decoded audio is identical; container bytes differ). To match
+    MakeMKV's container bytes exactly, we use LIT here AND byte-swap
+    the samples in the producer before queueing — see
+    ``_lpcm_be_to_le``.
+    """
     return {
         "mpeg2video": "V_MPEG2",
         "ac3":        "A_AC3",
         "dts":        "A_DTS",
         "mp2":        "A_MPEG/L2",
         "mp1":        "A_MPEG/L2",
-        "lpcm":       "A_PCM/INT/BIG",
+        "lpcm":       "A_PCM/INT/LIT",
         "subpicture": "S_VOBSUB",
     }.get(codec_name, "")
+
+
+def _lpcm_be_to_le(data: bytes, *, bits_per_sample: int) -> bytes:
+    """Byte-swap DVD-Video LPCM samples from disc-original big-endian
+    to little-endian for storage as Matroska ``A_PCM/INT/LIT`` blocks.
+
+    Matches MakeMKV's storage convention. ``bits_per_sample`` is 16 or
+    24 in practice on DVD-Video; 20-bit LPCM (rare) is currently not
+    handled by the upstream stream-plan path.
+
+    Trailing bytes that don't form a complete sample (shouldn't happen
+    on well-authored discs) are passed through unswapped as a defensive
+    measure rather than dropped.
+    """
+    if bits_per_sample == 16:
+        pad = len(data) % 2
+        a = array.array("h", data[: len(data) - pad] if pad else data)
+        a.byteswap()
+        return a.tobytes() + (data[-pad:] if pad else b"")
+    if bits_per_sample == 24:
+        n = (len(data) // 3) * 3
+        ba = bytearray(data[:n])
+        for i in range(0, n, 3):
+            ba[i], ba[i + 2] = ba[i + 2], ba[i]
+        return bytes(ba) + data[n:]
+    return data
 
 
 # DVD-Video audio_attr.code_extension → human-readable suffix for the MKV
@@ -439,7 +493,18 @@ def open_dvd_title(
         elif ti.type == MkvTrackType.AUDIO:
             is_first_audio = False
 
-        q: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+        # Queues are UNBOUNDED. A single producer thread pushes payloads
+        # to all per-stream queues serially, so any single bounded queue
+        # filling stalls the producer for every stream, not just the
+        # slow one — symptomatic of the LPCM hang on the orchestrator
+        # path (now fixed there too) and confirmed reproducible on
+        # multi-audio + subpicture titles (ANGEL T1: 4 AC3 + 4 subs).
+        # ``queue_maxsize`` is kept on the API for backward compatibility
+        # but no longer enforced. Memory cost is bounded by the title's
+        # total ES byte count, which stays in the low-GB range for any
+        # realistic DVD title.
+        q: queue.Queue = queue.Queue()
+        _ = queue_maxsize  # advisory only; see note above
         queues_by_key[plan.key] = q
         plan_for_key[plan.key] = plan
         sources.append(DvdFrameSource(q, ti))
@@ -547,23 +612,23 @@ def open_dvd_title(
                 q.put(chunk)
 
         # Compute the cell_filter from trim + angle filters. None ↔
-        # "include everything" (the CellReader default).
+        # "include everything" (the CellReader default). Cell metadata
+        # is loaded only when trim or non-default angle is requested;
+        # the producer otherwise needs no per-cell state because the
+        # PES PTSes themselves drive output timecodes (see STC note
+        # above ``_pts_to_ns``).
         cell_filter: Optional[set[int]] = None
         if (trim is not None and trim.any_trim) or angle != 1:
             with dr.open_ifo(disc, vts_no) as _vts:
                 _pgc = _vts.contents.vts_pgcit.contents.pgci_srp[pgc_no - 1].pgc.contents
                 _total = int(_pgc.nr_of_cells)
                 _cells_meta = cell_metadata_from_pgc(_pgc)
-            # Trim window first (defaults to all cells).
             if trim is not None and trim.any_trim:
                 lo = trim.start_trim + 1
                 hi = _total - trim.end_trim
                 trim_set = set(range(lo, hi + 1)) if hi >= lo else set()
             else:
                 trim_set = set(range(1, _total + 1))
-            # Then intersect with the selected angle (no-op for angle=1
-            # on single-angle PGCs since cells_for_angle returns every
-            # cell index in that case).
             angle_set = cells_for_angle(_cells_meta, angle=angle)
             cell_filter = trim_set & angle_set if angle_set else trim_set
 
@@ -614,9 +679,19 @@ def open_dvd_title(
                         # Audio — each PES is one self-contained chunk.
                         if payload.pts is None:
                             continue
+                        data = payload.es_bytes
+                        # LPCM: byte-swap from disc-original big-endian to
+                        # little-endian, matching MakeMKV's storage as
+                        # A_PCM/INT/LIT. Decoded audio is identical; this
+                        # is purely a container-byte convention.
+                        plan_obj = plan_for_key.get(key)
+                        if plan_obj is not None and plan_obj.codec_name == "lpcm":
+                            data = _lpcm_be_to_le(
+                                data, bits_per_sample=plan_obj.bits_per_sample,
+                            )
                         rel_pts = max(0, payload.pts - title_first_pts)
                         q.put(MkvChunk(
-                            data=payload.es_bytes,
+                            data=data,
                             timecode=_pts_to_ns(rel_pts),
                             duration=0,
                             flags=MkvChunkFlags.KEYFRAME,

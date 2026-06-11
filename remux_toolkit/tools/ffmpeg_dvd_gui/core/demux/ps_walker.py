@@ -39,8 +39,12 @@ is what the muxer will hand to ffmpeg.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Iterator, Optional
+
+
+_logger = logging.getLogger(__name__)
 
 
 PACK_START_CODE   = b"\x00\x00\x01\xBA"
@@ -200,6 +204,75 @@ class ESPayload:
                                     # stream output (substream header stripped)
 
 
+# AC3 frame sync word (big-endian).
+AC3_SYNC = b"\x0B\x77"
+# DTS CORE frame sync word (big-endian). DTS-HD and other extensions
+# have additional sync patterns; for our DVD-Video scope the core pattern
+# is what we expect.
+DTS_SYNC = b"\x7F\xFE\x80\x01"
+
+
+def _check_substream_sync(payload: bytes, substream_id: int) -> None:
+    """Defensive validator for AC3/DTS PES framing (B3).
+
+    The 4-byte private_stream_1 framing header in each AC3/DTS PES is::
+
+        payload[0]     substream_id (already at the front of ``payload``)
+        payload[1]     number_of_sync_frames (count of sync words starting
+                       in this PES; 0 means the PES is pure continuation)
+        payload[2..3]  first_access_unit_pointer (big-endian, 1-based byte
+                       offset from the byte after the FAUP word to the
+                       first sync word in this PES). 0 means no sync.
+
+    This function parses the framing header, reads the FAUP, and verifies
+    the expected sync word (``0x0B77`` AC3 / ``0x7FFE8001`` DTS) at the
+    declared offset within the post-header bytes. Logs a WARNING on
+    mismatch — does NOT modify the payload, since the decoder (ffmpeg in
+    the mux pipeline) is responsible for re-syncing across PES boundaries.
+
+    A WARNING here indicates one of:
+      * malformed PES authoring (rare),
+      * a dropped/zeroed sector in the input (CSS-protected reads),
+      * an off-by-one in our framing logic.
+
+    No-op for short payloads, non-AC3/DTS substream ids, or continuation-
+    only PESes (FAUP=0).
+    """
+    if len(payload) < 6:
+        return
+    num_frames = payload[1]
+    fau_pointer = (payload[2] << 8) | payload[3]
+    if num_frames == 0 or fau_pointer == 0:
+        # No sync word within this PES; bytes are mid-frame continuation.
+        return
+
+    if 0x80 <= substream_id <= 0x87:
+        expected, codec = AC3_SYNC, "AC3"
+    elif 0x88 <= substream_id <= 0x8F:
+        expected, codec = DTS_SYNC, "DTS"
+    else:
+        return
+
+    # FAUP is 1-based; subtract 1 to get the 0-based offset within
+    # ``payload[4:]`` (the post-framing-header bytes).
+    sync_offset = fau_pointer - 1
+    post_header = memoryview(payload)[4:]
+    if sync_offset + len(expected) > len(post_header):
+        # Payload too short to contain the declared sync. Not necessarily
+        # a bug — the sync could legitimately straddle a sector boundary
+        # truncated by ``iter_pes_in_sector``. Skip the check rather than
+        # log a false-positive.
+        return
+
+    actual = bytes(post_header[sync_offset:sync_offset + len(expected)])
+    if actual != expected:
+        _logger.warning(
+            "%s sync mismatch (substream 0x%02X): expected %s at "
+            "post-header offset %d, got %s",
+            codec, substream_id, expected.hex(), sync_offset, actual.hex(),
+        )
+
+
 def _split_private_stream_1(payload: bytes) -> tuple[Optional[int], bytes]:
     """For a private_stream_1 PES payload (AC3/DTS/LPCM/subpicture):
        byte 0       — substream_id
@@ -216,9 +289,11 @@ def _split_private_stream_1(payload: bytes) -> tuple[Optional[int], bytes]:
     if 0x80 <= substream_id <= 0x87:
         # AC3: substream_id + 3-byte framing header (frames in pack +
         # first-access-unit pointer)
+        _check_substream_sync(payload, substream_id)
         return (substream_id, payload[4:])
     if 0x88 <= substream_id <= 0x8F:
         # DTS: same 4-byte header as AC3
+        _check_substream_sync(payload, substream_id)
         return (substream_id, payload[4:])
     if 0xA0 <= substream_id <= 0xA7:
         # LPCM: 7-byte header (incl substream_id)

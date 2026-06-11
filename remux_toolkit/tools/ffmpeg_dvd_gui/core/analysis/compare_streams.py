@@ -83,15 +83,34 @@ def _ffprobe_json(mkv_path: Path, *, ffprobe_bin: str = "ffprobe") -> dict:
 
 
 def _ffmpeg_raw_format(codec_type: str, codec_name: str) -> Optional[str]:
-    """ffmpeg `-f` value for extracting this stream as raw ES."""
+    """ffmpeg `-f` value for extracting this stream as raw ES.
+
+    PCM codec_names in ffprobe (``pcm_s16le`` etc.) are NOT valid ffmpeg
+    output muxer names — the matching muxers are ``s16le`` / ``s16be`` /
+    ``s24le`` / ``s24be``. Map explicitly so the silent-failure of an
+    invalid ``-f`` doesn't masquerade as a SHA match on empty output.
+
+    DVD subpictures (``dvd_subtitle``) extract as raw binary via the
+    ``data`` muxer — the SPU bytes themselves are what we want to
+    compare across rips.
+    """
     if codec_type == "video":
-        # Most DVD video is mpeg2video; map to raw demuxers
         return {"mpeg2video": "mpeg2video", "mpegvideo": "mpegvideo",
                 "h264": "h264", "hevc": "hevc"}.get(codec_name, codec_name)
     if codec_type == "audio":
-        return codec_name  # "ac3", "dts", "mp2", "pcm_s16be" all work as -f
+        # PCM muxer names: strip the ``pcm_`` prefix.
+        if codec_name.startswith("pcm_"):
+            return codec_name[len("pcm_"):]
+        # Non-PCM compressed audio: ffmpeg's muxer name == codec_name
+        # (ac3, dts, mp2 all work).
+        return codec_name
     if codec_type == "subtitle":
-        return None  # subpictures are messy; skip for now
+        # Raw DVD subpicture binary; ``-c copy -f data -`` writes the
+        # subpic bytes directly. ``dvd_subtitle`` is ffprobe's codec
+        # name for ``S_VOBSUB``.
+        if codec_name == "dvd_subtitle":
+            return "data"
+        return None
     return None
 
 
@@ -167,7 +186,7 @@ def fingerprint_mkv(mkv_path: Path,
     streams: list[StreamFingerprint] = []
     for s in info.get("streams", []):
         codec_type = s.get("codec_type", "")
-        if codec_type not in ("video", "audio"):
+        if codec_type not in ("video", "audio", "subtitle"):
             continue
         codec_name = s.get("codec_name", "")
         raw_fmt = _ffmpeg_raw_format(codec_type, codec_name)
