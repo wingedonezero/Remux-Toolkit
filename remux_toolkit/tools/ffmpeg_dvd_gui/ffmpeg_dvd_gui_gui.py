@@ -18,10 +18,8 @@ from .ffmpeg_dvd_gui_config import DEFAULTS
 from .utils.paths import find_dvd_roots_with_structure, is_iso, get_dvd_input_path
 from .utils.ffmpeg_parser import duration_to_seconds, format_bytes_human
 from .models.job import Job
-from .core.info_probe import DVDProbeWorker as FFprobeDVDProbeWorker
-from .core.info_probe_native import DVDProbeWorker as NativeDVDProbeWorker
+from .core.info_probe_native import DVDProbeWorker
 from .core.remuxer import FFmpegDVDWorker
-from .core.native_rip_worker import NativeRipWorker
 from .gui.queue_tree import DropTree
 from .gui.details_panel import DetailsPanel
 from .gui.console_widget import FilterableConsole
@@ -111,21 +109,13 @@ class FFmpegDVDGUIWidget(QWidget):
         self.btn_stop.clicked.connect(self.stop_queue)
 
     def _setup_workers(self):
-        probe_cls = NativeDVDProbeWorker if self.settings.get("use_native_probe", True) else FFprobeDVDProbeWorker
-        self.probe_worker = probe_cls(self.settings)
+        self.probe_worker = DVDProbeWorker(self.settings)
         self.probe_thread = QThread(self)
         self.probe_worker.moveToThread(self.probe_thread)
         self.probe_worker.probed.connect(self._on_probed)
         self.probe_thread.start()
 
-        # Pick the rip backend: native (libmkv_shim) vs ffmpeg subprocess.
-        # The native backend is opt-in until cross-validated on the
-        # corpus; defaults to False so existing users see no behaviour
-        # change unless they toggle it in Settings.
-        worker_cls = (NativeRipWorker
-                      if self.settings.get("use_native_remux", False)
-                      else FFmpegDVDWorker)
-        self.worker = worker_cls(self.settings)
+        self.worker = FFmpegDVDWorker(self.settings)
         self.work_thread = QThread(self)
         self.worker.moveToThread(self.work_thread)
         self.worker.progress.connect(self.on_progress)
