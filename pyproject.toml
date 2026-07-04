@@ -17,12 +17,10 @@ dependencies = [
     "PyQt6>=6.8,<6.9",
 
     # Scientific Computing & Analysis
+    # (numba/llvmlite are not listed: nothing imports them directly, and
+    # librosa pulls the matching pair in automatically.)
     "numpy",
     "scipy",
-    # Unpinned: numba's own metadata requires the matching llvmlite series,
-    # so pip keeps the pair in lockstep automatically.
-    "numba",
-    "llvmlite",
 
     # Media processing
     "opencv-python",
@@ -40,20 +38,18 @@ dependencies = [
     "av==16.1.0",
     "matplotlib",
 
-    # GPU-accelerated correlation + neural frame matching
+    # GPU-accelerated correlation + DCT frame matching (sliding_matcher).
     # ROCm/CUDA builds are installed via the setup GUI (GPU / PyTorch action);
     # the updater routes torch upgrades through the matching wheel index so a
     # plain PyPI upgrade never replaces the ROCm build with a CUDA one.
     "torch",
-    "torchaudio",
-    "isc-feature-extractor",  # ISC neural frame matching (Meta ISC21 model)
 
-    # Frame-accurate video access
+    # Frame-accurate video access (core.ffms2.Source & friends come from the
+    # system VapourSynth plugins, not pip).
     # Pinned: must match the Debian system VapourSynth core (R73). Newer pip
     # bindings ship their own core, which does not load the system plugin dir
     # (ffms2/bwdif/vivtc). Bump only together with the system package.
     "VapourSynth==73",
-    "scikit-image",
 ]
 
 [project.optional-dependencies]

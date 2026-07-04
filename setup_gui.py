@@ -872,7 +872,6 @@ class SetupController:
                     pip_cmd(
                         "install",
                         "torch",
-                        "torchaudio",
                         "--index-url",
                         "https://download.pytorch.org/whl/cu124",
                     ),
@@ -886,7 +885,6 @@ class SetupController:
                     pip_cmd(
                         "install",
                         "torch",
-                        "torchaudio",
                         "--index-url",
                         "https://download.pytorch.org/whl/rocm6.4",
                     ),
@@ -900,7 +898,6 @@ class SetupController:
                     pip_cmd(
                         "install",
                         "torch",
-                        "torchaudio",
                         "--index-url",
                         "https://download.pytorch.org/whl/rocm7.2",
                     ),
@@ -988,7 +985,7 @@ except Exception as e:
             "Fix ROCm / PyTorch",
             "This will:\n"
             "  1. Remove NVIDIA CUDA packages\n"
-            "  2. Uninstall torch, torchaudio\n"
+            "  2. Uninstall torch (and stray torchaudio/torchvision)\n"
             "  3. Reinstall PyTorch with ROCm support\n\n"
             "Select ROCm version:",
             labels,
@@ -1053,14 +1050,13 @@ except Exception as e:
         )
 
         torch_cmd = pip_cmd(
-            "install", "torch", "torchaudio", "--index-url", rocm_url
+            "install", "torch", "--index-url", rocm_url
         )
         if is_nightly:
             torch_cmd = pip_cmd(
                 "install",
                 "--pre",
                 "torch",
-                "torchaudio",
                 "--index-url",
                 rocm_url,
             )
