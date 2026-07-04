@@ -865,6 +865,27 @@ class SetupController:
 
         steps: list[tuple[str, list[str], dict[str, str] | None]] = []
 
+        if gpu_type != "cpu":
+            # pip treats an installed torch of any build (e.g. the default
+            # PyPI CUDA wheel) as "requirement already satisfied" and would
+            # skip the index install entirely — remove it first, plus stray
+            # companions from earlier installs.
+            steps.append(
+                (
+                    "Removing existing PyTorch build...",
+                    pip_cmd(
+                        "uninstall",
+                        "-y",
+                        "torch",
+                        "torchvision",
+                        "torchaudio",
+                        "triton",
+                        "pytorch-triton-rocm",
+                    ),
+                    None,
+                )
+            )
+
         if gpu_type == "cuda":
             steps.append(
                 (
@@ -930,11 +951,19 @@ except Exception as e:
     print(f"ERROR {e}")
     sys.exit(1)
 """
+        # Pin verification to the discrete GPU — on dual-GPU systems the
+        # iGPU otherwise gets initialized and can crash the check. Respect
+        # an explicit override from the user's environment.
+        verify_env = (
+            None
+            if "HIP_VISIBLE_DEVICES" in os.environ
+            else {"HIP_VISIBLE_DEVICES": "0"}
+        )
         steps.append(
             (
                 "Verifying PyTorch installation...",
                 [str(VENV_PYTHON), "-c", verify_script],
-                None,
+                verify_env,
             )
         )
 
@@ -1091,11 +1120,19 @@ except Exception as e:
     print(f"ERROR {e}")
     sys.exit(1)
 """
+        # Pin verification to the discrete GPU — on dual-GPU systems the
+        # iGPU otherwise gets initialized and can crash the check. Respect
+        # an explicit override from the user's environment.
+        verify_env = (
+            None
+            if "HIP_VISIBLE_DEVICES" in os.environ
+            else {"HIP_VISIBLE_DEVICES": "0"}
+        )
         steps.append(
             (
                 "Verifying PyTorch installation...",
                 [str(VENV_PYTHON), "-c", verify_script],
-                None,
+                verify_env,
             )
         )
 
