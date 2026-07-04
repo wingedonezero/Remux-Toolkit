@@ -18,8 +18,8 @@ VENV_DIR="$PROJECT_DIR/.venv"
 if [ ! -d "$VENV_DIR" ]; then
     echo -e "${RED}Error: Virtual environment not found!${NC}"
     echo ""
-    echo "Please run the setup script first:"
-    echo -e "  ${BLUE}./setup_env.sh${NC}"
+    echo "Please run the setup GUI first:"
+    echo -e "  ${BLUE}python3 setup_gui.py${NC}"
     echo ""
     exit 1
 fi

@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["remux_toolkit*"]
+
+[project]
+name = "remux-toolkit"
+version = "0.1.0"
+description = "Remux Toolkit - collection of media remux and analysis GUI tools"
+requires-python = ">=3.13"
+dependencies = [
+    # Core GUI Framework
+    # Capped below 6.9 to match Debian 13 system Qt 6.8.2 for platform
+    # theme + plugin compatibility. The updater upgrades within this range.
+    "PyQt6>=6.8,<6.9",
+
+    # Scientific Computing & Analysis
+    "numpy",
+    "scipy",
+    # Unpinned: numba's own metadata requires the matching llvmlite series,
+    # so pip keeps the pair in lockstep automatically.
+    "numba",
+    "llvmlite",
+
+    # Media processing
+    "opencv-python",
+    "Pillow",
+    "imagehash",
+    "scenedetect[opencv]",
+    "librosa",
+    "soundfile",
+    "soxr",
+    "videohash",
+    "VideoTimestamps",
+    # Pinned: 17.x uses sws_free_context() not in Debian 13 FFmpeg 7.1.x.
+    # Required when rebuilding from source (--no-binary av) against the
+    # system FFmpeg via the setup GUI's "Rebuild PyAV" action.
+    "av==16.1.0",
+    "matplotlib",
+
+    # GPU-accelerated correlation + neural frame matching
+    # ROCm/CUDA builds are installed via the setup GUI (GPU / PyTorch action);
+    # the updater routes torch upgrades through the matching wheel index so a
+    # plain PyPI upgrade never replaces the ROCm build with a CUDA one.
+    "torch",
+    "torchaudio",
+    "isc-feature-extractor",  # ISC neural frame matching (Meta ISC21 model)
+
+    # Frame-accurate video access
+    # Pinned: must match the Debian system VapourSynth core (R73). Newer pip
+    # bindings ship their own core, which does not load the system plugin dir
+    # (ffms2/bwdif/vivtc). Bump only together with the system package.
+    "VapourSynth==73",
+    "scikit-image",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
