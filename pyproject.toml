@@ -40,13 +40,12 @@ dependencies = [
     "av==16.1.0",
     "matplotlib",
 
-    # GPU-accelerated correlation + neural frame matching
+    # GPU-accelerated correlation + DCT frame matching (sliding_matcher).
     # ROCm/CUDA builds are installed via the setup GUI (GPU / PyTorch action);
     # the updater routes torch upgrades through the matching wheel index so a
     # plain PyPI upgrade never replaces the ROCm build with a CUDA one.
     "torch",
     "torchaudio",
-    "isc-feature-extractor",  # ISC neural frame matching (Meta ISC21 model)
 
     # Frame-accurate video access
     # Pinned: must match the Debian system VapourSynth core (R73). Newer pip
