@@ -179,7 +179,6 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         # absorbs any short tail (e.g. extra creditless OP/ED segments on
         # JPN discs), so it is allowed to run longer than the target.
         min_episode = target_duration * 0.5
-        snap_window = 2.0
 
         # Hypothesis 1: the disc is authored as N exactly equal episodes
         # (common on BDs — e.g. 6 x 23:42). If every k*(total/N) lands on a
@@ -209,21 +208,6 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                 analysis_log.append(f"  Split {k}: Chapter {ch['num']} start at {ch['start_min']:.2f} min ({ch['start_min'] - k * anchor:+.3f} min from exact).")
                 split_points.append(ch['num'])
 
-        def boundary_rank(ch, ideal):
-            """Rank a candidate boundary: episodes typically end with a tiny
-            preview/eyecatch chapter, so a boundary sitting right after a
-            sub-minute chapter is the most episode-boundary-like. Boundaries
-            outside the snap window only win if nothing better exists."""
-            dev = abs(ch['start_min'] - ideal)
-            if dev > snap_window:
-                return (9, dev)
-            prec = chapter_durations[ch['num'] - 2]['duration_min']
-            if prec <= 0.6:
-                return (0, dev)
-            if prec < 1.0:
-                return (1, dev)
-            return (3, dev)
-
         prev_split_min = 0.0
         prev_num = 1
         while not equal_fit:
@@ -237,19 +221,16 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
             if not candidates:
                 break
 
-            best = min(candidates, key=lambda ch: boundary_rank(ch, ideal))
-
-            # Splitting before chapter N leaves chapter N at the head of the
-            # next episode. If N is a sub-minute chapter that follows a
-            # normal-length one, it is trailing junk (preview/bumper) and
-            # belongs with the current episode — advance past it. A sub-minute
-            # chapter following another tiny chapter is NOT junk (previews
-            # don't follow previews — it's the next episode's cold open).
-            while (best['num'] < len(chapter_durations)
-                   and best['duration_min'] < 1.0
-                   and chapter_durations[best['num'] - 2]['duration_min'] >= 1.0):
-                analysis_log.append(f"  Chapter {best['num']} is a short preview/bumper ({best['duration_min']:.2f} min) — keeping it with the current episode.")
-                best = chapter_durations[best['num']]
+            # Pure closest boundary — no structural guessing. Chapter meanings
+            # vary too much across discs (a sub-minute chapter can be a
+            # trailing preview OR the next episode's cold open) for heuristics
+            # to be trustworthy; the log flags near-ties for eyeballing.
+            best = min(candidates, key=lambda ch: abs(ch['start_min'] - ideal))
+            others = [ch for ch in candidates if ch['num'] != best['num']]
+            if others:
+                runner = min(others, key=lambda ch: abs(ch['start_min'] - ideal))
+                if abs(runner['start_min'] - ideal) - abs(best['start_min'] - ideal) < 0.5:
+                    analysis_log.append(f"  ⚠️ Near-tie: Chapter {runner['num']} at {runner['start_min']:.2f} min was almost as close as Chapter {best['num']} — worth double-checking this split.")
 
             remaining = total_min - best['start_min']
 
