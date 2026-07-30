@@ -161,6 +161,7 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         duration = end_time - start_time
         chapter_durations.append({
             "num": i + 1,
+            "start_min": start_time.total_seconds() / 60,
             "duration_min": duration.total_seconds() / 60,
             "title": chapter_title
         })
@@ -168,104 +169,70 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         analysis_log.append(f"  Chapter {i+1:<3} | Duration: {duration.total_seconds() / 60:.2f} minutes{title_display}")
 
     if analysis_mode == "Time-based Grouping":
-        analysis_log.append(f"\n--- Step 2 (Time-based): Enhanced Episode Structure Learning ---")
-        current_sum = 0.0
-        start_chapter_index = 0
-        learned_duration = target_duration
-        episode_durations = []  # Track all episode durations for adaptive learning
+        analysis_log.append(f"\n--- Step 2 (Time-based): Snapping to Chapter Boundaries ---")
+        total_min = container_duration.total_seconds() / 60
+        analysis_log.append(f"  Total duration: {total_min:.2f} min | Target episode length: {target_duration:.2f} min")
+        analysis_log.append(f"  Estimated episodes: {total_min / target_duration:.2f}")
 
-        # Adaptive tolerance based on learned variance
-        base_tolerance = 5.0
-        adaptive_tolerance = base_tolerance
+        # Each episode should end as close to (previous split + target) as
+        # possible, snapped to a real chapter boundary. The final episode
+        # absorbs any short tail (e.g. extra creditless OP/ED segments on
+        # JPN discs), so it is allowed to run longer than the target.
+        min_episode = target_duration * 0.5
+        prev_split_min = 0.0
+        prev_num = 1
 
-        while start_chapter_index < len(chapter_durations):
-            found_episode_break = False
-
-            for i in range(start_chapter_index, len(chapter_durations)):
-                current_sum += chapter_durations[i]['duration_min']
-
-                # Check if we're near the expected episode length
-                if current_sum >= learned_duration - adaptive_tolerance:
-                    # Look ahead for credits/ending marker
-                    for j in range(i, min(len(chapter_durations), i + 5)):
-                        current_chapter = chapter_durations[j]
-
-                        # Determine position context
-                        position = 'end' if j > start_chapter_index else 'start'
-
-                        # Enhanced credits detection
-                        if is_likely_credits(
-                            current_chapter['duration_min'],
-                            position,
-                            current_chapter.get('title', '')
-                        ):
-                            # Check if there's a preview/bumper chapter immediately after credits
-                            episode_end_index = j
-
-                            # Look ahead for very short chapters (previews, bumpers) < 1 minute
-                            if j + 1 < len(chapter_durations):
-                                next_chapter = chapter_durations[j + 1]
-                                if next_chapter['duration_min'] < 1.0:
-                                    # Include the preview with this episode
-                                    episode_end_index = j + 1
-                                    analysis_log.append(f"  Found short preview/bumper at Chapter {next_chapter['num']} ({next_chapter['duration_min']:.2f} min). Including with episode.")
-
-                            # Use actual chapter number, not array index
-                            split_point = chapter_durations[episode_end_index]['num'] + 1
-                            if split_point > len(chapter_durations):
-                                # Last episode, no more splits needed
-                                episode_block_duration = sum(
-                                    c['duration_min']
-                                    for c in chapter_durations[start_chapter_index : episode_end_index + 1]
-                                )
-                                episode_durations.append(episode_block_duration)
-                                analysis_log.append(f"  Episode block [{start_chapter_index+1}-{chapter_durations[episode_end_index]['num']}] duration: {episode_block_duration:.2f} min.")
-                                break
-
-                            episode_block_duration = sum(
-                                c['duration_min']
-                                for c in chapter_durations[start_chapter_index : episode_end_index + 1]
-                            )
-
-                            # Learn from first episode
-                            if not split_points:
-                                learned_duration = episode_block_duration
-                                analysis_log.append(f"  ✅ Learned first episode duration: {learned_duration:.2f} min.")
-
-                            # Track episode durations for adaptive tolerance
-                            episode_durations.append(episode_block_duration)
-
-                            # Adjust tolerance based on variance
-                            if len(episode_durations) >= 2:
-                                variance = statistics.stdev(episode_durations)
-                                adaptive_tolerance = min(8.0, max(3.0, variance * 1.5))
-                                if variance > 3.0:
-                                    analysis_log.append(f"  ⚙️ Adjusted tolerance to {adaptive_tolerance:.1f} min (variance: {variance:.1f})")
-
-                            analysis_log.append(f"  Episode block [{start_chapter_index+1}-{chapter_durations[episode_end_index]['num']}] duration: {episode_block_duration:.2f} min.")
-
-                            title_hint = f" (detected via title: '{current_chapter.get('title', '')}')" if current_chapter.get('title') else ""
-                            analysis_log.append(f"  Found credits/ending at Chapter {current_chapter['num']}{title_hint}. Splitting after Chapter {chapter_durations[episode_end_index]['num']}.")
-
-                            split_points.append(split_point)
-                            start_chapter_index = episode_end_index + 1
-                            current_sum = 0.0
-                            found_episode_break = True
-                            break
-
-                    if found_episode_break:
-                        break
-
-            if not found_episode_break:
+        while True:
+            ideal = prev_split_min + target_duration
+            # Boundaries after the previous split that wouldn't create a
+            # too-short episode. Splitting before chapter N happens at N's start.
+            candidates = [
+                ch for ch in chapter_durations
+                if ch['num'] > prev_num and ch['start_min'] >= prev_split_min + min_episode
+            ]
+            if not candidates:
                 break
 
-        # Summary of learned pattern
-        if episode_durations:
-            avg_duration = statistics.mean(episode_durations)
-            analysis_log.append(f"\n  📊 Episode Statistics:")
-            analysis_log.append(f"     Average Duration: {avg_duration:.2f} min")
-            if len(episode_durations) > 1:
-                analysis_log.append(f"     Standard Deviation: {statistics.stdev(episode_durations):.2f} min")
+            best = min(candidates, key=lambda ch: abs(ch['start_min'] - ideal))
+
+            # Splitting before chapter N leaves chapter N at the head of the
+            # next episode. If N is a sub-minute preview/bumper it belongs to
+            # the tail of the current episode instead — advance past it.
+            while best['num'] < len(chapter_durations) and chapter_durations[best['num'] - 1]['duration_min'] < 1.0:
+                bumped = chapter_durations[best['num'] - 1]
+                analysis_log.append(f"  Chapter {bumped['num']} is a short preview/bumper ({bumped['duration_min']:.2f} min) — keeping it with the current episode.")
+                best = chapter_durations[best['num']]
+
+            remaining = total_min - best['start_min']
+
+            if remaining < min_episode:
+                # Tail is too short to be an episode (extra credits segment,
+                # previews, etc.) — leave it attached to the final episode.
+                analysis_log.append(f"  Remaining {remaining:.2f} min after Chapter {best['num']} is under {min_episode:.2f} min — keeping it with the last episode.")
+                break
+
+            deviation = best['start_min'] - ideal
+            analysis_log.append(
+                f"  Split {len(split_points) + 1}: ideal at {ideal:.2f} min → snapped to Chapter {best['num']} "
+                f"start ({best['start_min']:.2f} min, {deviation:+.2f} min off). "
+                f"Episode duration: {best['start_min'] - prev_split_min:.2f} min."
+            )
+            split_points.append(best['num'])
+            prev_split_min = best['start_min']
+            prev_num = best['num']
+
+        if split_points:
+            episode_durations = []
+            bounds = [0.0] + [
+                next(ch['start_min'] for ch in chapter_durations if ch['num'] == sp)
+                for sp in split_points
+            ] + [total_min]
+            for k in range(len(bounds) - 1):
+                episode_durations.append(bounds[k + 1] - bounds[k])
+            analysis_log.append(f"\n  📊 Episode durations: " + ", ".join(f"{d:.2f}" for d in episode_durations) + " min")
+            analysis_log.append(f"     Average: {statistics.mean(episode_durations):.2f} min (last episode may run long by design)")
+        else:
+            analysis_log.append(f"  File is not long enough for more than one episode at this target — no splits.")
 
     elif analysis_mode == "Pattern Recognition":
         analysis_log.append(f"\n--- Step 2: Finding Main Content (Min Duration > {min_duration} min) ---")
@@ -414,8 +381,10 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
                 if not gap_chapters:
                     continue
                 min_duration_chapter = min(gap_chapters, key=lambda x: x['duration_min'])
-                analysis_log.append(f"  Shortest chapter in gap is Chapter {min_duration_chapter['num']}")
+                analysis_log.append(f"  Shortest chapter in gap is Chapter {min_duration_chapter['num']} ({min_duration_chapter['duration_min']:.2f} min). Splitting before Chapter {min_duration_chapter['num'] + 1}.")
                 split_points.append(min_duration_chapter['num'] + 1)
+        else:
+            analysis_log.append("  Only one main content group found — nothing to split. If this file should contain multiple episodes, try lowering 'Min Content Duration' (episodes chaptered as Part A/Part B may have no single chapter above the threshold).")
 
     elif analysis_mode == "Remove Chapters from End":
         chapters_to_remove = num_episodes  # reusing the param slot
