@@ -8,6 +8,31 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 from . import mkv_splitter_core as core
 from . import mkv_splitter_config as config
 
+def parse_target_duration(text):
+    """Parse 'mm:ss' (e.g. '23:40') or plain/decimal minutes ('23', '23.5') to float minutes."""
+    text = text.strip()
+    if not text:
+        raise ValueError("Target episode duration is empty. Use mm:ss, e.g. 23:40.")
+    try:
+        if ':' in text:
+            m, s = text.split(':', 1)
+            minutes = int(m) + int(s) / 60.0
+        else:
+            minutes = float(text)
+    except ValueError:
+        raise ValueError(f"Invalid target duration '{text}'. Use mm:ss, e.g. 23:40.")
+    if minutes <= 0:
+        raise ValueError("Target episode duration must be greater than zero.")
+    return minutes
+
+def format_target_duration(minutes):
+    """Format float minutes as 'mm:ss' for display (23.6667 -> '23:40')."""
+    m = int(minutes)
+    s = round((minutes - m) * 60)
+    if s == 60:
+        m, s = m + 1, 0
+    return f"{m}:{s:02d}"
+
 class AnalysisWorker(QtCore.QThread):
     """Worker to handle the file analysis in the background."""
     # Emits: mkv_info dict, analysis log string, split_points list
@@ -240,12 +265,14 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         analysis_layout.addRow("Analysis Mode:", self.analysis_mode_combo)
 
         self.params_stack = QtWidgets.QStackedWidget()
-        self.target_duration_input = QtWidgets.QDoubleSpinBox(); self.target_duration_input.setSuffix(" min"); self.target_duration_input.setRange(1, 240)
+        self.target_duration_input = QtWidgets.QLineEdit()
+        self.target_duration_input.setPlaceholderText("mm:ss, e.g. 23:40")
+        self.target_duration_input.setValidator(QtGui.QRegularExpressionValidator(QtCore.QRegularExpression(r"\d{1,3}(:[0-5]?\d?|\.\d{0,3})?")))
         self.min_duration_input = QtWidgets.QDoubleSpinBox(); self.min_duration_input.setSuffix(" min"); self.min_duration_input.setRange(0.1, 240)
         self.num_episodes_input = QtWidgets.QSpinBox(); self.num_episodes_input.setRange(2, 100)
         self.chapters_from_end_input = QtWidgets.QSpinBox(); self.chapters_from_end_input.setRange(1, 100)
 
-        param_layout1 = QtWidgets.QFormLayout(); param_layout1.addRow("Target Episode Duration:", self.target_duration_input); w1 = QtWidgets.QWidget(); w1.setLayout(param_layout1)
+        param_layout1 = QtWidgets.QFormLayout(); param_layout1.addRow("Target Episode Duration (mm:ss):", self.target_duration_input); w1 = QtWidgets.QWidget(); w1.setLayout(param_layout1)
         param_layout2 = QtWidgets.QFormLayout(); param_layout2.addRow("Min Content Duration:", self.min_duration_input); w2 = QtWidgets.QWidget(); w2.setLayout(param_layout2)
         param_layout3 = QtWidgets.QFormLayout(); param_layout3.addRow("Expected # of Episodes:", self.num_episodes_input); w3 = QtWidgets.QWidget(); w3.setLayout(param_layout3)
         param_layout4 = QtWidgets.QFormLayout(); param_layout4.addRow("Chapters to Remove from End:", self.chapters_from_end_input); w4 = QtWidgets.QWidget(); w4.setLayout(param_layout4)
@@ -377,11 +404,20 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         # Pass chapters_from_end via num_episodes slot for the new mode
         num_episodes_val = self.chapters_from_end_input.value() if current_mode == "Remove Chapters from End" else self.num_episodes_input.value()
 
+        try:
+            target_duration_min = parse_target_duration(self.target_duration_input.text())
+        except ValueError as e:
+            if current_mode == "Time-based Grouping":
+                self.log_output.setPlainText(f"Error: {e}")
+                self._set_controls_enabled(True)
+                return
+            target_duration_min = config.DEFAULTS['target_duration']
+
         self.analysis_worker = AnalysisWorker(
             path, self.min_duration_input.value(),
             num_episodes_val,
             current_mode,
-            self.target_duration_input.value()
+            target_duration_min
         )
         self.analysis_worker.result.connect(self._on_analysis_result)
         self.analysis_worker.error.connect(self._on_analysis_error)
@@ -512,16 +548,20 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         settings = self.app_manager.load_config(self.tool_name, config.DEFAULTS)
         self.file_path_input.setText(settings.get('file_path', ''))
         self.analysis_mode_combo.setCurrentText(settings.get('analysis_mode', config.DEFAULTS['analysis_mode']))
-        self.target_duration_input.setValue(settings.get('target_duration', config.DEFAULTS['target_duration']))
+        self.target_duration_input.setText(format_target_duration(settings.get('target_duration', config.DEFAULTS['target_duration'])))
         self.min_duration_input.setValue(settings.get('min_duration', config.DEFAULTS['min_duration']))
         self.num_episodes_input.setValue(settings.get('num_episodes', config.DEFAULTS['num_episodes']))
         self.chapters_from_end_input.setValue(settings.get('chapters_from_end', config.DEFAULTS['chapters_from_end']))
 
     def save_settings(self):
+        try:
+            target_duration_min = parse_target_duration(self.target_duration_input.text())
+        except ValueError:
+            target_duration_min = config.DEFAULTS['target_duration']
         settings = {
             'file_path': self.file_path_input.text(),
             'analysis_mode': self.analysis_mode_combo.currentText(),
-            'target_duration': self.target_duration_input.value(),
+            'target_duration': target_duration_min,
             'min_duration': self.min_duration_input.value(),
             'num_episodes': self.num_episodes_input.value(),
             'chapters_from_end': self.chapters_from_end_input.value(),
