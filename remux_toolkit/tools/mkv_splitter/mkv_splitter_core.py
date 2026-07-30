@@ -179,10 +179,38 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         # absorbs any short tail (e.g. extra creditless OP/ED segments on
         # JPN discs), so it is allowed to run longer than the target.
         min_episode = target_duration * 0.5
+
+        # Hypothesis 1: the disc is authored as N exactly equal episodes
+        # (common on BDs — e.g. 6 x 23:42). If every k*(total/N) lands on a
+        # real chapter boundary almost exactly, those ARE the episode
+        # boundaries; no structural guessing needed or wanted.
+        equal_fit = None
+        n_eps = round(total_min / target_duration)
+        if n_eps >= 2:
+            anchor = total_min / n_eps
+            fit_tol = 0.05
+            picks = []
+            for k in range(1, n_eps):
+                near = min(chapter_durations[1:], key=lambda ch: abs(ch['start_min'] - k * anchor))
+                if abs(near['start_min'] - k * anchor) > fit_tol:
+                    analysis_log.append(f"  Equal-division check: no boundary within {fit_tol:.2f} min of {k * anchor:.2f} min (closest: Chapter {near['num']} at {near['start_min']:.2f}) — disc is not evenly authored.")
+                    picks = None
+                    break
+                picks.append(near)
+            if picks and len({ch['num'] for ch in picks}) == len(picks):
+                equal_fit = picks
+
+        if equal_fit:
+            m = int(anchor)
+            s = (anchor - m) * 60
+            analysis_log.append(f"  ✅ Disc divides evenly into {n_eps} episodes of {anchor:.2f} min ({m}:{s:04.1f}) — every boundary matches exactly. Using equal-parts splits.")
+            for k, ch in enumerate(equal_fit, 1):
+                analysis_log.append(f"  Split {k}: Chapter {ch['num']} start at {ch['start_min']:.2f} min ({ch['start_min'] - k * anchor:+.3f} min from exact).")
+                split_points.append(ch['num'])
+
         prev_split_min = 0.0
         prev_num = 1
-
-        while True:
+        while not equal_fit:
             ideal = prev_split_min + target_duration
             # Boundaries after the previous split that wouldn't create a
             # too-short episode. Splitting before chapter N happens at N's start.
@@ -193,15 +221,16 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
             if not candidates:
                 break
 
+            # Pure closest boundary — no structural guessing. Chapter meanings
+            # vary too much across discs (a sub-minute chapter can be a
+            # trailing preview OR the next episode's cold open) for heuristics
+            # to be trustworthy; the log flags near-ties for eyeballing.
             best = min(candidates, key=lambda ch: abs(ch['start_min'] - ideal))
-
-            # Splitting before chapter N leaves chapter N at the head of the
-            # next episode. If N is a sub-minute preview/bumper it belongs to
-            # the tail of the current episode instead — advance past it.
-            while best['num'] < len(chapter_durations) and chapter_durations[best['num'] - 1]['duration_min'] < 1.0:
-                bumped = chapter_durations[best['num'] - 1]
-                analysis_log.append(f"  Chapter {bumped['num']} is a short preview/bumper ({bumped['duration_min']:.2f} min) — keeping it with the current episode.")
-                best = chapter_durations[best['num']]
+            others = [ch for ch in candidates if ch['num'] != best['num']]
+            if others:
+                runner = min(others, key=lambda ch: abs(ch['start_min'] - ideal))
+                if abs(runner['start_min'] - ideal) - abs(best['start_min'] - ideal) < 0.5:
+                    analysis_log.append(f"  ⚠️ Near-tie: Chapter {runner['num']} at {runner['start_min']:.2f} min was almost as close as Chapter {best['num']} — worth double-checking this split.")
 
             remaining = total_min - best['start_min']
 
