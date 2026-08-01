@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import gc
 import json
 import math
 import os
 import subprocess
+import tempfile
 from typing import Iterable
 import warnings
 
@@ -183,7 +185,147 @@ class AudioAnalysisResult:
         return data
 
 
-def _load_audio(path: str, target_sr: int) -> tuple[np.ndarray, int]:
+# Chunk sizes for streaming analysis: movie-length multichannel audio is far too
+# large to hold decoded in RAM (a 2 h 7.1 track is ~11 GB as float32), so every
+# whole-signal operation below works block-by-block over a disk-backed memmap.
+_CHUNK_SAMPLES = 4_000_000
+_CORR_CHUNK_SAMPLES = 1_000_000
+_LARGE_DECODE_BYTES = 512 * 1024 * 1024
+_DELTA_EQ_TIME_BUCKETS = 1024
+
+
+def _iter_ranges(start: int, stop: int, step: int):
+    for s in range(start, stop, step):
+        yield s, min(stop, s + step)
+
+
+def _remove_files(paths: Iterable[str]) -> None:
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _probe_stream_basics(path: str) -> tuple[float | None, int | None, int | None]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=channels,sample_rate",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        path,
+    ]
+    try:
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+        data = json.loads(output)
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return None, None, None
+    streams = data.get("streams") or [{}]
+    stream = streams[0] if isinstance(streams[0], dict) else {}
+    fmt = data.get("format", {}) if isinstance(data.get("format", {}), dict) else {}
+    try:
+        duration = float(fmt.get("duration"))
+    except (TypeError, ValueError):
+        duration = None
+    try:
+        channels = int(stream.get("channels"))
+    except (TypeError, ValueError):
+        channels = None
+    try:
+        sample_rate = int(stream.get("sample_rate"))
+    except (TypeError, ValueError):
+        sample_rate = None
+    return duration, channels, sample_rate
+
+
+def _estimated_decoded_bytes(path: str) -> int | None:
+    duration, channels, sample_rate = _probe_stream_basics(path)
+    if not duration or not channels or not sample_rate:
+        return None
+    return int(duration * channels * sample_rate * 4)
+
+
+def _decode_to_memmap(path: str, temp_dir: str, target_sr: int) -> tuple[np.ndarray, int, list[str]]:
+    """Decode the first audio stream to raw float32 on disk and memory-map it."""
+    _, channels, sample_rate = _probe_stream_basics(path)
+    if not channels or not sample_rate:
+        raise RuntimeError(f"ffprobe could not describe the audio stream in: {path}")
+    os.makedirs(temp_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(path))[0]
+    raw_path = os.path.join(temp_dir, f"{base}_{os.getpid()}_{abs(hash(path)) % 10**8}.f32raw")
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-i",
+        path,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "pcm_f32le",
+        "-f",
+        "f32le",
+        raw_path,
+    ]
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as exc:
+        _remove_files([raw_path])
+        raise RuntimeError(f"ffmpeg failed to decode audio from: {path}") from exc
+    frames = os.path.getsize(raw_path) // (4 * channels)
+    if frames == 0:
+        _remove_files([raw_path])
+        raise RuntimeError(f"ffmpeg produced no samples for: {path}")
+    audio = np.memmap(raw_path, dtype=np.float32, mode="r", shape=(frames, channels)).T
+    if sample_rate == target_sr:
+        # Unlink immediately: the mapping stays valid on POSIX and the disk
+        # space is reclaimed automatically once the memmap is released.
+        try:
+            os.remove(raw_path)
+            return audio, sample_rate, []
+        except OSError:
+            return audio, sample_rate, [raw_path]
+    res_path = raw_path + ".resampled"
+    out = None
+    for ch in range(channels):
+        resampled = _resample_audio(
+            np.ascontiguousarray(audio[ch], dtype=np.float32), sample_rate, target_sr
+        ).astype(np.float32, copy=False)
+        if out is None:
+            out = np.memmap(res_path, dtype=np.float32, mode="w+", shape=(channels, resampled.size))
+        out[ch, : out.shape[1]] = resampled[: out.shape[1]]
+    out.flush()
+    del audio
+    _remove_files([raw_path])
+    try:
+        os.remove(res_path)
+        return out, target_sr, []
+    except OSError:
+        return out, target_sr, [res_path]
+
+
+def _load_audio(
+    path: str, target_sr: int, temp_dir: str | None = None
+) -> tuple[np.ndarray, int, list[str]]:
+    """Load audio as a (channels, samples) array.
+
+    Files whose decoded size exceeds _LARGE_DECODE_BYTES are decoded to a
+    disk-backed memmap instead of RAM; the returned temp-file list must be
+    removed by the caller once analysis is done.
+    """
+    if temp_dir:
+        estimated = _estimated_decoded_bytes(path)
+        if estimated is not None and estimated > _LARGE_DECODE_BYTES:
+            return _decode_to_memmap(path, temp_dir, target_sr)
     try:
         audio, sr = sf.read(path, always_2d=True, dtype="float32")
         audio = audio.T
@@ -209,7 +351,69 @@ def _load_audio(path: str, target_sr: int) -> tuple[np.ndarray, int]:
         audio = np.stack([_resample_audio(channel, sr, target_sr) for channel in audio], axis=0)
         sr = target_sr
 
-    return audio, sr
+    return audio, sr, []
+
+
+def _mono_mix(y: np.ndarray) -> np.ndarray:
+    """Downmix to a mono float32 array held in RAM, reading chunk by chunk."""
+    n = y.shape[1]
+    if y.shape[0] == 1:
+        return np.asarray(y[0], dtype=np.float32)
+    out = np.empty(n, dtype=np.float32)
+    for s, e in _iter_ranges(0, n, _CHUNK_SAMPLES):
+        out[s:e] = np.mean(y[:, s:e], axis=0, dtype=np.float64)
+    return out
+
+
+def _stream_gram(rows: list[np.ndarray], n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Accumulate per-row sums and the cross-product matrix chunk by chunk."""
+    k = len(rows)
+    s1 = np.zeros(k, dtype=np.float64)
+    s2 = np.zeros((k, k), dtype=np.float64)
+    for s, e in _iter_ranges(0, n, _CORR_CHUNK_SAMPLES):
+        seg = np.empty((k, e - s), dtype=np.float64)
+        for i, row in enumerate(rows):
+            seg[i] = row[s:e]
+        s1 += seg.sum(axis=1)
+        s2 += seg @ seg.T
+    return s1, s2
+
+
+def _corr_from_gram(s1: np.ndarray, s2: np.ndarray, n: int) -> np.ndarray:
+    """Exact correlation matrix from streamed sums (matches np.corrcoef)."""
+    cov = s2 / n - np.outer(s1, s1) / (float(n) * n)
+    d = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+    denom = np.outer(d, d)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corr = cov / denom
+    return np.nan_to_num(corr)
+
+
+def _clipped_fraction(rows: np.ndarray, threshold: float) -> float:
+    data = rows if rows.ndim > 1 else rows[np.newaxis, :]
+    n = data.shape[1]
+    if n == 0 or data.shape[0] == 0:
+        return 0.0
+    clipped = 0
+    for s, e in _iter_ranges(0, n, _CHUNK_SAMPLES):
+        seg = np.asarray(data[:, s:e])
+        clipped += int(np.count_nonzero(np.abs(seg) >= threshold))
+    return clipped / float(data.size)
+
+
+def _sosfilt_stream(
+    sos: np.ndarray, row: np.ndarray, out: np.ndarray | None = None
+) -> tuple[np.ndarray | None, float]:
+    """Chunked sosfilt from rest (zero initial state); returns (out, sum of squares)."""
+    zi = np.zeros((sos.shape[0], 2))
+    sq = 0.0
+    for s, e in _iter_ranges(0, int(row.size), _CHUNK_SAMPLES):
+        seg = np.asarray(row[s:e], dtype=np.float64)
+        filtered, zi = scipy.signal.sosfilt(sos, seg, zi=zi)
+        if out is not None:
+            out[s:e] = filtered
+        sq += float(np.dot(filtered, filtered))
+    return out, sq
 
 
 def _calculate_dynamic_range(
@@ -249,11 +453,10 @@ def _calculate_dynamic_range(
 
 
 def _calculate_loudness_metrics(
-    y: np.ndarray, sr: int, settings: AnalysisSettings
+    y_mono: np.ndarray, sr: int, settings: AnalysisSettings
 ) -> tuple[float, float]:
-    if y.size == 0:
+    if y_mono.size == 0:
         return -120.0, 0.0
-    y_mono = np.mean(y, axis=0) if y.shape[0] > 1 else y[0]
     block_size = int(settings.dr_block_seconds * sr)
     if block_size <= 0:
         return -120.0, 0.0
@@ -299,7 +502,9 @@ def _bandpass_mono(y: np.ndarray, sr: int, low_hz: float, high_hz: float) -> np.
     if high <= low:
         return y
     sos = scipy.signal.butter(4, [low, high], btype="bandpass", output="sos")
-    return scipy.signal.sosfilt(sos, y)
+    out = np.empty(int(y.size), dtype=np.float32)
+    _sosfilt_stream(sos, y, out)
+    return out
 
 
 def _align_offset(
@@ -375,18 +580,111 @@ def _scc_align_offset(
         return 0.0, median_confidence, True, "SCC confidence below threshold."
     offset_s = float(np.median(offsets))
     return offset_s, median_confidence, False, None
-def _log_power_spectrogram(
-    y_mono: np.ndarray, sr: int, settings: AnalysisSettings
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Log-power spectrogram for delta EQ mapping."""
-    stft = librosa.stft(y_mono, n_fft=settings.fft_size, hop_length=settings.hop_length)
-    power = np.abs(stft) ** 2
-    power_db = librosa.power_to_db(power, ref=np.max)
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=settings.fft_size)
-    times = librosa.frames_to_time(
-        np.arange(power_db.shape[1]), sr=sr, hop_length=settings.hop_length
+def _stft_frame_count(n_samples: int, n_fft: int, hop_length: int) -> int:
+    return 1 + (n_samples + 2 * (n_fft // 2) - n_fft) // hop_length
+
+
+def _zero_padded_slice(y: np.ndarray, start: int, end: int, pad: int) -> np.ndarray:
+    """Slice [start, end) of the signal as if zero-padded by `pad` on each side.
+
+    Matches librosa.stft's default centered framing (pad_mode="constant").
+    """
+    out = np.zeros(end - start, dtype=np.float32)
+    lo = max(start - pad, 0)
+    hi = min(end - pad, int(y.size))
+    if hi > lo:
+        out[lo - (start - pad) : hi - (start - pad)] = y[lo:hi]
+    return out
+
+
+def _iter_stft_mag_chunks(
+    y_mono: np.ndarray, settings: AnalysisSettings, frames_per_chunk: int = 4096
+):
+    """Yield (start_frame, end_frame, |STFT|) chunks matching librosa's centered STFT."""
+    n_fft = settings.fft_size
+    hop = settings.hop_length
+    pad = n_fft // 2
+    n = int(y_mono.size)
+    total = _stft_frame_count(n, n_fft, hop)
+    for k0 in range(0, total, frames_per_chunk):
+        k1 = min(k0 + frames_per_chunk, total)
+        s = k0 * hop
+        e = (k1 - 1) * hop + n_fft
+        if s - pad >= 0 and e - pad <= n:
+            segment = np.asarray(y_mono[s - pad : e - pad], dtype=np.float32)
+        else:
+            segment = _zero_padded_slice(y_mono, s, e, pad)
+        stft = librosa.stft(segment, n_fft=n_fft, hop_length=hop, center=False)
+        yield k0, k1, np.abs(stft)
+
+
+def _stream_spectral_pass(
+    y_mono: np.ndarray,
+    sr: int,
+    settings: AnalysisSettings,
+    mel_basis: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, np.ndarray | None, int]:
+    """One streaming STFT pass: per-bin mean magnitude, global max power, optional mel."""
+    total = _stft_frame_count(int(y_mono.size), settings.fft_size, settings.hop_length)
+    mag_sum = np.zeros(settings.fft_size // 2 + 1, dtype=np.float64)
+    max_power = 0.0
+    mel = (
+        np.empty((mel_basis.shape[0], total), dtype=np.float32)
+        if mel_basis is not None
+        else None
     )
-    return freqs, times, power_db
+    for k0, k1, mag in _iter_stft_mag_chunks(y_mono, settings):
+        mag_sum += mag.sum(axis=1, dtype=np.float64)
+        power = mag
+        power *= power
+        if power.size:
+            max_power = max(max_power, float(power.max()))
+        if mel is not None:
+            mel[:, k0:k1] = mel_basis @ power
+    mean_mag = (mag_sum / max(1, total)).astype(np.float32)
+    return mean_mag, max_power, mel, total
+
+
+def _stream_logpower_stats(
+    y_mono: np.ndarray,
+    sr: int,
+    settings: AnalysisSettings,
+    max_power: float,
+    n_buckets: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Time-mean and time-bucketed log-power spectrum (librosa power_to_db semantics).
+
+    Replaces the full (bins x frames) log-power spectrogram for delta-EQ work:
+    the band metrics only need the time mean, and the delta-EQ PNG only needs
+    a time-decimated map, so the full array never has to exist.
+    """
+    amin = 1e-10
+    top_db = 80.0
+    ref_db = 10.0 * math.log10(max(amin, max_power))
+    bins = settings.fft_size // 2 + 1
+    total = _stft_frame_count(int(y_mono.size), settings.fft_size, settings.hop_length)
+    buckets = max(1, min(n_buckets, total))
+    db_sum = np.zeros(bins, dtype=np.float64)
+    bucket_sum = np.zeros((bins, buckets), dtype=np.float64)
+    bucket_frames = np.zeros(buckets, dtype=np.int64)
+    for k0, k1, mag in _iter_stft_mag_chunks(y_mono, settings):
+        power = mag
+        power *= power
+        np.maximum(power, amin, out=power)
+        db = 10.0 * np.log10(power)
+        db -= ref_db
+        np.maximum(db, -top_db, out=db)
+        db_sum += db.sum(axis=1, dtype=np.float64)
+        frame_buckets = (np.arange(k0, k1, dtype=np.int64) * buckets) // total
+        for b in np.unique(frame_buckets):
+            mask = frame_buckets == b
+            bucket_sum[:, b] += db[:, mask].sum(axis=1, dtype=np.float64)
+            bucket_frames[b] += int(mask.sum())
+    mean_db = (db_sum / max(1, total)).astype(np.float32)
+    bucket_db = (bucket_sum / np.maximum(bucket_frames, 1)).astype(np.float32)
+    centers = (np.arange(buckets) + 0.5) * (total / buckets)
+    times = librosa.frames_to_time(centers, sr=sr, hop_length=settings.hop_length)
+    return mean_db, bucket_db, times
 
 
 def _robust_level_match_gain_db(
@@ -426,22 +724,15 @@ def _apply_gain_db(x: np.ndarray, gain_db: float) -> np.ndarray:
 def _mean_spectrum_db(
     y_mono: np.ndarray, sr: int, settings: AnalysisSettings
 ) -> tuple[np.ndarray, np.ndarray]:
-    stft = librosa.stft(y_mono, n_fft=settings.fft_size, hop_length=settings.hop_length)
-    mag = np.abs(stft)
-    mean_mag = np.mean(mag, axis=1)
+    mean_mag, _, _, _ = _stream_spectral_pass(y_mono, sr, settings)
     mag_db = librosa.amplitude_to_db(mean_mag, ref=np.max)
     freqs = librosa.fft_frequencies(sr=sr, n_fft=settings.fft_size)
     return freqs, mag_db
 
 
 def _spectral_cutoff(
-    y_mono: np.ndarray, sr: int, settings: AnalysisSettings
+    freqs: np.ndarray, mag_db: np.ndarray, settings: AnalysisSettings
 ) -> tuple[float, bool, bool]:
-    stft = librosa.stft(y_mono, n_fft=settings.fft_size, hop_length=settings.hop_length)
-    mag = np.abs(stft)
-    mean_mag = np.mean(mag, axis=1)
-    mag_db = librosa.amplitude_to_db(mean_mag, ref=np.max)
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=settings.fft_size)
     threshold_db = np.max(mag_db) - settings.cutoff_db_below_peak
     valid = np.where(mag_db >= threshold_db)[0]
     cutoff_hz = float(freqs[valid[-1]]) if valid.size else 0.0
@@ -463,12 +754,8 @@ def _spectral_cutoff(
 
 
 def _dialog_balance_db(
-    y_mono: np.ndarray, sr: int, settings: AnalysisSettings
+    freqs: np.ndarray, mag_db: np.ndarray, settings: AnalysisSettings
 ) -> float:
-    stft = librosa.stft(y_mono, n_fft=settings.fft_size, hop_length=settings.hop_length)
-    mag = np.abs(stft)
-    mag_db = librosa.amplitude_to_db(np.mean(mag, axis=1), ref=np.max)
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=settings.fft_size)
     dialog_band = (freqs >= settings.dialog_band_low_hz) & (freqs <= settings.dialog_band_high_hz)
     presence_band = (freqs >= settings.presence_band_low_hz) & (
         freqs <= settings.presence_band_high_hz
@@ -541,11 +828,10 @@ def _detect_nr_filtered(
 
 def _evaluate_eq_delta(
     freqs: np.ndarray,
-    delta_db: np.ndarray,
+    mean_delta: np.ndarray,
     settings: AnalysisSettings,
 ) -> tuple[float, float, list[str]]:
     warnings: list[str] = []
-    mean_delta = np.mean(delta_db, axis=1)
     muffle_band = (freqs >= settings.eq_muffle_low_hz) & (freqs <= settings.eq_muffle_high_hz)
     boom_band = (freqs >= settings.eq_boom_center_hz - settings.eq_boom_band_hz) & (
         freqs <= settings.eq_boom_center_hz + settings.eq_boom_band_hz
@@ -607,11 +893,13 @@ def _detect_surround_swaps(
         return False
     if ref_audio.shape[0] < 5 or cand_audio.shape[0] < 5:
         return False
-    ref_channels = ref_audio[:5, :]
-    cand_channels = cand_audio[:5, :]
-    corr = np.nan_to_num(np.corrcoef(np.vstack([ref_channels, cand_channels])))
-    ref_count = ref_channels.shape[0]
-    corr_block = corr[:ref_count, ref_count:]
+    n = min(ref_audio.shape[1], cand_audio.shape[1])
+    if n == 0:
+        return False
+    rows = [ref_audio[i] for i in range(5)] + [cand_audio[i] for i in range(5)]
+    s1, s2 = _stream_gram(rows, n)
+    corr = _corr_from_gram(s1, s2, n)
+    corr_block = corr[:5, 5:]
     max_indices = np.argmax(np.abs(corr_block), axis=1)
     swaps = sum(idx != i for i, idx in enumerate(max_indices))
     return swaps > 0 and np.max(np.abs(corr_block)) >= settings.channel_swap_corr_threshold
@@ -640,21 +928,27 @@ def _detect_limiting_segments(
     window_samples = int(sr * settings.limiting_window_ms / 1000.0)
     if window_samples <= 0:
         return [], []
-    flat = np.max(np.abs(y), axis=0) if y.ndim > 1 else np.abs(y)
-    total_windows = max(1, flat.size // window_samples)
-    ratios = []
+    rows = y if y.ndim > 1 else y[np.newaxis, :]
+    n = rows.shape[1]
+    total_windows = max(1, n // window_samples)
+    ratios: list[float] = []
     segments: list[tuple[float, float]] = []
-    for idx in range(total_windows):
-        start = idx * window_samples
-        end = start + window_samples
-        window = flat[start:end]
-        if window.size == 0:
-            ratios.append(0.0)
-            continue
-        ratio = float(np.mean(window >= settings.clip_threshold))
-        ratios.append(ratio)
-        if ratio >= settings.limiting_ratio:
-            segments.append((start / sr, end / sr))
+    group = max(1, _CHUNK_SAMPLES // window_samples)
+    for w0 in range(0, total_windows, group):
+        w1 = min(total_windows, w0 + group)
+        s = w0 * window_samples
+        e = min(n, w1 * window_samples)
+        flat = np.max(np.abs(np.asarray(rows[:, s:e], dtype=np.float32)), axis=0)
+        for idx in range(w1 - w0):
+            window = flat[idx * window_samples : (idx + 1) * window_samples]
+            if window.size == 0:
+                ratios.append(0.0)
+                continue
+            ratio = float(np.mean(window >= settings.clip_threshold))
+            ratios.append(ratio)
+            if ratio >= settings.limiting_ratio:
+                start = (w0 + idx) * window_samples
+                segments.append((start / sr, (start + window_samples) / sr))
     return ratios, segments
 
 
@@ -716,24 +1010,37 @@ def _save_waveform_zoom(
 def _scan_glitches(y: np.ndarray, sr: int, settings: AnalysisSettings) -> list[float]:
     if y.size == 0:
         return []
-    diffs = []
-    for channel in y:
-        channel_diff = np.abs(np.diff(channel))
-        if channel_diff.size:
-            diffs.append(channel_diff)
-    if not diffs:
+    rows = y if y.ndim > 1 else y[np.newaxis, :]
+    n = rows.shape[1]
+    if n < 2:
         return []
-    diff = np.max(np.vstack(diffs), axis=0)
-    if diff.size == 0:
+
+    def iter_diff_chunks():
+        for s, e in _iter_ranges(1, n, _CHUNK_SAMPLES):
+            seg = np.asarray(rows[:, s - 1 : e], dtype=np.float32)
+            diff = np.abs(np.diff(seg, axis=1))
+            yield s - 1, np.max(diff, axis=0)
+
+    count = 0
+    total = 0.0
+    total_sq = 0.0
+    for _, dmax in iter_diff_chunks():
+        count += dmax.size
+        d64 = dmax.astype(np.float64)
+        total += float(d64.sum())
+        total_sq += float(np.dot(d64, d64))
+    if count == 0:
         return []
-    mean = float(np.mean(diff))
-    std = float(np.std(diff))
+    mean = total / count
+    std = math.sqrt(max(0.0, total_sq / count - mean * mean))
     threshold = max(settings.glitch_diff_threshold, mean + 6.0 * std)
-    spikes = np.where(diff >= threshold)[0]
-    if spikes.size == 0:
-        return []
-    timestamps = (spikes / sr).tolist()
-    return [float(ts) for ts in timestamps[: settings.glitch_max_count]]
+    timestamps: list[float] = []
+    for offset, dmax in iter_diff_chunks():
+        for idx in np.where(dmax >= threshold)[0]:
+            timestamps.append(float((offset + int(idx)) / sr))
+            if len(timestamps) >= settings.glitch_max_count:
+                return timestamps
+    return timestamps
 
 
 def _measure_stereo_width(y: np.ndarray) -> float:
@@ -744,31 +1051,32 @@ def _measure_stereo_width(y: np.ndarray) -> float:
     """
     if y.shape[0] < 2:
         return 0.0  # Mono or no stereo
+    n = y.shape[1]
+    if n == 0:
+        return 0.0
 
-    left = y[0, :]
-    right = y[1, :]
+    # Mid-Side energy, accumulated chunk by chunk
+    mid_sq = 0.0
+    side_sq = 0.0
+    for s, e in _iter_ranges(0, n, _CHUNK_SAMPLES):
+        left = np.asarray(y[0, s:e], dtype=np.float64)
+        right = np.asarray(y[1, s:e], dtype=np.float64)
+        mid = (left + right) / 2.0
+        side = (left - right) / 2.0
+        mid_sq += float(np.dot(mid, mid))
+        side_sq += float(np.dot(side, side))
 
-    # Mid-Side encoding
-    mid = (left + right) / 2.0
-    side = (left - right) / 2.0
-
-    # Calculate RMS energy
-    mid_rms = float(np.sqrt(np.mean(mid**2)))
-    side_rms = float(np.sqrt(np.mean(side**2)))
+    mid_rms = math.sqrt(mid_sq / n)
+    side_rms = math.sqrt(side_sq / n)
 
     # Avoid division by zero
     if mid_rms < 1e-12:
         return 0.0
 
-    # Width ratio: side/mid
-    # Convert to 0-1 scale where 0.5 = balanced, 1.0 = very wide
+    # Width ratio: side/mid, normalized to 0-1 (typical music has 0.3-0.8;
+    # above 0.8 = very wide, below 0.3 = narrow)
     width_ratio = side_rms / mid_rms
-
-    # Normalize to 0-1 range (typical music has 0.3-0.8)
-    # Values above 0.8 = very wide, below 0.3 = narrow
-    normalized_width = min(1.0, width_ratio / 0.8)
-
-    return normalized_width
+    return min(1.0, width_ratio / 0.8)
 
 
 def _detect_lr_imbalance(y: np.ndarray, sr: int) -> tuple[float, float, bool]:
@@ -783,32 +1091,37 @@ def _detect_lr_imbalance(y: np.ndarray, sr: int) -> tuple[float, float, bool]:
     """
     if y.shape[0] < 2:
         return 0.0, 0.0, False
+    n = y.shape[1]
+    if n == 0:
+        return 0.0, 0.0, False
 
-    left = y[0, :]
-    right = y[1, :]
+    def channel_stats(row: np.ndarray) -> tuple[float, float]:
+        # RMS level, accumulated chunk by chunk
+        sq = 0.0
+        for s, e in _iter_ranges(0, n, _CHUNK_SAMPLES):
+            seg = np.asarray(row[s:e], dtype=np.float64)
+            sq += float(np.dot(seg, seg))
+        rms = math.sqrt(sq / n)
+        # Noise floor: mean of the bottom 10% of |samples| (in-place partition
+        # keeps this to a single float32 copy of the channel)
+        k = int(n * 0.1)
+        noise = 0.0
+        if k > 0:
+            magnitudes = np.abs(np.asarray(row, dtype=np.float32))
+            magnitudes.partition(k - 1)
+            noise = float(np.mean(magnitudes[:k], dtype=np.float64))
+        return rms, noise
 
-    # Check RMS level balance
-    left_rms = float(np.sqrt(np.mean(left**2)))
-    right_rms = float(np.sqrt(np.mean(right**2)))
+    left_rms, left_noise = channel_stats(y[0])
+    right_rms, right_noise = channel_stats(y[1])
 
     if left_rms < 1e-12 or right_rms < 1e-12:
         return 0.0, 0.0, False
 
     level_imbalance_db = 20 * math.log10(max(left_rms, right_rms) / min(left_rms, right_rms))
 
-    # Check noise floor difference (bottom 10% of signal)
-    left_sorted = np.sort(np.abs(left))
-    right_sorted = np.sort(np.abs(right))
-
-    percentile_10 = int(left_sorted.size * 0.1)
-    if percentile_10 > 0:
-        left_noise = float(np.mean(left_sorted[:percentile_10]))
-        right_noise = float(np.mean(right_sorted[:percentile_10]))
-
-        if left_noise > 1e-12 and right_noise > 1e-12:
-            noise_floor_diff_db = 20 * math.log10(max(left_noise, right_noise) / min(left_noise, right_noise))
-        else:
-            noise_floor_diff_db = 0.0
+    if left_noise > 1e-12 and right_noise > 1e-12:
+        noise_floor_diff_db = 20 * math.log10(max(left_noise, right_noise) / min(left_noise, right_noise))
     else:
         noise_floor_diff_db = 0.0
 
@@ -827,11 +1140,9 @@ def _detect_center_bass_loss(y: np.ndarray, sr: int, center_idx: int | None, ref
     """
     if center_idx is None or center_idx >= y.shape[0]:
         return 0.0
-
-    center = y[center_idx, :]
-
-    # Get bass energy in center channel (20-100 Hz)
-    from scipy import signal as scipy_signal
+    n = y.shape[1]
+    if n == 0:
+        return 0.0
 
     # Bandpass 20-100 Hz
     nyq = sr / 2.0
@@ -842,42 +1153,38 @@ def _detect_center_bass_loss(y: np.ndarray, sr: int, center_idx: int | None, ref
         return 0.0
 
     try:
-        sos = scipy_signal.butter(4, [low, high], btype='band', output='sos')
-        center_bass = scipy_signal.sosfilt(sos, center)
-    except:
+        sos = scipy.signal.butter(4, [low, high], btype='band', output='sos')
+        _, center_sq = _sosfilt_stream(sos, y[center_idx])
+    except Exception:
         return 0.0
 
-    center_bass_rms = float(np.sqrt(np.mean(center_bass**2)))
+    center_bass_rms = math.sqrt(center_sq / n)
 
     # Compare to reference if available
     if reference_y is not None and center_idx < reference_y.shape[0]:
-        ref_center = reference_y[center_idx, :]
         try:
-            ref_bass = scipy_signal.sosfilt(sos, ref_center)
-            ref_bass_rms = float(np.sqrt(np.mean(ref_bass**2)))
+            _, ref_sq = _sosfilt_stream(sos, reference_y[center_idx])
+            ref_bass_rms = math.sqrt(ref_sq / reference_y.shape[1])
 
             if ref_bass_rms > 1e-12 and center_bass_rms > 1e-12:
                 bass_loss_db = 20 * math.log10(ref_bass_rms / center_bass_rms)
                 return max(0.0, bass_loss_db)
-        except:
+        except Exception:
             pass
 
     # No reference: compare center bass to L/R bass average
     if y.shape[0] >= 2:
-        left = y[0, :]
-        right = y[1, :]
-
         try:
-            left_bass = scipy_signal.sosfilt(sos, left)
-            right_bass = scipy_signal.sosfilt(sos, right)
+            _, left_sq = _sosfilt_stream(sos, y[0])
+            _, right_sq = _sosfilt_stream(sos, y[1])
 
-            lr_bass_rms = float(np.sqrt(np.mean((left_bass**2 + right_bass**2) / 2.0)))
+            lr_bass_rms = math.sqrt((left_sq + right_sq) / (2.0 * n))
 
             if lr_bass_rms > 1e-12 and center_bass_rms > 1e-12:
                 bass_loss_db = 20 * math.log10(lr_bass_rms / center_bass_rms)
                 # Only flag if significantly lower (center naturally has less bass)
                 return max(0.0, bass_loss_db - 3.0)  # -3 dB tolerance
-        except:
+        except Exception:
             pass
 
     return 0.0
@@ -886,15 +1193,16 @@ def _detect_center_bass_loss(y: np.ndarray, sr: int, center_idx: int | None, ref
 def _detect_fake_multichannel(y: np.ndarray, settings: AnalysisSettings) -> bool:
     if y.shape[0] < 6:
         return False
-    channels = y[: y.shape[0], :]
-    if channels.shape[1] == 0:
+    n = y.shape[1]
+    if n == 0:
         return False
-    corr = np.nan_to_num(np.corrcoef(channels))
+    s1, s2 = _stream_gram([y[i] for i in range(y.shape[0])], n)
+    corr = _corr_from_gram(s1, s2, n)
     if corr.shape[0] < 2:
         return False
     upper = corr[np.triu_indices_from(corr, k=1)]
     median_corr = float(np.median(np.abs(upper))) if upper.size else 0.0
-    rms = np.sqrt(np.mean(channels**2, axis=1))
+    rms = np.sqrt(np.diag(s2) / n)
     rms_db = 20 * np.log10(np.maximum(rms, 1e-12))
     energy_spread = float(np.max(rms_db) - np.min(rms_db))
     return (
@@ -953,21 +1261,20 @@ def _save_clipping_heatmap(
     fig.savefig(out_path)
     plt.close(fig)
 def _detect_clipping(y: np.ndarray, settings: AnalysisSettings) -> tuple[float, bool]:
-    flat = np.abs(y.reshape(-1))
-    if flat.size == 0:
+    if y.size == 0:
         return 0.0, False
-    clipping_ratio = float(np.mean(flat >= settings.clip_threshold))
+    clipping_ratio = _clipped_fraction(y, settings.clip_threshold)
     return clipping_ratio, clipping_ratio >= settings.clip_ratio_warn
 
 
 def _detect_phase_inversion(y: np.ndarray, settings: AnalysisSettings) -> bool:
     if y.shape[0] < 2:
         return False
-    left = y[0]
-    right = y[1]
-    if left.size == 0 or right.size == 0:
+    n = y.shape[1]
+    if n == 0:
         return False
-    corr = np.corrcoef(left, right)[0, 1]
+    s1, s2 = _stream_gram([y[0], y[1]], n)
+    corr = _corr_from_gram(s1, s2, n)[0, 1]
     return bool(corr <= settings.phase_inversion_threshold)
 
 
@@ -1374,17 +1681,20 @@ def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> s
     return "; ".join(parts)
 
 
-def _save_spectrogram(y_mono: np.ndarray, sr: int, out_path: str, settings: AnalysisSettings) -> None:
+def _save_spectrogram(
+    y_mono: np.ndarray,
+    sr: int,
+    out_path: str,
+    settings: AnalysisSettings,
+    mel_power: np.ndarray | None = None,
+) -> None:
+    if mel_power is None:
+        mel_basis = librosa.filters.mel(
+            sr=sr, n_fft=settings.fft_size, n_mels=settings.mel_bins
+        )
+        _, _, mel_power, _ = _stream_spectral_pass(y_mono, sr, settings, mel_basis=mel_basis)
     fig, ax = plt.subplots(figsize=(7, 3), dpi=200)
-    mel = librosa.feature.melspectrogram(
-        y=y_mono,
-        sr=sr,
-        n_fft=settings.fft_size,
-        hop_length=settings.hop_length,
-        n_mels=settings.mel_bins,
-        power=2.0,
-    )
-    mag_db = librosa.power_to_db(mel, ref=np.max)
+    mag_db = librosa.power_to_db(mel_power, ref=np.max)
     extent = [0, len(y_mono) / sr, 0, sr / 2]
     ax.imshow(mag_db, aspect="auto", origin="lower", extent=extent, cmap="magma")
     ax.set_xlabel("Time (s)")
@@ -1396,11 +1706,28 @@ def _save_spectrogram(y_mono: np.ndarray, sr: int, out_path: str, settings: Anal
 
 
 def _true_peak_db(y: np.ndarray, oversample: int = 4) -> float:
+    """Oversampled true peak, computed per channel in chunks.
+
+    Chunking bounds the oversampled float64 temporaries to a few hundred MB;
+    naively upsampling a full movie-length multichannel track would need tens
+    of GB in one allocation. Chunks overlap by `guard` samples so the polyphase
+    filter edges do not affect the interior samples that are kept.
+    """
     if y.size == 0:
         return -120.0
-    flat = y.reshape(-1)
-    upsampled = scipy.signal.resample_poly(flat, oversample, 1)
-    peak = float(np.max(np.abs(upsampled)))
+    rows = y if y.ndim > 1 else y[np.newaxis, :]
+    n = rows.shape[1]
+    guard = 256
+    peak = 0.0
+    for ch in range(rows.shape[0]):
+        for start, end in _iter_ranges(0, n, _CHUNK_SAMPLES):
+            s = max(0, start - guard)
+            e = min(n, end + guard)
+            segment = np.asarray(rows[ch, s:e], dtype=np.float32)
+            upsampled = scipy.signal.resample_poly(segment, oversample, 1)
+            lead = (start - s) * oversample
+            tail = lead + (end - start) * oversample
+            peak = max(peak, float(np.max(np.abs(upsampled[lead:tail]))))
     if peak <= 0:
         return -120.0
     return 20 * math.log10(peak)
@@ -1420,31 +1747,60 @@ def analyze_files(
     reference_path: str | None = None,
 ) -> list[AudioAnalysisResult]:
     results: list[AudioAnalysisResult] = []
+    temp_root = output_dir or tempfile.mkdtemp(prefix="audio_analysis_")
+    made_temp_root = not output_dir
+    leftover_temp: list[str] = []
+    mel_basis = None
     ref_freqs = None
     ref_mag_db = None
-    ref_power_db = None
-    ref_times = None
+    ref_mean_db = None
+    ref_bucket_db = None
+    ref_bucket_times = None
+    ref_total_frames = None
     ref_audio = None
+    ref_mono = None
+    ref_sr = settings.target_sample_rate
     ref_f0 = None
     if reference_path:
-        ref_audio, ref_sr = _load_audio(reference_path, settings.target_sample_rate)
-        ref_mono = np.mean(ref_audio, axis=0) if ref_audio.shape[0] > 1 else ref_audio[0]
-        ref_freqs, ref_mag_db = _mean_spectrum_db(ref_mono, ref_sr, settings)
-        ref_freqs, ref_times, ref_power_db = _log_power_spectrogram(ref_mono, ref_sr, settings)
+        ref_audio, ref_sr, ref_leftover = _load_audio(
+            reference_path, settings.target_sample_rate, temp_root
+        )
+        leftover_temp.extend(ref_leftover)
+        ref_mono = _mono_mix(ref_audio)
+        ref_freqs = librosa.fft_frequencies(sr=ref_sr, n_fft=settings.fft_size)
+        ref_mean_mag, ref_max_power, _, ref_total_frames = _stream_spectral_pass(
+            ref_mono, ref_sr, settings
+        )
+        ref_mag_db = librosa.amplitude_to_db(ref_mean_mag, ref=np.max)
+        ref_mean_db, ref_bucket_db, ref_bucket_times = _stream_logpower_stats(
+            ref_mono, ref_sr, settings, ref_max_power, _DELTA_EQ_TIME_BUCKETS
+        )
         ref_f0 = _estimate_f0(ref_mono, ref_sr, settings)
     for path in file_paths:
-        y, sr = _load_audio(path, settings.target_sample_rate)
+        is_reference_file = ref_audio is not None and path == reference_path
+        if is_reference_file:
+            y, sr = ref_audio, ref_sr
+        else:
+            y, sr, cand_leftover = _load_audio(path, settings.target_sample_rate, temp_root)
+            leftover_temp.extend(cand_leftover)
         duration_s = float(librosa.get_duration(y=y, sr=sr))
         metadata = _probe_audio_metadata(path)
-        y_mono = np.mean(y, axis=0) if y.shape[0] > 1 else y[0]
+        y_mono = ref_mono if is_reference_file else _mono_mix(y)
         codec_name, codec_profile, is_lossless = _probe_audio_codec(path)
         peak, rms, dr_db, dr_blocks_used = _calculate_dynamic_range(y, sr, settings)
-        loudness_db, loudness_range_db = _calculate_loudness_metrics(y, sr, settings)
+        loudness_db, loudness_range_db = _calculate_loudness_metrics(y_mono, sr, settings)
         true_peak_db = _true_peak_db(y)
-        cutoff_hz, shelf_detected, reencode_detected = _spectral_cutoff(y_mono, sr, settings)
-        freqs, mag_db = _mean_spectrum_db(y_mono, sr, settings)
-        spec_freqs, spec_times, power_db = _log_power_spectrogram(y_mono, sr, settings)
-        dialog_balance_db = _dialog_balance_db(y_mono, sr, settings)
+        if mel_basis is None and output_dir:
+            mel_basis = librosa.filters.mel(
+                sr=sr, n_fft=settings.fft_size, n_mels=settings.mel_bins
+            )
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=settings.fft_size)
+        mean_mag, max_power, mel_power, total_frames = _stream_spectral_pass(
+            y_mono, sr, settings, mel_basis=mel_basis
+        )
+        mag_db = librosa.amplitude_to_db(mean_mag, ref=np.max)
+        cutoff_hz, shelf_detected, reencode_detected = _spectral_cutoff(freqs, mag_db, settings)
+        dialog_balance_db = _dialog_balance_db(freqs, mag_db, settings)
         reference_mag = ref_mag_db if ref_mag_db is not None and ref_mag_db.shape == mag_db.shape else None
         nr_filtered = _detect_nr_filtered(mag_db, freqs, settings, reference_mag)
         glitch_timestamps = _scan_glitches(y, sr, settings)
@@ -1456,10 +1812,15 @@ def analyze_files(
         center_bass_loss = _detect_center_bass_loss(y, sr, center_idx, ref_audio)
         surround_swap_detected = _detect_surround_swaps(ref_audio, y, settings)
         lfe_rolloff_error = _detect_lfe_rolloff(y, sr, settings, lfe_idx)
-        center_channel = y[center_idx] if center_idx is not None else y_mono
-        center_clipping_ratio = float(np.mean(np.abs(center_channel) >= settings.clip_threshold))
+        if center_idx is not None:
+            center_channel = y[center_idx]
+            center_clipping_ratio = _clipped_fraction(center_channel, settings.clip_threshold)
+            center_freqs, center_mag_db = _mean_spectrum_db(center_channel, sr, settings)
+        else:
+            center_channel = y_mono
+            center_clipping_ratio = _clipped_fraction(y_mono, settings.clip_threshold)
+            center_freqs, center_mag_db = freqs, mag_db
         center_clipping_detected = center_clipping_ratio >= settings.clip_ratio_warn
-        center_freqs, center_mag_db = _mean_spectrum_db(center_channel, sr, settings)
         center_reference_mag = (
             ref_mag_db if ref_mag_db is not None and ref_mag_db.shape == center_mag_db.shape else None
         )
@@ -1494,6 +1855,7 @@ def analyze_files(
                     settings.scc_min_match_confidence,
                 )
             )
+            del ref_band, cand_band
             if not alignment_failed:
                 alignment_method = "scc"
                 aligned_ref_mono, aligned_cand_mono = _apply_offset(
@@ -1556,7 +1918,10 @@ def analyze_files(
         limiting_waveform_paths: list[str] = []
         if reference_path and reference_mag is not None and ref_freqs is not None and path != reference_path:
             diff_source = level_matched_mono if level_matched_mono is not None else y_mono
-            diff_freqs, diff_mag_db = _mean_spectrum_db(diff_source, sr, settings)
+            if diff_source is y_mono:
+                diff_freqs, diff_mag_db = freqs, mag_db
+            else:
+                diff_freqs, diff_mag_db = _mean_spectrum_db(diff_source, sr, settings)
             if diff_mag_db.shape == reference_mag.shape:
                 diff_db = diff_mag_db - reference_mag
             else:
@@ -1568,35 +1933,44 @@ def analyze_files(
                 base = os.path.splitext(os.path.basename(path))[0]
                 diff_spectrum_path = os.path.join(output_dir, f"{base}_diff_spectrum.png")
                 _save_difference_spectrum(diff_freqs, diff_db, diff_spectrum_path)
-        if reference_path and ref_power_db is not None and ref_freqs is not None and path != reference_path:
-            if ref_power_db.shape == power_db.shape:
+        if reference_path and ref_mean_db is not None and ref_freqs is not None and path != reference_path:
+            if ref_total_frames == total_frames:
+                mean_delta_db = None
+                bucket_delta_db = None
+                delta_times = None
                 if aligned_ref_mono is not None and aligned_cand_mono is not None:
-                    matched_candidate = level_matched_mono or aligned_cand_mono
-                    aligned_freqs, aligned_times, aligned_power = _log_power_spectrogram(
+                    matched_candidate = (
+                        level_matched_mono if level_matched_mono is not None else aligned_cand_mono
+                    )
+                    _, cand_max_power, _, cand_frames = _stream_spectral_pass(
                         matched_candidate, sr, settings
                     )
-                    _, _, aligned_ref_power = _log_power_spectrogram(
+                    _, aligned_ref_max_power, _, aligned_ref_frames = _stream_spectral_pass(
                         aligned_ref_mono, sr, settings
                     )
-                    if aligned_power.shape == aligned_ref_power.shape:
-                        delta_db = aligned_power - aligned_ref_power
-                        delta_freqs = aligned_freqs
-                        delta_times = aligned_times
-                    else:
-                        delta_db = power_db - ref_power_db
-                        delta_freqs = spec_freqs
-                        delta_times = spec_times
-                else:
-                    delta_db = power_db - ref_power_db
-                    delta_freqs = spec_freqs
-                    delta_times = spec_times
+                    if cand_frames == aligned_ref_frames:
+                        cand_mean_db, cand_bucket_db, delta_times = _stream_logpower_stats(
+                            matched_candidate, sr, settings, cand_max_power, _DELTA_EQ_TIME_BUCKETS
+                        )
+                        aligned_ref_mean_db, aligned_ref_bucket_db, _ = _stream_logpower_stats(
+                            aligned_ref_mono, sr, settings, aligned_ref_max_power, _DELTA_EQ_TIME_BUCKETS
+                        )
+                        mean_delta_db = cand_mean_db - aligned_ref_mean_db
+                        bucket_delta_db = cand_bucket_db - aligned_ref_bucket_db
+                if mean_delta_db is None:
+                    cand_mean_db, cand_bucket_db, _ = _stream_logpower_stats(
+                        y_mono, sr, settings, max_power, _DELTA_EQ_TIME_BUCKETS
+                    )
+                    mean_delta_db = cand_mean_db - ref_mean_db
+                    bucket_delta_db = cand_bucket_db - ref_bucket_db
+                    delta_times = ref_bucket_times
                 eq_muffle_db, eq_boom_db, eq_warnings = _evaluate_eq_delta(
-                    delta_freqs, delta_db, settings
+                    freqs, mean_delta_db, settings
                 )
                 if output_dir:
                     base = os.path.splitext(os.path.basename(path))[0]
                     delta_eq_path = os.path.join(output_dir, f"{base}_delta_eq.png")
-                    _save_delta_eq_map(delta_freqs, delta_times, delta_db, delta_eq_path)
+                    _save_delta_eq_map(freqs, delta_times, bucket_delta_db, delta_eq_path)
         weighted_score = _weighted_score(
             freq_score,
             dr_score,
@@ -1614,7 +1988,7 @@ def analyze_files(
         if output_dir:
             base = os.path.splitext(os.path.basename(path))[0]
             spectrogram_path = os.path.join(output_dir, f"{base}_spectrogram.png")
-            _save_spectrogram(y_mono, sr, spectrogram_path, settings)
+            _save_spectrogram(y_mono, sr, spectrogram_path, settings, mel_power=mel_power)
             block_size = int(settings.clip_heatmap_block_seconds * sr)
             if block_size > 0:
                 block_count = max(1, y.shape[1] // block_size)
@@ -1736,6 +2110,19 @@ def analyze_files(
         result.summary = _build_summary(result, settings)
         results.append(result)
 
+        # Drop this file's audio (and any views into it) before loading the
+        # next one so at most the reference plus one candidate are alive.
+        y = None
+        y_mono = None
+        center_channel = None
+        mel_power = None
+        aligned_ref_mono = None
+        aligned_cand_mono = None
+        level_matched_mono = None
+        diff_source = None
+        matched_candidate = None
+        gc.collect()
+
     if len(results) > 1:
         loudness_values = [r.loudness_db for r in results if r.loudness_db > -120.0]
         if loudness_values:
@@ -1783,4 +2170,13 @@ def analyze_files(
                 )
                 result.quality_grade = _grade_score(result.score)
     results.sort(key=lambda r: r.score, reverse=True)
+    ref_audio = None
+    ref_mono = None
+    gc.collect()
+    _remove_files(leftover_temp)
+    if made_temp_root:
+        try:
+            os.rmdir(temp_root)
+        except OSError:
+            pass
     return results
