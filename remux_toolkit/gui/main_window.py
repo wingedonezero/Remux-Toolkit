@@ -23,6 +23,7 @@ from remux_toolkit.tools.ffmpeg_dvd_gui.ffmpeg_dvd_gui_gui import FFmpegDVDGUIWi
 from remux_toolkit.tools.video_source_analyzer.video_source_analyzer_gui import VideoSourceAnalyzerWidget
 from remux_toolkit.tools.crc_tool.crc_tool_gui import CRCToolWidget
 from remux_toolkit.tools.tmm_cleaner.tmm_cleaner_gui import TMMCleanerWidget
+from remux_toolkit.tools.mkv_lossless_keeper.mkv_lossless_keeper_gui import MKVLosslessKeeperWidget
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -95,6 +96,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_tmm_cleaner_action = QtGui.QAction("TMM Cleaner", self)
         self.open_tmm_cleaner_action.triggered.connect(self.open_tmm_cleaner)
 
+        self.open_mkv_lossless_keeper_action = QtGui.QAction("MKV Lossless Keeper", self)
+        self.open_mkv_lossless_keeper_action.triggered.connect(self.open_mkv_lossless_keeper)
+
     def _create_menus(self):
         menu_bar = self.menuBar()
         tools_menu = menu_bar.addMenu("&Tools")
@@ -117,6 +121,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_video_source_analyzer_action)
         tools_menu.addAction(self.open_crc_tool_action)
         tools_menu.addAction(self.open_tmm_cleaner_action)
+        tools_menu.addAction(self.open_mkv_lossless_keeper_action)
 
     def open_silence_checker(self): self._open_tool("SilenceChecker", "Leading Silence Checker", SilenceCheckerWidget)
     def open_media_comparator(self): self._open_tool("MediaComparator", "Media Comparator", MediaComparatorWidget)
@@ -139,6 +144,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_video_source_analyzer(self): self._open_tool("VideoSourceAnalyzer", "Video Source Analyzer", VideoSourceAnalyzerWidget)
     def open_crc_tool(self): self._open_tool("CRCTool", "CRC/MD5 Integrity Tool", CRCToolWidget)
     def open_tmm_cleaner(self): self._open_tool("TMMCleaner", "TMM Cleaner", TMMCleanerWidget)
+    def open_mkv_lossless_keeper(self): self._open_tool("MKVLosslessKeeper", "MKV Lossless Keeper", MKVLosslessKeeperWidget)
 
     def _open_tool(self, tool_name, tab_title, widget_class):
         if tool_name in self.open_tools:
