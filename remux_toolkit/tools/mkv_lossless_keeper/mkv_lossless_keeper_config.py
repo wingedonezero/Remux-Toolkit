@@ -21,4 +21,5 @@ DEFAULTS = {
     },
     "sub_keep_langs": "",
     "keep_und": True,
+    "clear_title": True,
 }

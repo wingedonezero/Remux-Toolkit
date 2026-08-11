@@ -204,6 +204,7 @@ class FileAnalysis:
     audio: list[Track] = field(default_factory=list)
     subs: list[Track] = field(default_factory=list)
     n_video: int = 0
+    title: str = ""     # container/segment title (what MakeMKV fills in)
     error: str = ""
 
 
@@ -214,10 +215,12 @@ class FilterSettings:
     sub_remove_cats: set = field(default_factory=set)
     sub_keep_langs: list = field(default_factory=list)     # normalized tokens
     keep_und: bool = True
+    clear_title: bool = False
 
     def is_noop(self) -> bool:
         return (not self.audio_remove_cats and not self.audio_keep_langs
-                and not self.sub_remove_cats and not self.sub_keep_langs)
+                and not self.sub_remove_cats and not self.sub_keep_langs
+                and not self.clear_title)
 
 
 @dataclass
@@ -226,6 +229,7 @@ class FilePlan:
     remove_audio: list = field(default_factory=list)
     keep_subs: list = field(default_factory=list)
     remove_subs: list = field(default_factory=list)
+    clear_title: bool = False
     skip: str | None = None
 
 
@@ -243,6 +247,7 @@ def analyze_file(path: str) -> FileAnalysis:
     if data.get("errors"):
         fa.error = "; ".join(data["errors"])
         return fa
+    fa.title = data.get("container", {}).get("properties", {}).get("title", "")
     for t in data.get("tracks", []):
         ttype = t.get("type")
         props = t.get("properties", {})
@@ -287,9 +292,11 @@ def plan_for_file(fa: FileAnalysis, fs: FilterSettings) -> FilePlan:
                 and t.category not in fs.sub_remove_cats)
         (plan.keep_subs if keep else plan.remove_subs).append(t)
 
-    if not plan.remove_audio and not plan.remove_subs:
-        plan.skip = "no tracks match the filters — nothing to remove"
-    elif fa.audio and not plan.keep_audio:
+    plan.clear_title = bool(fs.clear_title and fa.title)
+
+    if not plan.remove_audio and not plan.remove_subs and not plan.clear_title:
+        plan.skip = "nothing matches the filters — nothing to change"
+    elif fa.audio and plan.remove_audio and not plan.keep_audio:
         plan.skip = "would remove ALL audio tracks — skipped for safety"
     return plan
 
@@ -317,6 +324,8 @@ def build_command(fa: FileAnalysis, plan: FilePlan, out_path: str) -> list[str]:
             cmd += ["--subtitle-tracks", ",".join(str(t.tid) for t in plan.keep_subs)]
         else:
             cmd += ["--no-subtitles"]
+    if plan.clear_title:
+        cmd += ["--title", ""]
     cmd.append(fa.path)
     return cmd
 
@@ -332,6 +341,8 @@ def verify_output(src_fa: FileAnalysis, out_path: str, plan: FilePlan) -> list[s
     problems = []
     if out_fa.n_video != src_fa.n_video:
         problems.append(f"video track count changed ({src_fa.n_video} -> {out_fa.n_video})")
+    if plan.clear_title and out_fa.title:
+        problems.append(f'container title was not cleared (still "{out_fa.title}")')
 
     for kind, expected, got in (("audio", plan.keep_audio, out_fa.audio),
                                 ("subtitle", plan.keep_subs, out_fa.subs)):
@@ -415,6 +426,8 @@ class ProcessWorker(QThread):
             if plan.remove_subs:
                 removed_parts.append("subs: " + ", ".join(
                     f"{t.codec} {t.language} (id {t.tid})" for t in plan.remove_subs))
+            if plan.clear_title:
+                removed_parts.append(f'container title "{fa.title}"')
             removed_desc = "; ".join(removed_parts)
             self.log.emit(f"MUX   {name}: removing {removed_desc}")
             self.log.emit(f"      -> {os.path.basename(out_path)}")
@@ -487,9 +500,10 @@ class ProcessWorker(QThread):
                 results.append((fa.path, "verify-failed", detail))
             else:
                 n_removed = len(plan.remove_audio) + len(plan.remove_subs)
+                title_note = ", title cleared" if plan.clear_title else ""
                 detail = (f"removed {n_removed} track(s) [{removed_desc}], "
-                          f"kept {len(plan.keep_audio)} audio / {len(plan.keep_subs)} subs, "
-                          f"verified OK{warn} -> {os.path.basename(out_path)}")
+                          f"kept {len(plan.keep_audio)} audio / {len(plan.keep_subs)} subs"
+                          f"{title_note}, verified OK{warn} -> {os.path.basename(out_path)}")
                 self.log.emit(f"OK    {name}: verified{warn}")
                 results.append((fa.path, "success", detail))
             self.progress.emit(i, total)
