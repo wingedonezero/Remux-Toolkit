@@ -325,13 +325,20 @@ class MKVLosslessKeeperWidget(QWidget):
                 if plan.clear_title:
                     parts.append("clear title")
                 action = " + ".join(parts)
-            title_col = f'title: "{fa.title}"' if fa.title else ""
-            top = QTreeWidgetItem([os.path.basename(path), title_col, "", action])
+            top = QTreeWidgetItem([os.path.basename(path), "", "", action])
             top.setToolTip(0, path)
             self.tree.addTopLevelItem(top)
             if not (fa.error or (plan.skip and plan.skip.startswith("error"))):
                 remove_ids = {t.tid for t in plan.remove_audio} | {t.tid for t in plan.remove_subs}
                 effective = plan.skip is None
+                if fa.title:
+                    will_remove = effective and plan.clear_title
+                    child = QTreeWidgetItem(
+                        ["", f'Title: "{fa.title}"', "",
+                         "REMOVE" if will_remove else "keep"])
+                    child.setForeground(3, Qt.GlobalColor.red if will_remove
+                                        else Qt.GlobalColor.darkGreen)
+                    top.addChild(child)
                 for kind, tracks in (("", fa.audio), ("Sub: ", fa.subs)):
                     for t in tracks:
                         will_remove = effective and t.tid in remove_ids
