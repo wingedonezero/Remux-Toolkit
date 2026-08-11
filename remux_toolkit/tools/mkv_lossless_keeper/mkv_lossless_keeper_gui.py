@@ -152,6 +152,18 @@ class MKVLosslessKeeperWidget(QWidget):
 
         layout.addLayout(filters_row)
 
+        title_row = QHBoxLayout()
+        self.clear_title_chk = QCheckBox(
+            "Clear container title (MakeMKV's \"Disc 1 Title X\" — players then show the filename)")
+        self.clear_title_chk.setChecked(True)
+        self.clear_title_chk.setToolTip(
+            "Blanks the MKV segment title via mkvmerge --title \"\" in the same pass\n"
+            "as track removal. Files whose only change is the title still get processed.")
+        self.clear_title_chk.stateChanged.connect(self.refresh_tree_actions)
+        title_row.addWidget(self.clear_title_chk)
+        title_row.addStretch(1)
+        layout.addLayout(title_row)
+
         # --- buttons ---
         btns = QHBoxLayout()
         self.btn_add = QPushButton("Add Files…")
@@ -204,6 +216,7 @@ class MKVLosslessKeeperWidget(QWidget):
         self.audio_lang_edit.setText(settings.get("audio_keep_langs", DEFAULTS["audio_keep_langs"]))
         self.sub_lang_edit.setText(settings.get("sub_keep_langs", DEFAULTS["sub_keep_langs"]))
         self.keep_und_chk.setChecked(bool(settings.get("keep_und", DEFAULTS["keep_und"])))
+        self.clear_title_chk.setChecked(bool(settings.get("clear_title", DEFAULTS["clear_title"])))
 
     def save_settings(self):
         self.app_manager.save_config(self.tool_name, {
@@ -212,6 +225,7 @@ class MKVLosslessKeeperWidget(QWidget):
             "sub_remove_categories": {k: cb.isChecked() for k, cb in self.sub_boxes.items()},
             "sub_keep_langs": self.sub_lang_edit.text(),
             "keep_und": self.keep_und_chk.isChecked(),
+            "clear_title": self.clear_title_chk.isChecked(),
         })
 
     def shutdown(self):
@@ -259,6 +273,7 @@ class MKVLosslessKeeperWidget(QWidget):
             sub_remove_cats={k for k, cb in self.sub_boxes.items() if cb.isChecked()},
             sub_keep_langs=core.parse_lang_list(self.sub_lang_edit.text()),
             keep_und=self.keep_und_chk.isChecked(),
+            clear_title=self.clear_title_chk.isChecked(),
         )
 
     def start_analyze(self):
@@ -301,13 +316,29 @@ class MKVLosslessKeeperWidget(QWidget):
                 continue
             plan = core.plan_for_file(fa, filters)
             n_remove = len(plan.remove_audio) + len(plan.remove_subs)
-            action = plan.skip if plan.skip else f"will remove {n_remove} track(s)"
+            if plan.skip:
+                action = plan.skip
+            else:
+                parts = []
+                if n_remove:
+                    parts.append(f"will remove {n_remove} track(s)")
+                if plan.clear_title:
+                    parts.append("clear title")
+                action = " + ".join(parts)
             top = QTreeWidgetItem([os.path.basename(path), "", "", action])
             top.setToolTip(0, path)
             self.tree.addTopLevelItem(top)
             if not (fa.error or (plan.skip and plan.skip.startswith("error"))):
                 remove_ids = {t.tid for t in plan.remove_audio} | {t.tid for t in plan.remove_subs}
                 effective = plan.skip is None
+                if fa.title:
+                    will_remove = effective and plan.clear_title
+                    child = QTreeWidgetItem(
+                        ["", f'Title: "{fa.title}"', "",
+                         "REMOVE" if will_remove else "keep"])
+                    child.setForeground(3, Qt.GlobalColor.red if will_remove
+                                        else Qt.GlobalColor.darkGreen)
+                    top.addChild(child)
                 for kind, tracks in (("", fa.audio), ("Sub: ", fa.subs)):
                     for t in tracks:
                         will_remove = effective and t.tid in remove_ids
