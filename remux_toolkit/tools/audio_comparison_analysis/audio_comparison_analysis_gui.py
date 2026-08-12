@@ -159,6 +159,7 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             labels = {
                 "name": QtWidgets.QLabel("-"),
                 "info": QtWidgets.QLabel("-"),
+                "integrity": QtWidgets.QLabel("-"),
                 "dr": QtWidgets.QLabel("-"),
                 "dr_score": QtWidgets.QLabel("-"),
                 "lra": QtWidgets.QLabel("-"),
@@ -197,8 +198,14 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Policy.Expanding,
                 QtWidgets.QSizePolicy.Policy.Preferred,
             )
+            labels["integrity"].setWordWrap(True)
+            labels["integrity"].setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
             card_layout.addRow("File Info", labels["name"])
             card_layout.addRow("Stream", labels["info"])
+            card_layout.addRow("Decode Integrity", labels["integrity"])
             card_layout.addRow("Crest Factor", labels["dr"])
             card_layout.addRow("Dynamics Score", labels["dr_score"])
             card_layout.addRow("Loudness Range", labels["lra"])
@@ -736,17 +743,55 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         set_tip(self.dialogue_clarity_penalty, "Penalty for center-channel NR/clipping.")
         layout.addRow("Dialogue Clarity Penalty", self.dialogue_clarity_penalty)
 
-        self.fake_multichannel_corr_threshold = QtWidgets.QDoubleSpinBox()
-        self.fake_multichannel_corr_threshold.setRange(0.7, 0.999)
-        self.fake_multichannel_corr_threshold.setSingleStep(0.01)
-        set_tip(self.fake_multichannel_corr_threshold, "Correlation threshold for fake multichannel.")
-        layout.addRow("Fake Multi Corr Threshold", self.fake_multichannel_corr_threshold)
+        self.pair_corr_fake_threshold = QtWidgets.QDoubleSpinBox()
+        self.pair_corr_fake_threshold.setRange(0.8, 0.999)
+        self.pair_corr_fake_threshold.setSingleStep(0.005)
+        self.pair_corr_fake_threshold.setDecimals(3)
+        set_tip(
+            self.pair_corr_fake_threshold,
+            "Per-pair channel correlation (FL-FR, FC-FL, BL-BR) above which a "
+            "multichannel track is judged a matrix upmix. True discrete mixes "
+            "measure well under 0.9 on real content.",
+        )
+        layout.addRow("Fake Pair Corr Threshold", self.pair_corr_fake_threshold)
 
-        self.fake_multichannel_energy_variance_db = QtWidgets.QDoubleSpinBox()
-        self.fake_multichannel_energy_variance_db.setRange(1.0, 20.0)
-        self.fake_multichannel_energy_variance_db.setSingleStep(0.5)
-        set_tip(self.fake_multichannel_energy_variance_db, "Max channel energy spread for fake multichannel.")
-        layout.addRow("Fake Multi Energy Spread (dB)", self.fake_multichannel_energy_variance_db)
+        self.lfe_dead_rms_db = QtWidgets.QDoubleSpinBox()
+        self.lfe_dead_rms_db.setRange(-160.0, -40.0)
+        self.lfe_dead_rms_db.setSingleStep(5.0)
+        set_tip(
+            self.lfe_dead_rms_db,
+            "LFE RMS below this over the whole runtime = dead channel.",
+        )
+        layout.addRow("Dead LFE RMS (dB)", self.lfe_dead_rms_db)
+
+        self.decode_error_limit = QtWidgets.QSpinBox()
+        self.decode_error_limit.setRange(1, 100000)
+        set_tip(
+            self.decode_error_limit,
+            "Decoder-error lines from ffmpeg at or above this count mark the "
+            "stream as damaged (a couple of errors at stream start can be benign).",
+        )
+        layout.addRow("Decode Error Limit", self.decode_error_limit)
+
+        self.decode_duration_tolerance_s = QtWidgets.QDoubleSpinBox()
+        self.decode_duration_tolerance_s.setRange(0.05, 10.0)
+        self.decode_duration_tolerance_s.setSingleStep(0.1)
+        set_tip(
+            self.decode_duration_tolerance_s,
+            "Decoded audio shorter/longer than the container claims by more than "
+            "this = dropped frames, even when ffmpeg reported no errors.",
+        )
+        layout.addRow("Decode Duration Tolerance (s)", self.decode_duration_tolerance_s)
+
+        self.sync_step_warn_ms = QtWidgets.QDoubleSpinBox()
+        self.sync_step_warn_ms.setRange(1.0, 500.0)
+        self.sync_step_warn_ms.setSingleStep(1.0)
+        set_tip(
+            self.sync_step_warn_ms,
+            "Warn when per-chunk alignment offsets disagree across the runtime "
+            "by more than this (a splice/step breaks single-offset comparison).",
+        )
+        layout.addRow("Sync Step Warn (ms)", self.sync_step_warn_ms)
 
         self.mel_bins = QtWidgets.QSpinBox()
         self.mel_bins.setRange(32, 512)
@@ -908,14 +953,22 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.dialogue_clarity_penalty.setValue(
             settings.get("dialogue_clarity_penalty", DEFAULTS["dialogue_clarity_penalty"])
         )
-        self.fake_multichannel_corr_threshold.setValue(
-            settings.get("fake_multichannel_corr_threshold", DEFAULTS["fake_multichannel_corr_threshold"])
+        self.pair_corr_fake_threshold.setValue(
+            settings.get("pair_corr_fake_threshold", DEFAULTS["pair_corr_fake_threshold"])
         )
-        self.fake_multichannel_energy_variance_db.setValue(
+        self.lfe_dead_rms_db.setValue(
+            settings.get("lfe_dead_rms_db", DEFAULTS["lfe_dead_rms_db"])
+        )
+        self.decode_error_limit.setValue(
+            int(settings.get("decode_error_limit", DEFAULTS["decode_error_limit"]))
+        )
+        self.decode_duration_tolerance_s.setValue(
             settings.get(
-                "fake_multichannel_energy_variance_db",
-                DEFAULTS["fake_multichannel_energy_variance_db"],
+                "decode_duration_tolerance_s", DEFAULTS["decode_duration_tolerance_s"]
             )
+        )
+        self.sync_step_warn_ms.setValue(
+            settings.get("sync_step_warn_ms", DEFAULTS["sync_step_warn_ms"])
         )
         self.mel_bins.setValue(settings.get("mel_bins", DEFAULTS["mel_bins"]))
         self.weight_frequency.setValue(settings.get("weight_frequency", DEFAULTS["weight_frequency"]))
@@ -988,8 +1041,11 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             "loudness_diff_warn_db": self.loudness_diff_warn_db.value(),
             "mastering_diff_penalty_db": self.mastering_diff_penalty_db.value(),
             "dialogue_clarity_penalty": self.dialogue_clarity_penalty.value(),
-            "fake_multichannel_corr_threshold": self.fake_multichannel_corr_threshold.value(),
-            "fake_multichannel_energy_variance_db": self.fake_multichannel_energy_variance_db.value(),
+            "pair_corr_fake_threshold": self.pair_corr_fake_threshold.value(),
+            "lfe_dead_rms_db": self.lfe_dead_rms_db.value(),
+            "decode_error_limit": self.decode_error_limit.value(),
+            "decode_duration_tolerance_s": self.decode_duration_tolerance_s.value(),
+            "sync_step_warn_ms": self.sync_step_warn_ms.value(),
             "mel_bins": self.mel_bins.value(),
             "weight_frequency": self.weight_frequency.value(),
             "weight_dynamic_range": self.weight_dynamic_range.value(),
@@ -1141,6 +1197,14 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         for idx, result in enumerate(results[:4]):
             labels = self.file_cards[idx]
             flags = []
+            if result.get("disqualified"):
+                flags.append("DISQUALIFIED")
+            if result.get("decode_damaged"):
+                flags.append("Corrupt stream")
+            if result.get("lfe_dead"):
+                flags.append("Dead LFE")
+            if result.get("sync_step_detected"):
+                flags.append("Sync step")
             if result.get("reference_path") and result.get("path") == result.get("reference_path"):
                 flags.append("Reference")
             if result.get("reencode_detected"):
@@ -1194,6 +1258,22 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 if result.get("bitrate_kbps")
                 else f"{result['channels']}ch @ {result['sample_rate']} Hz{codec_label} | {result['file_size_mb']:.1f} MB"
             )
+            if result.get("decode_damaged"):
+                regions = result.get("damaged_regions") or []
+                integrity = (
+                    f"DAMAGED: {result.get('decode_errors', 0)} decoder errors, "
+                    f"{abs(result.get('duration_mismatch_s', 0.0)):.1f}s missing"
+                )
+                if regions:
+                    region_text = ", ".join(f"{s:.0f}-{e:.0f}s" for s, e in regions[:3])
+                    integrity += f" (~{region_text})"
+                labels["integrity"].setText(integrity)
+            elif result.get("decode_errors"):
+                labels["integrity"].setText(
+                    f"OK ({result['decode_errors']} decoder errors, below limit)"
+                )
+            else:
+                labels["integrity"].setText("OK")
             labels["dr"].setText(f"{result['dr_db']:.1f} dB (blocks {result['dr_blocks_used']})")
             labels["dr_score"].setText(f"{result['dr_score']:.1f}")
             labels["lra"].setText(f"{result.get('loudness_range_db', 0.0):.1f} dB")
@@ -1214,17 +1294,32 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
                 labels["pitch"].setText(f"{pitch_ratio:.4f}x")
             else:
                 labels["pitch"].setText("N/A")
-            channel_text = "OK"
+            channel_issues = []
+            if result.get("fake_multichannel"):
+                reasons = result.get("fake_reasons") or []
+                channel_issues.append(
+                    "FAKE MULTICHANNEL: " + "; ".join(reasons) if reasons else "FAKE MULTICHANNEL"
+                )
+            elif result.get("fake_reasons"):
+                channel_issues.append("; ".join(result["fake_reasons"]))
+            elif result.get("lfe_dead"):
+                channel_issues.append("Dead LFE")
             if result.get("surround_swap_detected"):
-                channel_text = "Surround swap"
+                channel_issues.append("Surround swap")
             if result.get("lfe_rolloff_error"):
-                channel_text = f"{channel_text}, LFE roll-off" if channel_text != "OK" else "LFE roll-off"
-            labels["channel"].setText(channel_text)
+                channel_issues.append("LFE roll-off")
+            labels["channel"].setText(", ".join(channel_issues) if channel_issues else "OK")
             if result.get("reference_path") and result.get("path") != result.get("reference_path"):
-                labels["alignment"].setText(
+                alignment_text = (
                     f"{result.get('alignment_offset_s', 0.0):+.3f}s "
                     f"(conf {result.get('alignment_confidence', 0.0):.1f})"
                 )
+                if result.get("sync_step_detected"):
+                    alignment_text += (
+                        f" | STEP {result.get('sync_step_delta_ms', 0.0):+.1f} ms "
+                        f"at ~{(result.get('sync_step_time_s') or 0.0):.0f}s"
+                    )
+                labels["alignment"].setText(alignment_text)
             else:
                 labels["alignment"].setText("N/A")
             breakdown = (
@@ -1256,17 +1351,27 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
     def _update_summary(self, results: list[dict]):
         lines = []
         for rank, result in enumerate(results, start=1):
+            prefix = "[DQ] " if result.get("disqualified") else ""
             lines.append(
-                f"Ranked #{rank}: {os.path.basename(result['path'])} - {result['summary']} (Score {result['score']:.1f})"
+                f"Ranked #{rank}: {prefix}{os.path.basename(result['path'])} - "
+                f"{result['summary']} (Score {result['score']:.1f})"
             )
         self.summary_box.setText("\n".join(lines))
         if results:
-            best = results[0]
-            verdict = (
-                f"Best Copy: {os.path.basename(best['path'])}\n"
-                f"Reason: {best['summary']} (Grade {best.get('quality_grade', '-')}, "
-                f"Score {best['score']:.1f})"
-            )
+            clean = [r for r in results if not r.get("disqualified")]
+            disqualified = [r for r in results if r.get("disqualified")]
+            if clean:
+                best = clean[0]
+                verdict = (
+                    f"Best Copy: {os.path.basename(best['path'])}\n"
+                    f"Reason: {best['summary']} (Grade {best.get('quality_grade', '-')}, "
+                    f"Score {best['score']:.1f})"
+                )
+            else:
+                verdict = "No usable track: every file was disqualified."
+            for result in disqualified:
+                reasons = "; ".join(result.get("disqualify_reasons") or [])
+                verdict += f"\nDisqualified: {os.path.basename(result['path'])} - {reasons}"
             self.verdict_box.setText(verdict)
         else:
             self.verdict_box.clear()
