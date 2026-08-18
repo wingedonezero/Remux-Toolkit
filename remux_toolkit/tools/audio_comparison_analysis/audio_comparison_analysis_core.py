@@ -7,6 +7,7 @@ import gc
 import json
 import math
 import os
+import re
 import subprocess
 import tempfile
 from typing import Iterable
@@ -95,8 +96,11 @@ class AnalysisSettings:
     loudness_diff_warn_db: float
     mastering_diff_penalty_db: float
     dialogue_clarity_penalty: float
-    fake_multichannel_corr_threshold: float
-    fake_multichannel_energy_variance_db: float
+    decode_error_limit: int
+    decode_duration_tolerance_s: float
+    pair_corr_fake_threshold: float
+    lfe_dead_rms_db: float
+    sync_step_warn_ms: float
     mel_bins: int
     weight_frequency: float
     weight_dynamic_range: float
@@ -178,6 +182,20 @@ class AudioAnalysisResult:
     lr_noise_floor_diff_db: float
     lr_imbalance_detected: bool
     center_bass_loss_db: float
+    decode_errors: int
+    container_duration_s: float
+    duration_mismatch_s: float
+    decode_damaged: bool
+    damaged_regions: list[tuple[float, float]]
+    channel_corr_pairs: dict[str, float]
+    channel_rms_db: list[float]
+    lfe_dead: bool
+    fake_reasons: list[str]
+    sync_step_detected: bool
+    sync_step_time_s: float | None
+    sync_step_delta_ms: float
+    disqualified: bool
+    disqualify_reasons: list[str]
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -252,8 +270,127 @@ def _estimated_decoded_bytes(path: str) -> int | None:
     return int(duration * channels * sample_rate * 4)
 
 
-def _decode_to_memmap(path: str, temp_dir: str, target_sr: int) -> tuple[np.ndarray, int, list[str]]:
-    """Decode the first audio stream to raw float32 on disk and memory-map it."""
+# Substrings (lowercase) that mark a decoder-error line in ffmpeg stderr.
+# ffmpeg exits 0 and silently drops the bad frames, so counting these lines
+# is the only way to know the decode was incomplete.
+_DECODE_ERROR_PATTERNS = (
+    "error submitting packet",
+    "invalid data found",
+    "invalid frame type",
+    "invalid sample rate",
+    "error while decoding",
+    "header missing",
+    "frame sync error",
+    "corrupt",
+    "invalid nal",
+)
+
+
+def _count_decoder_errors(stderr_text: str) -> int:
+    count = 0
+    last_was_error = False
+    for line in stderr_text.splitlines():
+        low = line.lower()
+        # ffmpeg collapses identical consecutive messages; credit the batch to
+        # the preceding error line so counts stay exact even without repeat+.
+        repeat = re.search(r"last message repeated (\d+) times", low)
+        if repeat:
+            if last_was_error:
+                count += int(repeat.group(1))
+            continue
+        if any(p in low for p in _DECODE_ERROR_PATTERNS):
+            count += 1
+            last_was_error = True
+        else:
+            last_was_error = False
+    return count
+
+
+def _null_decode_error_scan(path: str) -> int:
+    """Decode the first audio stream to null and count decoder-error lines."""
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-v",
+        "repeat+error",
+        "-i",
+        path,
+        "-map",
+        "0:a:0",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return 0
+    return _count_decoder_errors(proc.stderr or "")
+
+
+def _locate_damage_regions(
+    path: str, duration_s: float | None, n_segments: int = 10
+) -> list[tuple[float, float]]:
+    """Null-decode the stream in segments and report which time ranges error."""
+    if not duration_s or duration_s <= 0:
+        return []
+    seg_len = duration_s / n_segments
+    damaged: list[int] = []
+    for i in range(n_segments):
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-v",
+            "repeat+error",
+            "-ss",
+            f"{i * seg_len:.3f}",
+            "-t",
+            f"{seg_len:.3f}",
+            "-i",
+            path,
+            "-map",
+            "0:a:0",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError:
+            return []
+        if _count_decoder_errors(proc.stderr or "") > 0:
+            damaged.append(i)
+    regions: list[tuple[float, float]] = []
+    for i in damaged:
+        start, end = i * seg_len, (i + 1) * seg_len
+        if regions and regions[-1][1] >= start - 1e-6:
+            regions[-1] = (regions[-1][0], end)
+        else:
+            regions.append((start, end))
+    return regions
+
+
+def _container_duration(metadata: dict) -> float | None:
+    """Container-claimed audio duration: stream duration first, format fallback."""
+    for key in ("stream_duration", "duration"):
+        try:
+            value = float(metadata.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _decode_to_memmap(
+    path: str, temp_dir: str, target_sr: int
+) -> tuple[np.ndarray, int, list[str], int]:
+    """Decode the first audio stream to raw float32 on disk and memory-map it.
+
+    Also returns the decoder-error count parsed from ffmpeg stderr: ffmpeg
+    exits 0 even when it drops undecodable frames, so the caller must check
+    this to know the decode was complete.
+    """
     _, channels, sample_rate = _probe_stream_basics(path)
     if not channels or not sample_rate:
         raise RuntimeError(f"ffprobe could not describe the audio stream in: {path}")
@@ -263,7 +400,7 @@ def _decode_to_memmap(path: str, temp_dir: str, target_sr: int) -> tuple[np.ndar
     cmd = [
         "ffmpeg",
         "-v",
-        "error",
+        "repeat+error",
         "-nostdin",
         "-y",
         "-i",
@@ -277,10 +414,14 @@ def _decode_to_memmap(path: str, temp_dir: str, target_sr: int) -> tuple[np.ndar
         raw_path,
     ]
     try:
-        subprocess.check_call(cmd)
-    except subprocess.CalledProcessError as exc:
+        proc = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as exc:
         _remove_files([raw_path])
         raise RuntimeError(f"ffmpeg failed to decode audio from: {path}") from exc
+    decode_errors = _count_decoder_errors(proc.stderr or "")
+    if proc.returncode != 0:
+        _remove_files([raw_path])
+        raise RuntimeError(f"ffmpeg failed to decode audio from: {path}")
     frames = os.path.getsize(raw_path) // (4 * channels)
     if frames == 0:
         _remove_files([raw_path])
@@ -291,9 +432,9 @@ def _decode_to_memmap(path: str, temp_dir: str, target_sr: int) -> tuple[np.ndar
         # space is reclaimed automatically once the memmap is released.
         try:
             os.remove(raw_path)
-            return audio, sample_rate, []
+            return audio, sample_rate, [], decode_errors
         except OSError:
-            return audio, sample_rate, [raw_path]
+            return audio, sample_rate, [raw_path], decode_errors
     res_path = raw_path + ".resampled"
     out = None
     for ch in range(channels):
@@ -308,19 +449,21 @@ def _decode_to_memmap(path: str, temp_dir: str, target_sr: int) -> tuple[np.ndar
     _remove_files([raw_path])
     try:
         os.remove(res_path)
-        return out, target_sr, []
+        return out, target_sr, [], decode_errors
     except OSError:
-        return out, target_sr, [res_path]
+        return out, target_sr, [res_path], decode_errors
 
 
 def _load_audio(
     path: str, target_sr: int, temp_dir: str | None = None
-) -> tuple[np.ndarray, int, list[str]]:
+) -> tuple[np.ndarray, int, list[str], int | None]:
     """Load audio as a (channels, samples) array.
 
     Files whose decoded size exceeds _LARGE_DECODE_BYTES are decoded to a
     disk-backed memmap instead of RAM; the returned temp-file list must be
-    removed by the caller once analysis is done.
+    removed by the caller once analysis is done. The final element is the
+    ffmpeg decoder-error count, or None when the file was loaded by
+    soundfile/librosa and no error count is available.
     """
     if temp_dir:
         estimated = _estimated_decoded_bytes(path)
@@ -351,7 +494,7 @@ def _load_audio(
         audio = np.stack([_resample_audio(channel, sr, target_sr) for channel in audio], axis=0)
         sr = target_sr
 
-    return audio, sr, []
+    return audio, sr, [], None
 
 
 def _mono_mix(y: np.ndarray) -> np.ndarray:
@@ -543,23 +686,87 @@ def _apply_offset(
     return ref[:min_len], cand[:min_len]
 
 
+def _detect_sync_step(
+    offsets_s: np.ndarray,
+    confidences: np.ndarray,
+    times_s: np.ndarray,
+    min_confidence: float,
+    warn_ms: float,
+) -> dict | None:
+    """Find a sustained offset step across the runtime from per-chunk offsets.
+
+    A single global delay silently mis-aligns everything after a mid-stream
+    splice; comparing the median offset on each side of every split point
+    catches both hard steps and steady drift. Requires enough confident
+    chunks on both sides so scene-change noise cannot fake a step.
+    """
+    mask = confidences >= min_confidence
+    if int(mask.sum()) < 12:
+        return None
+    off_ms = offsets_s[mask] * 1000.0
+    times = times_s[mask]
+    min_side = max(5, off_ms.size // 20)
+    deltas = np.zeros(off_ms.size)
+    for i in range(min_side, off_ms.size - min_side):
+        deltas[i] = abs(float(np.median(off_ms[i:])) - float(np.median(off_ms[:i])))
+    best_delta = float(deltas.max()) if deltas.size else 0.0
+    if best_delta < warn_ms:
+        return None
+    # Every split strictly inside a plateau pair scores the same delta, so
+    # break ties by side coherence: the true boundary is where both sides are
+    # tightest around their own medians. Mean deviation (not median) so that
+    # even a minority of wrong-side chunks pulls the split toward the boundary.
+    candidates = np.where(deltas >= best_delta - 0.5)[0]
+    best_idx = None
+    best_spread = None
+    for i in candidates:
+        left, right = off_ms[:i], off_ms[i:]
+        spread = float(np.mean(np.abs(left - np.median(left)))) + float(
+            np.mean(np.abs(right - np.median(right)))
+        )
+        if best_spread is None or spread < best_spread:
+            best_spread = spread
+            best_idx = int(i)
+    if best_idx is None:
+        return None
+    before = float(np.median(off_ms[:best_idx]))
+    after = float(np.median(off_ms[best_idx:]))
+    left = off_ms[:best_idx]
+    right = off_ms[best_idx:]
+    mad_left = float(np.median(np.abs(left - before)))
+    mad_right = float(np.median(np.abs(right - after)))
+    # A genuine splice has two tight plateaus (sub-ms spread). Wildly
+    # scattered offsets mean the chunk alignment itself is unreliable —
+    # report that honestly instead of inventing a step time.
+    coherent = mad_left <= 5.0 * warn_ms and mad_right <= 5.0 * warn_ms
+    return {
+        "kind": "step" if coherent else "inconsistent",
+        "time_s": float(times[best_idx]),
+        "delta_ms": after - before,
+        "before_ms": before,
+        "after_ms": after,
+    }
+
+
 def _scc_align_offset(
     ref: np.ndarray,
     cand: np.ndarray,
     sr: int,
     min_confidence: float,
-) -> tuple[float, float, bool, str | None]:
+    sync_step_warn_ms: float,
+) -> tuple[float, float, bool, str | None, dict | None]:
     """SCC-style chunked correlation alignment with consensus confidence."""
     if ref.size == 0 or cand.size == 0:
-        return 0.0, 0.0, True, "Empty audio for alignment."
+        return 0.0, 0.0, True, "Empty audio for alignment.", None
     chunk_seconds = 5.0
     hop_seconds = 2.5
     chunk_len = int(chunk_seconds * sr)
     hop_len = int(hop_seconds * sr)
     if chunk_len <= 0 or hop_len <= 0:
-        return 0.0, 0.0, True, "Invalid SCC chunk sizing."
+        return 0.0, 0.0, True, "Invalid SCC chunk sizing.", None
     offsets = []
     confidences = []
+    chunk_times = []
     max_start = max(0, min(ref.size, cand.size) - chunk_len)
     for start in range(0, max_start + 1, hop_len):
         ref_chunk = ref[start : start + chunk_len]
@@ -573,13 +780,21 @@ def _scc_align_offset(
         offset_samples = peak_idx - (len(ref_chunk) - 1)
         offsets.append(offset_samples / sr)
         confidences.append(confidence)
+        chunk_times.append(start / sr)
     if not offsets:
-        return 0.0, 0.0, True, "SCC alignment failed to find chunks."
+        return 0.0, 0.0, True, "SCC alignment failed to find chunks.", None
+    sync_step = _detect_sync_step(
+        np.asarray(offsets),
+        np.asarray(confidences),
+        np.asarray(chunk_times),
+        min_confidence,
+        sync_step_warn_ms,
+    )
     median_confidence = float(np.median(confidences))
     if median_confidence < min_confidence:
-        return 0.0, median_confidence, True, "SCC confidence below threshold."
+        return 0.0, median_confidence, True, "SCC confidence below threshold.", sync_step
     offset_s = float(np.median(offsets))
-    return offset_s, median_confidence, False, None
+    return offset_s, median_confidence, False, None, sync_step
 def _stft_frame_count(n_samples: int, n_fft: int, hop_length: int) -> int:
     return 1 + (n_samples + 2 * (n_fft // 2) - n_fft) // hop_length
 
@@ -1190,25 +1405,135 @@ def _detect_center_bass_loss(y: np.ndarray, sr: int, center_idx: int | None, ref
     return 0.0
 
 
-def _detect_fake_multichannel(y: np.ndarray, settings: AnalysisSettings) -> bool:
-    if y.shape[0] < 6:
-        return False
-    n = y.shape[1]
-    if n == 0:
-        return False
-    s1, s2 = _stream_gram([y[i] for i in range(y.shape[0])], n)
-    corr = _corr_from_gram(s1, s2, n)
-    if corr.shape[0] < 2:
-        return False
-    upper = corr[np.triu_indices_from(corr, k=1)]
-    median_corr = float(np.median(np.abs(upper))) if upper.size else 0.0
-    rms = np.sqrt(np.diag(s2) / n)
-    rms_db = 20 * np.log10(np.maximum(rms, 1e-12))
-    energy_spread = float(np.max(rms_db) - np.min(rms_db))
-    return (
-        median_corr >= settings.fake_multichannel_corr_threshold
-        and energy_spread <= settings.fake_multichannel_energy_variance_db
+def _analyze_channel_structure(
+    y: np.ndarray, sr: int, settings: AnalysisSettings
+) -> dict | None:
+    """Full-file streamed channel correlation/covariance and per-channel RMS.
+
+    Digitally silent stretches (1 s blocks whose all-channel RMS is under the
+    silence floor) are excluded from the accumulation: silence tells us
+    nothing about channel structure and dilutes the correlations. Every
+    non-silent sample in the file is counted — this is not a sampling scheme.
+    """
+    if y.ndim < 2 or y.shape[0] < 2 or y.shape[1] == 0 or sr <= 0:
+        return None
+    k, n = y.shape
+    block = int(sr)
+    s1 = np.zeros(k, dtype=np.float64)
+    s2 = np.zeros((k, k), dtype=np.float64)
+    count = 0
+    for s, e in _iter_ranges(0, n, block):
+        seg = np.asarray(y[:, s:e], dtype=np.float64)
+        block_rms = math.sqrt(float(np.mean(seg * seg)))
+        if 20.0 * math.log10(max(block_rms, 1e-12)) < settings.dr_silence_db:
+            continue
+        s1 += seg.sum(axis=1)
+        s2 += seg @ seg.T
+        count += seg.shape[1]
+    if count < sr * 5:
+        return None
+    corr = _corr_from_gram(s1, s2, count)
+    cov = s2 / count - np.outer(s1, s1) / (float(count) * count)
+    rms = np.sqrt(np.clip(np.diag(s2) / count, 0.0, None))
+    rms_db = 20.0 * np.log10(np.maximum(rms, 1e-12))
+    return {"corr": corr, "cov": cov, "rms_db": rms_db, "seconds": count / sr}
+
+
+def _evaluate_fake_multichannel(
+    structure: dict | None,
+    chmap: dict[str, int],
+    settings: AnalysisSettings,
+) -> tuple[bool, list[str], dict[str, float], bool, list[float]]:
+    """Judge channel structure the way a manual reviewer would.
+
+    Returns (fake, reasons, pair_correlations, lfe_dead, per_channel_rms_db).
+    A matrix upmix shows near-1.0 correlation on specific pairs (mono fronts,
+    duplicated center, mono/difference surrounds) and often a dead LFE —
+    true discrete mixes measure well under the threshold on real content.
+    """
+    if structure is None:
+        return False, [], {}, False, []
+    corr = structure["corr"]
+    cov = structure["cov"]
+    rms_db = structure["rms_db"]
+    thr = settings.pair_corr_fake_threshold
+    pairs: dict[str, float] = {}
+    reasons: list[str] = []
+
+    def pair_corr(a: str, b: str) -> float | None:
+        ia, ib = chmap.get(a), chmap.get(b)
+        if ia is None or ib is None or ia >= corr.shape[0] or ib >= corr.shape[0]:
+            return None
+        value = float(corr[ia, ib])
+        pairs[f"{a}-{b}"] = value
+        return value
+
+    def corr_with_front_diff(name: str) -> float | None:
+        """Correlation of a channel against the FL-FR difference signal."""
+        i, fl, fr = chmap.get(name), chmap.get("FL"), chmap.get("FR")
+        if i is None or fl is None or fr is None:
+            return None
+        var_d = cov[fl, fl] + cov[fr, fr] - 2.0 * cov[fl, fr]
+        denom = math.sqrt(max(var_d, 0.0) * max(cov[i, i], 0.0))
+        if denom <= 1e-18:
+            return None
+        value = float((cov[i, fl] - cov[i, fr]) / denom)
+        pairs[f"{name}-(FL-FR)"] = value
+        return value
+
+    fl_fr = pair_corr("FL", "FR")
+    fc_fl = pair_corr("FC", "FL")
+    fc_fr = pair_corr("FC", "FR")
+    surround_pair = None
+    for a, b in (("BL", "BR"), ("SL", "SR")):
+        if chmap.get(a) is not None and chmap.get(b) is not None:
+            surround_pair = pair_corr(a, b)
+            break
+
+    mono_fronts = fl_fr is not None and fl_fr >= thr
+    center_dup = (
+        fc_fl is not None and fc_fr is not None and fc_fl >= thr and fc_fr >= thr
     )
+    mono_surrounds = surround_pair is not None and surround_pair >= thr
+
+    matrix_surrounds = False
+    for name in ("BL", "BR", "SL", "SR"):
+        diff_corr = corr_with_front_diff(name)
+        if diff_corr is not None and abs(diff_corr) >= thr:
+            matrix_surrounds = True
+
+    lfe_idx = chmap.get("LFE")
+    lfe_dead = (
+        lfe_idx is not None
+        and lfe_idx < rms_db.shape[0]
+        and float(rms_db[lfe_idx]) < settings.lfe_dead_rms_db
+    )
+
+    if mono_fronts:
+        reasons.append(f"mono fronts (corr FL-FR {fl_fr:.3f})")
+    if center_dup:
+        reasons.append(f"duplicated center (corr FC-FL {fc_fl:.3f})")
+    if mono_surrounds:
+        reasons.append(f"mono/matrix surrounds (corr {surround_pair:.3f})")
+    if matrix_surrounds:
+        reasons.append("surrounds are an FL-FR difference signal (matrix upmix)")
+    if lfe_dead:
+        reasons.append(f"dead LFE ({float(rms_db[lfe_idx]):.0f} dB RMS)")
+
+    has_center_or_surrounds = (
+        chmap.get("FC") is not None or surround_pair is not None or lfe_idx is not None
+    )
+    fake = (
+        has_center_or_surrounds
+        and mono_fronts
+        and (center_dup or mono_surrounds or matrix_surrounds or lfe_dead)
+    )
+    if not fake:
+        # A dead LFE or matrix surrounds without mono fronts still deserve
+        # their reasons in the report, but only the combinations above are
+        # conclusive enough to call the track fake.
+        reasons = [r for r in reasons if r.startswith("dead LFE") or "matrix" in r]
+    return fake, reasons, pairs, lfe_dead, [float(v) for v in rms_db]
 
 
 def _score_mastering_accuracy(mean_abs_diff_db: float, settings: AnalysisSettings) -> float:
@@ -1353,7 +1678,7 @@ def _probe_audio_metadata(path: str) -> dict:
         "-select_streams",
         "a:0",
         "-show_entries",
-        "stream=channels,channel_layout,sample_rate,bit_rate,codec_name,profile",
+        "stream=channels,channel_layout,sample_rate,bit_rate,codec_name,profile,duration",
         "-show_entries",
         "format=duration:format_tags=ENCODER",
         "-of",
@@ -1380,39 +1705,51 @@ def _probe_audio_metadata(path: str) -> dict:
         "codec_name": stream.get("codec_name"),
         "profile": stream.get("profile"),
         "duration": fmt.get("duration"),
+        "stream_duration": stream.get("duration"),
         "encoder": tags.get("ENCODER") if isinstance(tags, dict) else None,
     }
 
 
-def _channel_index(channel_layout: str | None, target: str, channels: int) -> int | None:
-    if not channel_layout:
-        if target == "FC" and channels >= 3:
-            return 2
-        if target == "LFE" and channels >= 4:
-            return 3
-        return None
-    layout = channel_layout.lower()
-    layout_map = {
-        "mono": ["FC"],
-        "stereo": ["FL", "FR"],
-        "2.1": ["FL", "FR", "LFE"],
-        "3.0": ["FL", "FR", "FC"],
-        "3.1": ["FL", "FR", "FC", "LFE"],
-        "4.0": ["FL", "FR", "FC", "BC"],
-        "4.1": ["FL", "FR", "FC", "LFE", "BC"],
-        "5.0": ["FL", "FR", "FC", "BL", "BR"],
-        "5.1": ["FL", "FR", "FC", "LFE", "BL", "BR"],
-        "5.1(side)": ["FL", "FR", "FC", "LFE", "SL", "SR"],
-        "6.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "BC"],
-        "7.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
-    }
-    order = layout_map.get(layout)
+_LAYOUT_ORDERS = {
+    "mono": ["FC"],
+    "stereo": ["FL", "FR"],
+    "2.1": ["FL", "FR", "LFE"],
+    "3.0": ["FL", "FR", "FC"],
+    "3.1": ["FL", "FR", "FC", "LFE"],
+    "4.0": ["FL", "FR", "FC", "BC"],
+    "4.1": ["FL", "FR", "FC", "LFE", "BC"],
+    "quad": ["FL", "FR", "BL", "BR"],
+    "5.0": ["FL", "FR", "FC", "BL", "BR"],
+    "5.0(side)": ["FL", "FR", "FC", "SL", "SR"],
+    "5.1": ["FL", "FR", "FC", "LFE", "BL", "BR"],
+    "5.1(side)": ["FL", "FR", "FC", "LFE", "SL", "SR"],
+    "6.1": ["FL", "FR", "FC", "LFE", "BC", "SL", "SR"],
+    "7.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+}
+
+# Fallback orders (ffmpeg default layouts) when ffprobe gives no layout string.
+_DEFAULT_ORDERS = {
+    1: ["FC"],
+    2: ["FL", "FR"],
+    3: ["FL", "FR", "FC"],
+    4: ["FL", "FR", "FC", "BC"],
+    5: ["FL", "FR", "FC", "BL", "BR"],
+    6: ["FL", "FR", "FC", "LFE", "BL", "BR"],
+    7: ["FL", "FR", "FC", "LFE", "BC", "SL", "SR"],
+    8: ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+}
+
+
+def _layout_channel_map(channel_layout: str | None, channels: int) -> dict[str, int]:
+    """Map semantic channel names (FL, FR, FC, LFE, BL/BR, SL/SR) to indices."""
+    order = None
+    if channel_layout:
+        order = _LAYOUT_ORDERS.get(channel_layout.lower())
+    if order is None:
+        order = _DEFAULT_ORDERS.get(channels)
     if not order:
-        return None
-    try:
-        return order.index(target)
-    except ValueError:
-        return None
+        return {}
+    return {name: idx for idx, name in enumerate(order) if idx < channels}
 
 def _probe_audio_bitrate(path: str) -> float | None:
     cmd = [
@@ -1623,6 +1960,25 @@ def _weighted_score_with_penalties(
 
 def _build_summary(result: AudioAnalysisResult, settings: AnalysisSettings) -> str:
     parts = []
+    if result.disqualified:
+        parts.append("DISQUALIFIED: " + "; ".join(result.disqualify_reasons))
+    if result.decode_damaged:
+        if result.damaged_regions:
+            region_text = ", ".join(
+                f"~{s:.0f}-{e:.0f}s" for s, e in result.damaged_regions[:3]
+            )
+            parts.append(f"Damaged regions {region_text}")
+    elif result.decode_errors:
+        parts.append(f"Decoder errors: {result.decode_errors}")
+    if result.lfe_dead and not result.disqualified:
+        parts.append("Dead LFE channel")
+    if result.sync_step_detected:
+        parts.append(
+            f"Sync step {result.sync_step_delta_ms:+.1f} ms at "
+            f"~{(result.sync_step_time_s or 0.0):.0f}s (post-step comparison unreliable)"
+        )
+    elif result.alignment_warning and not result.alignment_failed:
+        parts.append(result.alignment_warning)
     if result.reencode_detected:
         parts.append("RE-ENCODE DETECTED (no energy above 18 kHz)")
     elif result.shelf_detected:
@@ -1761,8 +2117,9 @@ def analyze_files(
     ref_mono = None
     ref_sr = settings.target_sample_rate
     ref_f0 = None
+    ref_decode_errors: int | None = None
     if reference_path:
-        ref_audio, ref_sr, ref_leftover = _load_audio(
+        ref_audio, ref_sr, ref_leftover, ref_decode_errors = _load_audio(
             reference_path, settings.target_sample_rate, temp_root
         )
         leftover_temp.extend(ref_leftover)
@@ -1780,11 +2137,27 @@ def analyze_files(
         is_reference_file = ref_audio is not None and path == reference_path
         if is_reference_file:
             y, sr = ref_audio, ref_sr
+            decode_errors = ref_decode_errors
         else:
-            y, sr, cand_leftover = _load_audio(path, settings.target_sample_rate, temp_root)
+            y, sr, cand_leftover, decode_errors = _load_audio(
+                path, settings.target_sample_rate, temp_root
+            )
             leftover_temp.extend(cand_leftover)
         duration_s = float(librosa.get_duration(y=y, sr=sr))
         metadata = _probe_audio_metadata(path)
+        if decode_errors is None:
+            decode_errors = _null_decode_error_scan(path)
+        container_duration_s = _container_duration(metadata)
+        duration_mismatch_s = (
+            container_duration_s - duration_s if container_duration_s else 0.0
+        )
+        decode_damaged = (
+            decode_errors >= settings.decode_error_limit
+            or abs(duration_mismatch_s) > settings.decode_duration_tolerance_s
+        )
+        damaged_regions: list[tuple[float, float]] = []
+        if decode_damaged and decode_errors > 0:
+            damaged_regions = _locate_damage_regions(path, container_duration_s)
         y_mono = ref_mono if is_reference_file else _mono_mix(y)
         codec_name, codec_profile, is_lossless = _probe_audio_codec(path)
         peak, rms, dr_db, dr_blocks_used = _calculate_dynamic_range(y, sr, settings)
@@ -1806,9 +2179,19 @@ def analyze_files(
         glitch_timestamps = _scan_glitches(y, sr, settings)
         stereo_width = _measure_stereo_width(y)
         lr_level_imbalance, lr_noise_floor_diff, lr_imbalance = _detect_lr_imbalance(y, sr)
-        fake_multichannel = _detect_fake_multichannel(y, settings)
-        center_idx = _channel_index(metadata.get("channel_layout"), "FC", y.shape[0])
-        lfe_idx = _channel_index(metadata.get("channel_layout"), "LFE", y.shape[0])
+        chmap = _layout_channel_map(metadata.get("channel_layout"), y.shape[0])
+        channel_structure = (
+            _analyze_channel_structure(y, sr, settings) if y.shape[0] >= 3 else None
+        )
+        (
+            fake_multichannel,
+            fake_reasons,
+            channel_corr_pairs,
+            lfe_dead,
+            channel_rms_db,
+        ) = _evaluate_fake_multichannel(channel_structure, chmap, settings)
+        center_idx = chmap.get("FC")
+        lfe_idx = chmap.get("LFE")
         center_bass_loss = _detect_center_bass_loss(y, sr, center_idx, ref_audio)
         surround_swap_detected = _detect_surround_swaps(ref_audio, y, settings)
         lfe_rolloff_error = _detect_lfe_rolloff(y, sr, settings, lfe_idx)
@@ -1844,18 +2227,43 @@ def analyze_files(
         alignment_warning = None
         aligned_ref_mono = None
         aligned_cand_mono = None
+        sync_step_detected = False
+        sync_step_time_s: float | None = None
+        sync_step_delta_ms = 0.0
         if ref_audio is not None and path != reference_path:
             ref_band = _bandpass_mono(ref_mono, sr, 300.0, 3000.0)
             cand_band = _bandpass_mono(y_mono, sr, 300.0, 3000.0)
-            alignment_offset_s, alignment_confidence, alignment_failed, alignment_warning = (
-                _scc_align_offset(
-                    ref_band,
-                    cand_band,
-                    sr,
-                    settings.scc_min_match_confidence,
-                )
+            (
+                alignment_offset_s,
+                alignment_confidence,
+                alignment_failed,
+                alignment_warning,
+                sync_step,
+            ) = _scc_align_offset(
+                ref_band,
+                cand_band,
+                sr,
+                settings.scc_min_match_confidence,
+                settings.sync_step_warn_ms,
             )
             del ref_band, cand_band
+            if sync_step is not None:
+                if sync_step["kind"] == "step":
+                    sync_step_detected = True
+                    sync_step_time_s = sync_step["time_s"]
+                    sync_step_delta_ms = sync_step["delta_ms"]
+                    step_text = (
+                        f"Sync step {sync_step['delta_ms']:+.1f} ms at "
+                        f"~{sync_step['time_s']:.0f}s; comparison past the step is unreliable"
+                    )
+                else:
+                    step_text = (
+                        "Alignment offsets inconsistent across the runtime; "
+                        "single-offset comparison unreliable"
+                    )
+                alignment_warning = (
+                    f"{alignment_warning}; {step_text}" if alignment_warning else step_text
+                )
             if not alignment_failed:
                 alignment_method = "scc"
                 aligned_ref_mono, aligned_cand_mono = _apply_offset(
@@ -2032,6 +2440,26 @@ def analyze_files(
                     _save_waveform_zoom(y, sr, segment, zoom_path)
                     limiting_waveform_paths.append(zoom_path)
 
+        disqualify_reasons: list[str] = []
+        if decode_damaged:
+            detail_parts = []
+            if decode_errors:
+                detail_parts.append(f"{decode_errors} decoder errors")
+            if abs(duration_mismatch_s) > settings.decode_duration_tolerance_s:
+                detail_parts.append(f"{abs(duration_mismatch_s):.1f}s of audio missing")
+            disqualify_reasons.append(
+                "Corrupt stream (" + ", ".join(detail_parts) + ")"
+                if detail_parts
+                else "Corrupt stream"
+            )
+        if fake_multichannel:
+            disqualify_reasons.append(
+                "Fake multichannel (" + "; ".join(fake_reasons) + ")"
+                if fake_reasons
+                else "Fake multichannel"
+            )
+        disqualified = bool(disqualify_reasons)
+
         result = AudioAnalysisResult(
             path=path,
             duration_s=duration_s,
@@ -2102,11 +2530,25 @@ def analyze_files(
             lr_noise_floor_diff_db=lr_noise_floor_diff,
             lr_imbalance_detected=lr_imbalance,
             center_bass_loss_db=center_bass_loss,
+            decode_errors=decode_errors,
+            container_duration_s=container_duration_s or 0.0,
+            duration_mismatch_s=duration_mismatch_s,
+            decode_damaged=decode_damaged,
+            damaged_regions=damaged_regions,
+            channel_corr_pairs=channel_corr_pairs,
+            channel_rms_db=channel_rms_db,
+            lfe_dead=lfe_dead,
+            fake_reasons=fake_reasons,
+            sync_step_detected=sync_step_detected,
+            sync_step_time_s=sync_step_time_s,
+            sync_step_delta_ms=sync_step_delta_ms,
+            disqualified=disqualified,
+            disqualify_reasons=disqualify_reasons,
         )
         result.score, result.score_explain = _weighted_score_with_penalties(
             result.score, result, settings
         )
-        result.quality_grade = _grade_score(result.score)
+        result.quality_grade = "DQ" if result.disqualified else _grade_score(result.score)
         result.summary = _build_summary(result, settings)
         results.append(result)
 
@@ -2146,7 +2588,9 @@ def analyze_files(
                     result.score, result.score_explain = _weighted_score_with_penalties(
                         result.score, result, settings
                     )
-                    result.quality_grade = _grade_score(result.score)
+                    result.quality_grade = (
+                        "DQ" if result.disqualified else _grade_score(result.score)
+                    )
 
         sizes = [r.file_size_mb for r in results]
         min_size = min(sizes)
@@ -2168,8 +2612,11 @@ def analyze_files(
                 result.score, result.score_explain = _weighted_score_with_penalties(
                     result.score, result, settings
                 )
-                result.quality_grade = _grade_score(result.score)
-    results.sort(key=lambda r: r.score, reverse=True)
+                result.quality_grade = (
+                    "DQ" if result.disqualified else _grade_score(result.score)
+                )
+    # Disqualified tracks always sort below every clean track, regardless of score.
+    results.sort(key=lambda r: (r.disqualified, -r.score))
     ref_audio = None
     ref_mono = None
     gc.collect()
