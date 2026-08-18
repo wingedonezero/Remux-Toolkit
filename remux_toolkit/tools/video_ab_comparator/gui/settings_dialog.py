@@ -159,10 +159,11 @@ class SettingsDialog(QtWidgets.QDialog):
 
         # Use advanced alignment
         advanced_checkbox = QtWidgets.QCheckBox("Use Advanced SCC Alignment")
-        advanced_checkbox.setChecked(self.settings.get('use_advanced_alignment', False))
+        advanced_checkbox.setChecked(self.settings.get('use_advanced_alignment', True))
         advanced_checkbox.setToolTip(
-            "Enable advanced Standard Cross-Correlation method.\n"
-            "More accurate but slightly slower than fast hybrid mode."
+            "Enable advanced Standard Cross-Correlation method plus\n"
+            "sliding pHash frame matching (video-verified design).\n"
+            "Recommended: ON. The legacy fast-hybrid mode is far less accurate."
         )
         layout.addRow(advanced_checkbox)
         self.controls['use_advanced_alignment'] = advanced_checkbox
@@ -330,15 +331,44 @@ class SettingsDialog(QtWidgets.QDialog):
         # Number of positions
         positions_label = QtWidgets.QLabel("Test Positions:")
         positions_spin = QtWidgets.QSpinBox()
-        positions_spin.setRange(1, 9)
-        positions_spin.setValue(self.settings.get('align_sliding_num_positions', 3))
+        positions_spin.setRange(1, 15)
+        positions_spin.setValue(self.settings.get('align_sliding_num_positions', 9))
         positions_spin.setToolTip(
             "Number of test positions across the video.\n"
             "Consensus voting picks the most common offset.\n"
-            "Default: 3 (evenly spaced between 10% and 90% of video)"
+            "Default: 9 (evenly spaced between 10% and 90% of video)"
         )
         layout.addRow(positions_label, positions_spin)
         self.controls['align_sliding_num_positions'] = positions_spin
+
+        # Minimum confidence to accept
+        confidence_label = QtWidgets.QLabel("Minimum Confidence:")
+        confidence_combo = QtWidgets.QComboBox()
+        confidence_combo.addItems([
+            "HIGH (strictest — ≥90% consensus)",
+            "MEDIUM (≥70% consensus)",
+            "LOW (accept anything)"
+        ])
+        conf_map = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
+        current_conf = str(self.settings.get('align_sliding_min_confidence', 'MEDIUM')).upper()
+        confidence_combo.setCurrentIndex(conf_map.get(current_conf, 1))
+        confidence_combo.setToolTip(
+            "Sliding results below this consensus confidence are rejected\n"
+            "and the audio-correlation offset is kept instead.\n"
+            "Default: MEDIUM"
+        )
+        layout.addRow(confidence_label, confidence_combo)
+        self.controls['align_sliding_min_confidence_combo'] = confidence_combo
+
+        # Debug report
+        debug_checkbox = QtWidgets.QCheckBox("Write score-landscape debug report")
+        debug_checkbox.setChecked(self.settings.get('align_sliding_debug_report', True))
+        debug_checkbox.setToolTip(
+            "Write a full per-position score landscape report\n"
+            "(sliding_match_report.txt) to the run's temp directory."
+        )
+        layout.addRow(debug_checkbox)
+        self.controls['align_sliding_debug_report'] = debug_checkbox
 
         # Window duration
         window_label = QtWidgets.QLabel("Window Duration:")
@@ -550,6 +580,12 @@ class SettingsDialog(QtWidgets.QDialog):
             self.settings['align_sliding_batch_size'] = self.controls['align_sliding_batch_size'].value()
         if 'align_sliding_hash_size' in self.controls:
             self.settings['align_sliding_hash_size'] = self.controls['align_sliding_hash_size'].value()
+        if 'align_sliding_min_confidence_combo' in self.controls:
+            idx = self.controls['align_sliding_min_confidence_combo'].currentIndex()
+            conf_map = {0: 'HIGH', 1: 'MEDIUM', 2: 'LOW'}
+            self.settings['align_sliding_min_confidence'] = conf_map.get(idx, 'MEDIUM')
+        if 'align_sliding_debug_report' in self.controls:
+            self.settings['align_sliding_debug_report'] = self.controls['align_sliding_debug_report'].isChecked()
 
         # Detectors tab
         if 'enable_audio_analysis' in self.controls:

@@ -94,6 +94,12 @@ class ComparisonPipeline(QObject):
         }
 
         try:
+            # Exact per-frame timestamps (when VideoTimestamps is available);
+            # stored in the chunk metadata so the frame-by-frame viewer
+            # fetches the very frames the detectors analyzed.
+            exact_ts_a = None
+            exact_ts_b = None
+
             # Use exact timestamps from VideoTimestamps when available
             if self.frame_mapper and self.frame_mapper.is_available():
                 # Get exact frame timestamps for this chunk
@@ -108,6 +114,8 @@ class ComparisonPipeline(QObject):
                 if timestamps_a and timestamps_b:
                     frames_a = self.source_a.get_frames_at_exact_timestamps(timestamps_a)
                     frames_b = self.source_b.get_frames_at_exact_timestamps(timestamps_b)
+                    exact_ts_a = timestamps_a
+                    exact_ts_b = timestamps_b
                 else:
                     # Fallback to regular extraction
                     frames_a = list(self.source_a.get_frame_iterator(ts_a, chunk_duration))
@@ -126,8 +134,14 @@ class ComparisonPipeline(QObject):
 
             # Initialize per-frame storage
             for frame_idx in range(min_frames):
-                frame_ts_a = ts_a + (frame_idx * 0.1)  # 10fps = 0.1s per frame
-                frame_ts_b = ts_b + (frame_idx * 0.1)
+                if exact_ts_a and frame_idx < len(exact_ts_a):
+                    frame_ts_a = exact_ts_a[frame_idx]
+                else:
+                    frame_ts_a = ts_a + (frame_idx * 0.1)  # 10fps sampling grid
+                if exact_ts_b and frame_idx < len(exact_ts_b):
+                    frame_ts_b = exact_ts_b[frame_idx]
+                else:
+                    frame_ts_b = ts_b + (frame_idx * 0.1)
 
                 chunk_meta['frame_scores'].append({
                     'frame_index': frame_idx,
@@ -271,7 +285,7 @@ class ComparisonPipeline(QObject):
 
             # 3. Compute alignment (now much faster!)
             # Check if advanced alignment is requested
-            use_advanced = self.settings.get("use_advanced_alignment", False)
+            use_advanced = self.settings.get("use_advanced_alignment", True)
 
             if use_advanced:
                 self._emit("Computing alignment (advanced SCC method)…", 10)
@@ -294,11 +308,15 @@ class ComparisonPipeline(QObject):
                     'audio_lang': self.settings.get('align_audio_lang', None),
                     # Sliding pHash frame matching settings
                     'use_sliding': self.settings.get('align_use_sliding', True),
-                    'sliding_num_positions': self.settings.get('align_sliding_num_positions', 3),
+                    'sliding_num_positions': self.settings.get('align_sliding_num_positions', 9),
                     'sliding_window_seconds': self.settings.get('align_sliding_window_seconds', 10),
                     'sliding_slide_range_seconds': self.settings.get('align_sliding_slide_range_seconds', 5),
                     'sliding_batch_size': self.settings.get('align_sliding_batch_size', 32),
                     'sliding_hash_size': self.settings.get('align_sliding_hash_size', 32),
+                    'sliding_min_confidence': self.settings.get('align_sliding_min_confidence', 'MEDIUM'),
+                    'sliding_debug_report': self.settings.get('align_sliding_debug_report', True),
+                    # ffindex cache + debug report land in this run's temp dir
+                    'temp_dir': self.temp_dir,
                     # Run alignment_advanced in a subprocess to isolate
                     # torch/GPU memory (recommended).
                     'use_subprocess': self.settings.get('align_use_subprocess', True),
@@ -329,7 +347,10 @@ class ComparisonPipeline(QObject):
                 align = type('obj', (object,), {
                     'offset_sec': 0.0,
                     'drift_ratio': 0.0,
-                    'confidence': 0.0
+                    'confidence': 0.0,
+                    'offset_frames': None,
+                    'method': 'none (alignment failed)',
+                    'details': None
                 })()
 
             if self._stop_requested:
@@ -353,7 +374,9 @@ class ComparisonPipeline(QObject):
                         str(self.source_b.path),
                         align.offset_sec,
                         align.drift_ratio,
-                        offset_frames=frame_offset  # Direct frame mapping from video-verified sync
+                        offset_frames=frame_offset,  # Direct frame mapping from video-verified sync
+                        fps_a=self.source_a.info.video_stream.fps,
+                        fps_b=self.source_b.info.video_stream.fps,
                     )
 
                     if self.frame_mapper.is_available():
@@ -460,6 +483,36 @@ class ComparisonPipeline(QObject):
                 else:
                     verdict += f"\n📍 Alignment: B is {align.offset_sec:.3f}s ahead of A"
 
+            # Alignment method / content-type transparency: say what
+            # alignment was actually used and why, so an audio-only
+            # fallback is never mistaken for a frame-matched run.
+            align_details = getattr(align, 'details', None) or {}
+            align_method = getattr(align, 'method', None)
+            if align_method:
+                sliding_info = align_details.get('sliding') or {}
+                match_reason = align_details.get('frame_match_reason', '')
+                if match_reason == 'sliding-matched':
+                    verdict += (
+                        f"\n🔗 Sync: {align_method} — frame-matched, "
+                        f"{sliding_info.get('confidence_label', '?')} confidence "
+                        f"({sliding_info.get('consensus_count', '?')}/"
+                        f"{sliding_info.get('num_positions', '?')} positions agree)"
+                    )
+                elif match_reason:
+                    verdict += f"\n🔗 Sync: {align_method} — {match_reason}"
+                else:
+                    verdict += f"\n🔗 Sync: {align_method}"
+
+            content_a = align_details.get('content_a') or {}
+            content_b = align_details.get('content_b') or {}
+            if content_a or content_b:
+                verdict += (
+                    f"\n🎬 Content: A={content_a.get('content_type', '?')} "
+                    f"@ {content_a.get('fps', 0.0):.3f}fps ({content_a.get('codec_name', '?')}), "
+                    f"B={content_b.get('content_type', '?')} "
+                    f"@ {content_b.get('fps', 0.0):.3f}fps ({content_b.get('codec_name', '?')})"
+                )
+
             self._emit("Complete!", 100)
 
             self.finished.emit({
@@ -468,6 +521,9 @@ class ComparisonPipeline(QObject):
                 "alignment_offset_secs": align.offset_sec,
                 "alignment_drift_ratio": align.drift_ratio,
                 "alignment_confidence": align.confidence,
+                "alignment_offset_frames": getattr(align, 'offset_frames', None),
+                "alignment_method": align_method,
+                "alignment_details": align_details,
                 "verdict": verdict,
                 "issues": final_issues,
                 "temp_dir": self.temp_dir
@@ -625,7 +681,9 @@ class ComparisonPipeline(QObject):
             # Extract frame at timestamp to analyze
             try:
                 source = self.source_a if source_label == 'A' else self.source_b
-                frame = source.get_frame(timestamp, accurate=False)  # Fast seek is fine
+                # Accurate seek: with nokey fast-seek this would analyze
+                # the nearest keyframe instead of the frame that scored.
+                frame = source.get_frame(timestamp, accurate=True)
 
                 if frame is not None:
                     if not self._is_low_information_frame(frame, timestamp):

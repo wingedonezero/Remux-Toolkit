@@ -16,7 +16,7 @@ DEFAULTS = {
     "enable_cadence_detection": True,
 
     # Advanced Audio Alignment Settings
-    "use_advanced_alignment": False,  # Enable advanced SCC-based alignment
+    "use_advanced_alignment": True,  # Advanced SCC + sliding pHash alignment (recommended)
     "align_chunk_count": 30,  # Number of audio chunks to analyze
     "align_chunk_duration": 30.0,  # Duration of each audio chunk in seconds
     "align_scan_start_pct": 5.0,  # Start scanning at 5% into video
@@ -29,14 +29,16 @@ DEFAULTS = {
     "align_delay_selection": "first",  # Delay selection strategy: first/median/mean
     "align_audio_lang": "jpn",  # Audio language to use for alignment (None = first track)
 
-    # Sliding pHash Frame Matching Settings
+    # Sliding pHash Frame Matching Settings (video-verified design)
     "align_use_sliding": True,  # Enable GPU pHash sliding-window matching
     "align_use_subprocess": True,  # Run audio SCC + sliding in a subprocess (GPU isolation)
-    "align_sliding_num_positions": 3,  # Test positions across video (evenly 10-90%)
+    "align_sliding_num_positions": 9,  # Test positions across video (evenly 10-90%)
     "align_sliding_window_seconds": 10,  # Duration of frame window per position
     "align_sliding_slide_range_seconds": 5,  # ±N seconds sliding range
     "align_sliding_batch_size": 32,  # GPU batch size for pHash extraction
     "align_sliding_hash_size": 32,  # pHash size (32 = 1024-bit descriptor)
+    "align_sliding_min_confidence": "MEDIUM",  # Reject sliding result below this consensus confidence
+    "align_sliding_debug_report": True,  # Write score-landscape report to temp dir
 
     # Frame Mapping Settings
     "use_frame_mapper": True,  # Use VideoTimestamps for frame-perfect mapping

@@ -1,6 +1,7 @@
 # remux_toolkit/tools/video_ab_comparator/core/alignment.py
 from __future__ import annotations
 from dataclasses import dataclass
+from pathlib import Path
 import numpy as np
 import subprocess
 import json
@@ -27,6 +28,10 @@ class AlignResult:
     # this for direct frame-to-frame mapping when available.
     offset_frames: Optional[int] = None
     method: str = "hybrid"
+    # Rich alignment metadata from the advanced path: content types,
+    # frame-match reason, sliding consensus / confidence / PTS /
+    # timeline details. JSON-serializable.
+    details: Optional[Dict] = None
 
 def extract_audio_fingerprint(source_path: str, start_time: float, duration: float) -> Optional[np.ndarray]:
     """Extract audio fingerprint using FFmpeg's chromaprint."""
@@ -128,10 +133,11 @@ def compare_frame_sequences(hashes_a: List[int], hashes_b: List[int], max_offset
         for i in range(len(hashes_a)):
             j = i + offset
             if 0 <= j < len(hashes_b):
-                # Hamming distance between hashes
+                # Hamming distance between hashes. The hashes come from
+                # 16x16 grayscale frames, so they are 256-bit.
                 xor = hashes_a[i] ^ hashes_b[j]
                 distance = bin(xor).count('1')
-                similarity = 1.0 - (distance / 64.0)  # Assuming 64-bit hash
+                similarity = 1.0 - (distance / 256.0)
                 score += similarity
                 count += 1
 
@@ -382,6 +388,7 @@ def _run_advanced_align_subprocess(source_a_path: str, source_b_path: str,
             accepted_count=int(result_dict.get("accepted_count", 0)),
             method=str(result_dict.get("method", "SCC")),
             offset_frames=result_dict.get("offset_frames"),
+            details=result_dict.get("details"),
         )
 
     except Exception as exc:
@@ -438,11 +445,14 @@ def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
             audio_lang=align_config.get('audio_lang', None),
             # Sliding pHash frame matching settings
             use_sliding=align_config.get('use_sliding', True),
-            sliding_num_positions=align_config.get('sliding_num_positions', 3),
+            sliding_num_positions=align_config.get('sliding_num_positions', 9),
             sliding_window_seconds=align_config.get('sliding_window_seconds', 10),
             sliding_slide_range_seconds=align_config.get('sliding_slide_range_seconds', 5),
             sliding_batch_size=align_config.get('sliding_batch_size', 32),
             sliding_hash_size=align_config.get('sliding_hash_size', 32),
+            sliding_min_confidence=align_config.get('sliding_min_confidence', 'MEDIUM'),
+            sliding_debug_report=align_config.get('sliding_debug_report', True),
+            temp_dir=align_config.get('temp_dir', None),
         )
 
         use_subprocess = bool(align_config.get('use_subprocess', True))
@@ -487,6 +497,7 @@ def robust_align(source_a, source_b, *, fps_a: float, fps_b: float,
             confidence=advanced_result.confidence,
             offset_frames=advanced_result.offset_frames,
             method=advanced_result.method,
+            details=advanced_result.details,
         )
 
         return result

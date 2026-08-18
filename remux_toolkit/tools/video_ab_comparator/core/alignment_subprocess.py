@@ -43,6 +43,7 @@ def _result_to_dict(r) -> dict:
         "accepted_count": int(r.accepted_count),
         "method": str(r.method),
         "offset_frames": r.offset_frames if r.offset_frames is None else int(r.offset_frames),
+        "details": _make_serializable(r.details) if r.details else None,
     }
 
 

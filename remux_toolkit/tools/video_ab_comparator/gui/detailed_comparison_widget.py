@@ -267,15 +267,17 @@ class DetailedComparisonWidget(QtWidgets.QWidget):
         num_frames = self.frames_per_chunk[self.current_chunk_idx]
         self.frame_counter_label.setText(f"{frame_idx + 1} / {num_frames}")
 
-        # Update timestamp labels
+        # Update timestamp labels — prefer the exact per-frame timestamps
+        # stored during analysis; fall back to the 10fps sampling grid.
         chunk = self.chunk_data[self.current_chunk_idx]
-        chunk_start_a = chunk['timestamp_a']
-        chunk_start_b = chunk['timestamp_b']
-
-        # Calculate timestamp for this specific frame (10fps = 0.1s per frame)
-        frame_offset = frame_idx * 0.1
-        ts_a = chunk_start_a + frame_offset
-        ts_b = chunk_start_b + frame_offset
+        frame_scores = chunk.get('frame_scores', [])
+        if frame_idx < len(frame_scores) and 'timestamp_a' in frame_scores[frame_idx]:
+            ts_a = frame_scores[frame_idx]['timestamp_a']
+            ts_b = frame_scores[frame_idx]['timestamp_b']
+        else:
+            frame_offset = frame_idx * 0.1  # 10fps = 0.1s per frame
+            ts_a = chunk['timestamp_a'] + frame_offset
+            ts_b = chunk['timestamp_b'] + frame_offset
 
         self.frame_ts_a_label.setText(f"A: {ts_a:.3f}s")
         self.frame_ts_b_label.setText(f"B: {ts_b:.3f}s")

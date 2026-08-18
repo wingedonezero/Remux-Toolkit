@@ -56,11 +56,18 @@ class AlignmentConfig:
 
     # Sliding pHash frame matching (GPU DCT-II, no weights)
     use_sliding: bool = True  # Fine-tune audio offset with sliding pHash matching
-    sliding_num_positions: int = 3  # Test positions across video (evenly, 10-90%)
+    sliding_num_positions: int = 9  # Test positions across video (evenly, 10-90%)
     sliding_window_seconds: int = 10  # Duration of frame window per position
     sliding_slide_range_seconds: int = 5  # ±N seconds sliding range
     sliding_batch_size: int = 32  # GPU batch size for pHash extraction
     sliding_hash_size: int = 32  # pHash size (32 → 1024-bit descriptor)
+    # Minimum consensus confidence to accept the sliding result over
+    # audio ("HIGH"/"MEDIUM"/"LOW"). Below this the audio offset is
+    # kept and the rejection is recorded in details.
+    sliding_min_confidence: str = "MEDIUM"
+    sliding_debug_report: bool = True  # Write score-landscape report to temp dir
+    # Directory for ffindex cache + debug report (None = system temp)
+    temp_dir: Optional[str] = None
 
 
 @dataclass
@@ -72,7 +79,11 @@ class AlignResult:
     chunk_results: List[Dict]  # Individual chunk results
     accepted_count: int  # Number of accepted chunks
     method: str = "SCC"  # Correlation method used
-    offset_frames: Optional[int] = None  # Frame offset from video-verified sync (more accurate than time)
+    offset_frames: Optional[int] = None  # Content-index frame offset from video-verified sync
+    # Rich alignment metadata: content types, frame-match reason,
+    # confidence label, sliding consensus / PTS / timeline details.
+    # JSON-serializable (survives the subprocess round trip).
+    details: Optional[Dict] = None
 
 
 def _normalize_lang(lang: Optional[str]) -> Optional[str]:
@@ -269,7 +280,8 @@ def advanced_align(source_a_path: str, source_b_path: str,
 
     if idx_a is None or idx_b is None:
         print("Failed to locate audio streams")
-        return AlignResult(0.0, 0.0, 0.0, [], 0, "SCC")
+        return AlignResult(0.0, 0.0, 0.0, [], 0, "SCC",
+                           details={"reason": "audio-streams-not-found"})
 
     lang_desc = f"'{lang_norm}'" if lang_norm else "'first available'"
     print(f"Selected audio streams: A (lang={lang_desc}, index={idx_a}), B (lang={lang_desc}, index={idx_b})")
@@ -287,7 +299,8 @@ def advanced_align(source_a_path: str, source_b_path: str,
 
     if audio_a is None or audio_b is None:
         print("Failed to decode audio")
-        return AlignResult(0.0, 0.0, 0.0, [], 0, "SCC")
+        return AlignResult(0.0, 0.0, 0.0, [], 0, "SCC",
+                           details={"reason": "audio-decode-failed"})
 
     # Calculate video duration from audio length
     duration_a = len(audio_a) / float(config.sample_rate)
@@ -384,28 +397,74 @@ def advanced_align(source_a_path: str, source_b_path: str,
         avg_match = np.mean([c['match_pct'] for c in accepted_chunks])
         final_confidence = min(1.0, avg_match / 100.0)
 
-    print(f"\nAudio alignment: offset={final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms), "
+    print(f"\nAudio alignment: delay={final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms), "
           f"confidence={final_confidence:.2%}, accepted={len(accepted_chunks)}/{chunk_count_int}")
+
+    # Domain conversion: SCC returns a DELAY ("how much to delay B so it
+    # matches A", i.e. src_time - tgt_time). The sliding matcher and
+    # every downstream consumer work in the opposite domain
+    # (tgt_time - src_time: positive = B's matching content is LATER).
+    # Convert here so the whole advanced path speaks one domain; without
+    # this, audio-only fallbacks came back sign-flipped and every mapped
+    # timestamp was off by 2x the true offset.
+    final_offset_sec = -final_offset_sec
 
     # Track verified frame offset for frame-to-frame mapping
     verified_frame_offset = None
+    details: Dict = {
+        "audio_offset_sec": final_offset_sec,
+        "audio_confidence": final_confidence,
+    }
+
+    # Content-type probes. Frames are always analyzed AS-IS in both
+    # sources — content type only decides whether sliding frame
+    # matching is attempted, and is reported so the results say
+    # exactly what alignment method was used and why.
+    eligible, gate_reason = True, ""
+    try:
+        from .content_probe import detect_video_properties, frame_match_eligibility
+
+        if progress_callback:
+            progress_callback("Probing content types...", 90)
+
+        props_a = detect_video_properties(source_a_path)
+        props_b = detect_video_properties(source_b_path)
+        eligible, gate_reason = frame_match_eligibility(props_a, props_b)
+        details["content_a"] = {k: v for k, v in props_a.items() if k != "mediainfo"}
+        details["content_b"] = {k: v for k, v in props_b.items() if k != "mediainfo"}
+    except Exception as e:
+        print(f"[ContentProbe] Probe failed: {e} — attempting frame matching anyway")
+
+    sliding_attempted = False
+    sliding_accepted = False
 
     # Sliding pHash frame matching for frame-perfect accuracy.
     # GPU DCT-II perceptual hash, no model weights. Slides a source
-    # window across the target and picks the position with the best
-    # mean cosine similarity, then takes a consensus across several
-    # positions across the video. Content-indexed (the returned
-    # offset_frames can be used directly by FrameMapper).
-    if config.use_sliding and final_offset_sec != 0.0:
+    # window across the target, votes across N positions, and reports
+    # both a wall-clock offset (real container timestamps of the
+    # matched pair) and a content-index frame offset for FrameMapper.
+    # Runs whenever enabled and eligible — including when the audio
+    # offset is exactly 0.0 (audio-identical files can still be a
+    # frame off in the video domain).
+    if config.use_sliding and not eligible:
+        print(f"\n⚠ Frame matching skipped: {gate_reason}")
+        print("  Using audio-correlation alignment (frames still analyzed as-is).")
+        details["frame_match_reason"] = gate_reason
+    elif config.use_sliding:
+        sliding_attempted = True
         if progress_callback:
             progress_callback("Sliding pHash frame matching...", 92)
 
         try:
             from .sliding_matcher import calculate_sliding_offset
 
-            import tempfile
-            temp_dir = Path(tempfile.gettempdir()) / "remux_toolkit_frame_sync"
+            if config.temp_dir:
+                temp_dir = Path(config.temp_dir)
+            else:
+                import tempfile
+                temp_dir = Path(tempfile.gettempdir()) / "remux_toolkit_frame_sync"
             temp_dir.mkdir(parents=True, exist_ok=True)
+            debug_dir = temp_dir if config.sliding_debug_report else None
 
             audio_offset_ms = final_offset_sec * 1000.0
 
@@ -422,42 +481,69 @@ def advanced_align(source_a_path: str, source_b_path: str,
                 batch_size=config.sliding_batch_size,
                 hash_size=config.sliding_hash_size,
                 temp_dir=temp_dir,
+                debug_output_dir=debug_dir,
                 progress_callback=progress_callback,
             )
 
+            details["sliding"] = sliding_result
+
             if sliding_result["success"]:
-                frame_corrected_offset_sec = sliding_result["offset_ms"] / 1000.0
-                verified_frame_offset = sliding_result["offset_frames"]
+                label = sliding_result.get("confidence_label", "LOW")
+                rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+                min_label = str(config.sliding_min_confidence or "MEDIUM").upper()
+                required = rank.get(min_label, 1)
 
-                print(f"\n✓ Sliding pHash matching successful!")
-                print(f"  Audio offset:   {final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms)")
-                print(f"  Sliding offset: {frame_corrected_offset_sec:.6f}s ({sliding_result['offset_ms']:.3f}ms)")
-                print(f"  Frame offset:   {sliding_result['offset_frames']:+d} frames (content)")
-                print(f"  Confidence:     {sliding_result['confidence_label']} ({sliding_result['confidence']:.1%})")
-                print(f"  Consensus:      {sliding_result.get('consensus_count', 0)}/{sliding_result.get('num_positions', 0)} positions")
-                if sliding_result.get("pts_correction_applied"):
-                    print(
-                        f"  PTS delta:      {sliding_result['pts_delta_frames']:+d} frames "
-                        f"({sliding_result['pts_delta_s']:+.3f}s)"
-                    )
+                if rank.get(label, 0) >= required:
+                    sliding_accepted = True
+                    frame_corrected_offset_sec = sliding_result["offset_ms"] / 1000.0
+                    verified_frame_offset = sliding_result["offset_frames"]
 
-                final_offset_sec = frame_corrected_offset_sec
-                final_confidence = (final_confidence * 0.4) + (sliding_result["confidence"] * 0.6)
+                    print(f"\n✓ Sliding pHash matching successful!")
+                    print(f"  Audio offset:      {final_offset_sec:.6f}s ({final_offset_sec*1000:.3f}ms)")
+                    print(f"  Wall-clock offset: {frame_corrected_offset_sec:.6f}s ({sliding_result['offset_ms']:.3f}ms)")
+                    print(f"  Frame offset:      {sliding_result['offset_frames']:+d} frames (content-index)")
+                    print(f"  Confidence:        {label} ({sliding_result['confidence']:.1%})")
+                    print(f"  Consensus:         {sliding_result.get('consensus_count', 0)}/{sliding_result.get('num_positions', 0)} positions")
+                    if sliding_result.get("pts_correction_applied"):
+                        print(
+                            f"  PTS delta:         {sliding_result['pts_delta_frames']:+d} frames "
+                            f"({sliding_result['pts_delta_s']:+.3f}s)"
+                        )
+                    if sliding_result.get("timeline_correction_applied"):
+                        print(
+                            f"  Timeline gap corr: {sliding_result['timeline_correction_frames']:+d} frames "
+                            f"(wall-clock is authoritative)"
+                        )
 
+                    final_offset_sec = frame_corrected_offset_sec
+                    final_confidence = (final_confidence * 0.4) + (sliding_result["confidence"] * 0.6)
+                    details["frame_match_reason"] = "sliding-matched"
+                else:
+                    print(f"\n⚠ Sliding result REJECTED: confidence {label} below required {min_label}")
+                    print(f"  Consensus was {sliding_result.get('consensus_count', 0)}/"
+                          f"{sliding_result.get('num_positions', 0)} positions, "
+                          f"mean score {sliding_result.get('mean_score', 0):.4f}")
+                    print(f"  Keeping audio offset: {final_offset_sec:.6f}s")
+                    details["frame_match_reason"] = f"rejected-low-confidence ({label})"
             else:
                 print(f"\n⚠ Sliding pHash matching: {sliding_result['method']}")
                 if sliding_result.get("error"):
                     print(f"  Reason: {sliding_result['error']}")
                 print(f"  Keeping audio offset: {final_offset_sec:.6f}s")
+                details["frame_match_reason"] = sliding_result.get("reason", "fallback")
 
         except ImportError as e:
             print(f"Sliding pHash matching unavailable: {e}")
             print(f"Keeping audio-only offset: {final_offset_sec:.6f}s")
+            details["frame_match_reason"] = f"fallback-import-error: {e}"
         except Exception as e:
             print(f"Sliding pHash matching error: {e}")
             import traceback
             traceback.print_exc()
             print(f"Keeping audio-only offset: {final_offset_sec:.6f}s")
+            details["frame_match_reason"] = f"fallback-error: {e}"
+    else:
+        details["frame_match_reason"] = "sliding-disabled"
 
     # Clean up GPU resources after correlation
     try:
@@ -470,12 +556,19 @@ def advanced_align(source_a_path: str, source_b_path: str,
         progress_callback("Alignment complete", 98)
 
     # Determine method string
-    if config.use_sliding and verified_frame_offset is not None:
+    if not config.use_sliding:
+        method_str = "SCC"  # Audio-only (frame matching disabled)
+    elif sliding_accepted:
         method_str = "SCC+pHash"  # Audio correlation + GPU pHash sliding
-    elif config.use_sliding:
-        method_str = "SCC+pHashFallback"  # Sliding attempted but fell back
+    elif not eligible:
+        method_str = "SCC (frame match skipped)"  # Content type ineligible
+    elif sliding_attempted:
+        method_str = "SCC+pHashFallback"  # Sliding attempted but fell back/rejected
     else:
-        method_str = "SCC"  # Audio-only
+        method_str = "SCC"
+
+    details["method"] = method_str
+    details["final_offset_sec"] = final_offset_sec
 
     return AlignResult(
         offset_sec=final_offset_sec,
@@ -484,5 +577,6 @@ def advanced_align(source_a_path: str, source_b_path: str,
         chunk_results=chunk_results,
         accepted_count=len(accepted_chunks),
         method=method_str,
-        offset_frames=verified_frame_offset  # Frame offset for direct frame-to-frame mapping
+        offset_frames=verified_frame_offset,  # Content-index frame offset for FrameMapper
+        details=details,
     )
