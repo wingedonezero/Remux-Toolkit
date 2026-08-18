@@ -197,7 +197,7 @@ class VideoSource:
             frame = self.get_frame(ts, accurate=False)
             if frame is not None:
                 try:
-                    pil = Image.fromarray(cv2.cvtColor(frame, cv.COLOR_BGR2RGB))
+                    pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     fingerprints.append(imagehash.average_hash(pil))
                 except: continue
         return fingerprints

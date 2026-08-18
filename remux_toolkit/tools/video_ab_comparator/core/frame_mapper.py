@@ -40,7 +40,8 @@ class FrameMapper:
 
     def __init__(self, source_a_path: str, source_b_path: str,
                  offset_sec: float, drift_ratio: float = 0.0,
-                 offset_frames: Optional[int] = None):
+                 offset_frames: Optional[int] = None,
+                 fps_a: float = 23.976, fps_b: float = 23.976):
         """
         Initialize frame mapper.
 
@@ -51,12 +52,16 @@ class FrameMapper:
             drift_ratio: FPS drift ratio (for variable frame rate)
             offset_frames: Frame offset from video-verified sync (more accurate than time)
                            When set, uses direct frame mapping: frame_b = frame_a + offset_frames
+            fps_a / fps_b: Actual frame rates, used for timestamp estimation
+                           when VideoTimestamps is unavailable
         """
         self.source_a_path = Path(source_a_path)
         self.source_b_path = Path(source_b_path)
         self.offset_sec = offset_sec
         self.drift_ratio = drift_ratio
         self.offset_frames = offset_frames  # Direct frame-to-frame mapping offset
+        self.fps_a = fps_a if fps_a and fps_a > 0 else 23.976
+        self.fps_b = fps_b if fps_b and fps_b > 0 else 23.976
 
         self.vts_a: Optional[VideoTimestamps] = None
         self.vts_b: Optional[VideoTimestamps] = None
@@ -148,19 +153,21 @@ class FrameMapper:
             # Ensure frame_b is valid
             if frame_b < 0:
                 frame_b = 0
+            if self.vts_b is not None and len(self.vts_b) > 0:
+                frame_b = min(frame_b, len(self.vts_b) - 1)
 
             # Get timestamps if VideoTimestamps is available
             if self.vts_a and self.vts_b:
                 try:
-                    timestamp_a = self.vts_a[frame_a] / 1000.0 if frame_a < len(self.vts_a) else frame_a / 23.976
-                    timestamp_b = self.vts_b[frame_b] / 1000.0 if frame_b < len(self.vts_b) else frame_b / 23.976
+                    timestamp_a = self.vts_a[frame_a] / 1000.0 if frame_a < len(self.vts_a) else frame_a / self.fps_a
+                    timestamp_b = self.vts_b[frame_b] / 1000.0 if frame_b < len(self.vts_b) else frame_b / self.fps_b
                 except:
-                    timestamp_a = frame_a / 23.976  # Fallback to estimated timestamp
-                    timestamp_b = frame_b / 23.976
+                    timestamp_a = frame_a / self.fps_a  # Fallback to estimated timestamp
+                    timestamp_b = frame_b / self.fps_b
             else:
-                # Estimate timestamps from frame numbers (assume ~24fps)
-                timestamp_a = frame_a / 23.976
-                timestamp_b = frame_b / 23.976
+                # Estimate timestamps from frame numbers using actual fps
+                timestamp_a = frame_a / self.fps_a
+                timestamp_b = frame_b / self.fps_b
 
             return FrameMapping(
                 frame_a=frame_a,

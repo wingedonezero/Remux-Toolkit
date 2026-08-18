@@ -21,9 +21,15 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Pin ROCm to the discrete GPU before torch initializes HIP: on a
+# dual-GPU box the iGPU can SIGSEGV on first kernel launch. setdefault
+# is respected only when the environment hasn't already chosen a device.
+os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
 
 # Module state
 _device: Any = None  # torch.device, lazily initialized

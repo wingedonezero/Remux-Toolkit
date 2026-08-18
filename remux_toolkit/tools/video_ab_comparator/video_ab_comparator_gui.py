@@ -66,13 +66,18 @@ class ChunkFrameLoader(QtCore.QObject):
             return
 
         chunk = self.chunk_data[chunk_idx]
-        chunk_start_a = chunk['timestamp_a']
-        chunk_start_b = chunk['timestamp_b']
 
-        # Calculate timestamp for this specific frame (10fps = 0.1s per frame)
-        frame_offset = frame_idx * 0.1
-        ts_a = chunk_start_a + frame_offset
-        ts_b = chunk_start_b + frame_offset
+        # Prefer the exact per-frame timestamps stored during analysis so
+        # the viewer shows the very frames the detectors scored; fall
+        # back to the 10fps sampling grid for older metadata.
+        frame_scores = chunk.get('frame_scores', [])
+        if frame_idx < len(frame_scores) and 'timestamp_a' in frame_scores[frame_idx]:
+            ts_a = frame_scores[frame_idx]['timestamp_a']
+            ts_b = frame_scores[frame_idx]['timestamp_b']
+        else:
+            frame_offset = frame_idx * 0.1  # 10fps = 0.1s per frame
+            ts_a = chunk['timestamp_a'] + frame_offset
+            ts_b = chunk['timestamp_b'] + frame_offset
 
         frame_a = self.source_a.get_frame(ts_a, accurate=True)
         frame_b = self.source_b.get_frame(ts_b, accurate=True)
