@@ -30,11 +30,17 @@ class DiscInfo(NamedTuple):
     relative_path: Path
     drop_root: Path
 
-def _is_bare_dvd(d: Path) -> bool:
-    """Folder holds DVD files directly (no VIDEO_TS subfolder) — e.g. a rip
-    where the VIDEO_TS *contents* were copied into the disc folder, or the
-    VIDEO_TS folder itself was dropped."""
-    return (d / "VIDEO_TS.IFO").is_file() or (d / "video_ts.ifo").is_file()
+def _bare_dvd_ifo(d: Path):
+    """VIDEO_TS.IFO inside a folder that holds DVD files directly (no
+    VIDEO_TS subfolder) — e.g. a rip where the VIDEO_TS *contents* were
+    copied into the disc folder, or the VIDEO_TS folder itself was
+    dropped. Returns the IFO path (makemkvcon needs file:<...IFO> for
+    these; it rejects the bare folder), or None."""
+    for name in ("VIDEO_TS.IFO", "video_ts.ifo"):
+        p = d / name
+        if p.is_file():
+            return p
+    return None
 
 def _is_bare_bdmv(d: Path) -> bool:
     """Folder is itself a BDMV directory (contains index.bdmv)."""
@@ -83,10 +89,11 @@ def find_disc_roots_with_structure(path: Path, max_depth: int = 5) -> list[DiscI
                 return
 
             # Bare layouts: DVD/BD files directly in this folder
-            if _is_bare_dvd(current_path) or _is_bare_bdmv(current_path):
+            bare_ifo = _bare_dvd_ifo(current_path)
+            if bare_ifo or _is_bare_bdmv(current_path):
                 rel_path = current_path.relative_to(drop_root)
                 discs.append(DiscInfo(
-                    disc_path=current_path,
+                    disc_path=bare_ifo if bare_ifo else current_path,
                     display_name=_bare_display_name(current_path),
                     relative_path=rel_path,
                     drop_root=drop_root
@@ -142,9 +149,10 @@ def find_disc_roots_with_structure(path: Path, max_depth: int = 5) -> list[DiscI
                 relative_path=Path("."),
                 drop_root=drop_root
             )]
-        if _is_bare_dvd(path) or _is_bare_bdmv(path):
+        bare_ifo = _bare_dvd_ifo(path)
+        if bare_ifo or _is_bare_bdmv(path):
             return [DiscInfo(
-                disc_path=path,
+                disc_path=bare_ifo if bare_ifo else path,
                 display_name=_bare_display_name(path),
                 relative_path=Path("."),
                 drop_root=drop_root
