@@ -30,6 +30,23 @@ class DiscInfo(NamedTuple):
     relative_path: Path
     drop_root: Path
 
+def _is_bare_dvd(d: Path) -> bool:
+    """Folder holds DVD files directly (no VIDEO_TS subfolder) — e.g. a rip
+    where the VIDEO_TS *contents* were copied into the disc folder, or the
+    VIDEO_TS folder itself was dropped."""
+    return (d / "VIDEO_TS.IFO").is_file() or (d / "video_ts.ifo").is_file()
+
+def _is_bare_bdmv(d: Path) -> bool:
+    """Folder is itself a BDMV directory (contains index.bdmv)."""
+    return (d / "index.bdmv").is_file() or (d / "INDEX.BDMV").is_file()
+
+def _bare_display_name(d: Path) -> str:
+    # A folder literally named VIDEO_TS/BDMV says nothing about the disc;
+    # use its parent's name instead.
+    if d.name.upper() in ("VIDEO_TS", "BDMV") and d.parent != d:
+        return d.parent.name
+    return d.name
+
 def find_disc_roots_with_structure(path: Path, max_depth: int = 5) -> list[DiscInfo]:
     discs: list[DiscInfo] = []
     drop_root = path.resolve()
@@ -60,6 +77,17 @@ def find_disc_roots_with_structure(path: Path, max_depth: int = 5) -> list[DiscI
                 discs.append(DiscInfo(
                     disc_path=bdmv,
                     display_name=current_path.name,
+                    relative_path=rel_path,
+                    drop_root=drop_root
+                ))
+                return
+
+            # Bare layouts: DVD/BD files directly in this folder
+            if _is_bare_dvd(current_path) or _is_bare_bdmv(current_path):
+                rel_path = current_path.relative_to(drop_root)
+                discs.append(DiscInfo(
+                    disc_path=current_path,
+                    display_name=_bare_display_name(current_path),
                     relative_path=rel_path,
                     drop_root=drop_root
                 ))
@@ -111,6 +139,13 @@ def find_disc_roots_with_structure(path: Path, max_depth: int = 5) -> list[DiscI
             return [DiscInfo(
                 disc_path=path / "BDMV",
                 display_name=path.name,
+                relative_path=Path("."),
+                drop_root=drop_root
+            )]
+        if _is_bare_dvd(path) or _is_bare_bdmv(path):
+            return [DiscInfo(
+                disc_path=path,
+                display_name=_bare_display_name(path),
                 relative_path=Path("."),
                 drop_root=drop_root
             )]
