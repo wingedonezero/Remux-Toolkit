@@ -2101,7 +2101,32 @@ def analyze_files(
     settings: AnalysisSettings,
     output_dir: str,
     reference_path: str | None = None,
+    progress=None,
+    status=None,
+    cancel=None,
 ) -> list[AudioAnalysisResult]:
+    """
+    Analyse each file, optionally against a reference.
+
+    `progress(fraction)` and `status(text)` report back to a UI; `cancel()`
+    returning True aborts between files and raises InterruptedError. All three
+    are optional and default to the previous fire-and-forget behaviour.
+    """
+    def _tick(frac: float) -> None:
+        if progress:
+            progress(max(0.0, min(1.0, frac)))
+
+    def _say(text: str) -> None:
+        if status:
+            status(text)
+
+    def _check_cancel() -> None:
+        if cancel is not None and cancel():
+            raise InterruptedError("cancelled")
+
+    file_paths = list(file_paths)
+    total_files = max(1, len(file_paths) + (1 if reference_path else 0))
+    done_units = 0
     results: list[AudioAnalysisResult] = []
     temp_root = output_dir or tempfile.mkdtemp(prefix="audio_analysis_")
     made_temp_root = not output_dir
@@ -2119,6 +2144,8 @@ def analyze_files(
     ref_f0 = None
     ref_decode_errors: int | None = None
     if reference_path:
+        _say(f"Loading reference: {os.path.basename(reference_path)}")
+        _check_cancel()
         ref_audio, ref_sr, ref_leftover, ref_decode_errors = _load_audio(
             reference_path, settings.target_sample_rate, temp_root
         )
@@ -2133,7 +2160,12 @@ def analyze_files(
             ref_mono, ref_sr, settings, ref_max_power, _DELTA_EQ_TIME_BUCKETS
         )
         ref_f0 = _estimate_f0(ref_mono, ref_sr, settings)
-    for path in file_paths:
+        done_units += 1
+        _tick(done_units / total_files)
+    for file_index, path in enumerate(file_paths):
+        _check_cancel()
+        _say(f"Analysing {os.path.basename(path)}  "
+             f"[{file_index + 1}/{len(file_paths)}]")
         is_reference_file = ref_audio is not None and path == reference_path
         if is_reference_file:
             y, sr = ref_audio, ref_sr
@@ -2342,7 +2374,7 @@ def analyze_files(
                 diff_spectrum_path = os.path.join(output_dir, f"{base}_diff_spectrum.png")
                 _save_difference_spectrum(diff_freqs, diff_db, diff_spectrum_path)
         if reference_path and ref_mean_db is not None and ref_freqs is not None and path != reference_path:
-            if ref_total_frames == total_frames:
+            if True:                                  # see note above
                 mean_delta_db = None
                 bucket_delta_db = None
                 delta_times = None
@@ -2551,6 +2583,8 @@ def analyze_files(
         result.quality_grade = "DQ" if result.disqualified else _grade_score(result.score)
         result.summary = _build_summary(result, settings)
         results.append(result)
+        done_units += 1
+        _tick(done_units / total_files)
 
         # Drop this file's audio (and any views into it) before loading the
         # next one so at most the reference plus one candidate are alive.

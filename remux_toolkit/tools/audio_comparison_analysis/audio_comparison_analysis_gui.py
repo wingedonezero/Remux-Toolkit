@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Iterable
 
 from PyQt6 import QtCore, QtGui, QtWidgets
@@ -12,42 +13,213 @@ from . import audio_comparison_analysis_core as core
 from .audio_comparison_analysis_config import DEFAULTS
 
 
+MEDIA_SUFFIXES = {".flac", ".wav", ".mka", ".mkv", ".mp4", ".m4a", ".aac", ".ac3",
+                  ".eac3", ".dts", ".thd", ".ogg", ".opus", ".mp3", ".m2ts", ".ts", ".wv"}
+
+
 class Worker(QtCore.QObject):
     analysis_complete = QtCore.pyqtSignal(list)
     error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(float)
+    status = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def reset(self):
+        """Clear the stop flag so the worker stays usable for the next run."""
+        self._stop = False
 
     @QtCore.pyqtSlot(list, dict, str, str)
     def run(self, file_paths: list[str], settings: dict, output_dir: str, reference_path: str):
         try:
             settings_obj = core.AnalysisSettings(**settings)
             reference = reference_path or None
-            results = core.analyze_files(file_paths, settings_obj, output_dir, reference)
+            results = core.analyze_files(
+                file_paths, settings_obj, output_dir, reference,
+                progress=self.progress.emit, status=self.status.emit,
+                cancel=lambda: self._stop,
+            )
             self.analysis_complete.emit([r.to_dict() for r in results])
+        except InterruptedError:
+            self.error.emit("Stopped.")
         except Exception as exc:  # noqa: BLE001
             self.error.emit(str(exc))
 
 
+class ImagePanel(QtWidgets.QLabel):
+    """
+    Shows an analysis image scaled to fit, and opens it full size when clicked.
+
+    The old panels were fixed-size QLabels scaled to 400px, which made the
+    spectrograms too small to read and impossible to inspect.
+    """
+    clicked = QtCore.pyqtSignal()
+
+    def __init__(self, placeholder: str = "", parent=None):
+        super().__init__(parent)
+        self._placeholder = placeholder
+        self._source: str | None = None
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
+        self.setMinimumHeight(180)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Expanding)
+        self.setText(placeholder)
+        self.setWordWrap(True)
+
+    def set_source(self, path: str | None, unavailable_reason: str = ""):
+        self._source = path if path and os.path.exists(path) else None
+        if self._source is None:
+            self.setPixmap(QtGui.QPixmap())
+            self.setText(unavailable_reason or self._placeholder)
+            self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+        else:
+            self.setText("")
+            self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            self.setToolTip("Click to open full size")
+        self._rescale()
+
+    def source(self) -> str | None:
+        return self._source
+
+    def _rescale(self):
+        if not self._source:
+            return
+        pix = QtGui.QPixmap(self._source)
+        if pix.isNull():
+            self.setText("Image could not be loaded.")
+            return
+        self.setPixmap(pix.scaled(
+            max(self.width() - 4, 64), max(self.height() - 4, 64),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale()
+
+    def mouseReleaseEvent(self, event):
+        if self._source and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            ImageViewer(self._source, self.window()).show()
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+class ImageViewer(QtWidgets.QDialog):
+    """Full-size image window with zoom (Ctrl+wheel or the buttons)."""
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(os.path.basename(path))
+        self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
+        self._pixmap = QtGui.QPixmap(path)
+        self._scale = 1.0
+
+        layout = QtWidgets.QVBoxLayout(self)
+        bar = QtWidgets.QHBoxLayout()
+        for text, fn in (("-", lambda: self._zoom(1 / 1.25)), ("+", lambda: self._zoom(1.25)),
+                         ("Fit", self._fit), ("100%", lambda: self._set_scale(1.0))):
+            b = QtWidgets.QPushButton(text)
+            b.setFixedWidth(52)
+            b.clicked.connect(fn)
+            bar.addWidget(b)
+        self.zoom_label = QtWidgets.QLabel("100%")
+        bar.addWidget(self.zoom_label)
+        bar.addStretch()
+        bar.addWidget(QtWidgets.QLabel(path))
+        layout.addLayout(bar)
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(False)
+        self.label = QtWidgets.QLabel()
+        self.label.setPixmap(self._pixmap)
+        self.scroll.setWidget(self.label)
+        layout.addWidget(self.scroll, 1)
+        self.resize(min(1400, self._pixmap.width() + 60),
+                    min(900, self._pixmap.height() + 90))
+        QtCore.QTimer.singleShot(0, self._fit)
+
+    def _set_scale(self, scale: float):
+        self._scale = max(0.05, min(8.0, scale))
+        size = self._pixmap.size() * self._scale
+        self.label.setPixmap(self._pixmap.scaled(
+            size, QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation))
+        self.label.resize(size)
+        self.zoom_label.setText(f"{self._scale * 100:.0f}%")
+
+    def _zoom(self, factor: float):
+        self._set_scale(self._scale * factor)
+
+    def _fit(self):
+        if self._pixmap.isNull():
+            return
+        area = self.scroll.viewport().size()
+        self._set_scale(min(area.width() / max(self._pixmap.width(), 1),
+                            area.height() / max(self._pixmap.height(), 1)))
+
+    def wheelEvent(self, event):
+        if event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+            self._zoom(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+
+class SourceList(QtWidgets.QListWidget):
+    """Drag-and-drop source list, matching the Audio Authenticity tool."""
+    pathsDropped = QtCore.pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+
+    @staticmethod
+    def _paths(mime):
+        if not mime.hasUrls():
+            return []
+        return [u.toLocalFile() for u in mime.urls() if u.isLocalFile() and u.toLocalFile()]
+
+    def dragEnterEvent(self, e):
+        e.acceptProposedAction() if self._paths(e.mimeData()) else super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        e.acceptProposedAction() if self._paths(e.mimeData()) else super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        paths = self._paths(e.mimeData())
+        if not paths:
+            super().dropEvent(e)
+            return
+        e.acceptProposedAction()
+        self.pathsDropped.emit(paths)
+
+
 class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
+    CARD_SLOTS = 8          # result cards built up front; unused ones stay hidden
+
     def __init__(self, app_manager, parent=None):
         super().__init__(parent)
         self.app_manager = app_manager
         self.tool_name = "audio_comparison_analysis"
         self.thread = None
         self.worker = None
-        self.file_inputs: list[QtWidgets.QLineEdit] = []
-        self.spectrogram_labels: list[QtWidgets.QLabel] = []
-        self.diff_spectrum_labels: list[QtWidgets.QLabel] = []
-        self.clipping_heatmap_labels: list[QtWidgets.QLabel] = []
-        self.delta_eq_labels: list[QtWidgets.QLabel] = []
-        self.limiting_heatmap_labels: list[QtWidgets.QLabel] = []
-        self.limiting_waveform_labels: list[QtWidgets.QLabel] = []
         self.file_cards: list[dict[str, QtWidgets.QLabel]] = []
+        self.file_card_boxes: list[QtWidgets.QGroupBox] = []
         self.reference_index: int | None = None
+        self._running = False
+        self._latest_results: list[dict] = []
         self.setAcceptDrops(True)
         self._init_ui()
         self._load_settings()
-        self._setup_worker()
-        self._check_dependencies()
+        self._refresh_source_labels()
+        self._check_dependencies()   # the worker thread is created per run
 
     def _init_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -69,37 +241,59 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
 
-        file_group = QtWidgets.QGroupBox("Input Audio Files (up to 4)")
-        file_layout = QtWidgets.QGridLayout(file_group)
-        for idx in range(4):
-            label = QtWidgets.QLabel(f"File {idx + 1}:")
-            line_edit = QtWidgets.QLineEdit()
-            line_edit.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-            line_edit.customContextMenuRequested.connect(
-                lambda pos, i=idx: self._show_reference_menu(i, pos)
-            )
-            browse_btn = QtWidgets.QPushButton("Browse")
-            browse_btn.clicked.connect(lambda _, i=idx: self._browse_file(i))
-            self.file_inputs.append(line_edit)
-            file_layout.addWidget(label, idx, 0)
-            file_layout.addWidget(line_edit, idx, 1)
-            file_layout.addWidget(browse_btn, idx, 2)
+        file_group = QtWidgets.QGroupBox(
+            f"Sources  (drag files or folders here - up to {self.CARD_SLOTS})")
+        file_layout = QtWidgets.QVBoxLayout(file_group)
+        self.source_list = SourceList()
+        self.source_list.pathsDropped.connect(self._add_paths)
+        self.source_list.itemDoubleClicked.connect(lambda _i: self._set_reference_from_selection())
+        self.source_list.setMinimumHeight(110)
+        file_layout.addWidget(self.source_list)
+
+        src_buttons = QtWidgets.QHBoxLayout()
+        self.add_button = QtWidgets.QPushButton("Add Files…")
+        self.add_button.clicked.connect(self._browse_files)
+        self.add_folder_button = QtWidgets.QPushButton("Add Folder…")
+        self.add_folder_button.clicked.connect(self._browse_folder)
+        self.remove_button = QtWidgets.QPushButton("Remove Selected")
+        self.remove_button.clicked.connect(self._remove_selected)
+        self.reference_button = QtWidgets.QPushButton("Set as Reference")
+        self.reference_button.setToolTip(
+            "The reference is what every other file is compared against.\n"
+            "Difference spectrum and EQ delta are only produced for non-reference files.\n"
+            "Double-clicking a row does the same thing.")
+        self.reference_button.clicked.connect(self._set_reference_from_selection)
+        self.clear_reference_button = QtWidgets.QPushButton("Clear Reference")
+        self.clear_reference_button.clicked.connect(lambda: self._set_reference_index(None))
+        for b in (self.add_button, self.add_folder_button, self.remove_button,
+                  self.reference_button, self.clear_reference_button):
+            src_buttons.addWidget(b)
+        src_buttons.addStretch()
+        file_layout.addLayout(src_buttons)
+
         self.reference_label = QtWidgets.QLabel("Reference: None")
-        file_layout.addWidget(self.reference_label, 4, 0, 1, 3)
+        file_layout.addWidget(self.reference_label)
         panel_layout.addWidget(file_group)
 
         action_layout = QtWidgets.QHBoxLayout()
         self.run_button = QtWidgets.QPushButton("Run Analysis")
         self.run_button.clicked.connect(self._run_analysis)
+        self.stop_button = QtWidgets.QPushButton("Stop")
+        self.stop_button.clicked.connect(self._stop_analysis)
+        self.stop_button.setEnabled(False)
         self.clear_button = QtWidgets.QPushButton("Clear")
         self.clear_button.clicked.connect(self._clear_inputs)
         self.export_button = QtWidgets.QPushButton("Export Results")
         self.export_button.clicked.connect(self._export_results)
         action_layout.addWidget(self.run_button)
+        action_layout.addWidget(self.stop_button)
         action_layout.addWidget(self.clear_button)
         action_layout.addWidget(self.export_button)
         action_layout.addStretch()
         panel_layout.addLayout(action_layout)
+
+        self.status_label = QtWidgets.QLabel("Add sources, then Run Analysis.")
+        panel_layout.addWidget(self.status_label)
 
         analysis_tabs = QtWidgets.QTabWidget()
         analysis_tabs.addTab(self._create_results_panel(), "Results")
@@ -145,8 +339,9 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
-        for idx in range(4):
+        for idx in range(self.CARD_SLOTS):
             card = QtWidgets.QGroupBox(f"File {idx + 1}")
+            self.file_card_boxes.append(card)
             card.setSizePolicy(
                 QtWidgets.QSizePolicy.Policy.Expanding,
                 QtWidgets.QSizePolicy.Policy.Expanding,
@@ -272,125 +467,79 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         return panel
 
     def _create_spectrogram_panel(self) -> QtWidgets.QWidget:
+        """One large spectrogram, or two side by side, both clickable to zoom."""
         panel = QtWidgets.QWidget()
-        panel_layout = QtWidgets.QVBoxLayout(panel)
-        panel.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
+        layout = QtWidgets.QVBoxLayout(panel)
 
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
-        scroll_area.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
-        panel_layout.addWidget(scroll_area, 1)
+        controls = QtWidgets.QHBoxLayout()
+        self.spec_compare = QtWidgets.QCheckBox("Compare two side by side")
+        self.spec_compare.toggled.connect(self._update_spectrogram_view)
+        controls.addWidget(self.spec_compare)
+        controls.addSpacing(12)
+        controls.addWidget(QtWidgets.QLabel("Left:"))
+        self.spec_picker_a = QtWidgets.QComboBox()
+        self.spec_picker_a.currentIndexChanged.connect(self._update_spectrogram_view)
+        controls.addWidget(self.spec_picker_a, 1)
+        self.spec_right_label = QtWidgets.QLabel("Right:")
+        controls.addWidget(self.spec_right_label)
+        self.spec_picker_b = QtWidgets.QComboBox()
+        self.spec_picker_b.currentIndexChanged.connect(self._update_spectrogram_view)
+        controls.addWidget(self.spec_picker_b, 1)
+        layout.addLayout(controls)
 
-        content = QtWidgets.QWidget()
-        content_layout = QtWidgets.QVBoxLayout(content)
-        content.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
-        content.setMinimumHeight(0)
+        self.spec_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.spec_panel_a = ImagePanel("Run an analysis to see spectrograms.")
+        self.spec_panel_b = ImagePanel("Pick a second file to compare.")
+        self.spec_split.addWidget(self.spec_panel_a)
+        self.spec_split.addWidget(self.spec_panel_b)
+        layout.addWidget(self.spec_split, 1)
 
-        spectrogram_group = QtWidgets.QGroupBox("Spectrogram Comparison")
-        spectrogram_layout = QtWidgets.QGridLayout(spectrogram_group)
-        spectrogram_group.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
-        for idx in range(4):
-            label = QtWidgets.QLabel("No spectrogram")
-            label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            label.setMinimumHeight(220)
-            label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
-            self.spectrogram_labels.append(label)
-            spectrogram_layout.addWidget(label, idx // 2, idx % 2)
-        content_layout.addWidget(spectrogram_group, 1)
-
-        scroll_area.setWidget(content)
-
+        hint = QtWidgets.QLabel(
+            "Click a spectrogram to open it full size (Ctrl+wheel zooms).")
+        hint.setStyleSheet("color: palette(mid);")
+        layout.addWidget(hint)
+        self._update_spectrogram_view()
         return panel
 
     def _create_forensic_panel(self) -> QtWidgets.QWidget:
+        """Forensic images for one file at a time, at a size worth looking at."""
         panel = QtWidgets.QWidget()
-        panel_layout = QtWidgets.QVBoxLayout(panel)
-        panel.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
+        layout = QtWidgets.QVBoxLayout(panel)
 
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
-        scroll_area.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
-        panel_layout.addWidget(scroll_area, 1)
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("File:"))
+        self.forensic_picker = QtWidgets.QComboBox()
+        self.forensic_picker.currentIndexChanged.connect(self._update_forensic_view)
+        controls.addWidget(self.forensic_picker, 1)
+        layout.addLayout(controls)
 
-        content = QtWidgets.QWidget()
-        content_layout = QtWidgets.QVBoxLayout(content)
-        content.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
-        content.setMinimumHeight(0)
+        self.forensic_note = QtWidgets.QLabel("")
+        self.forensic_note.setWordWrap(True)
+        self.forensic_note.setStyleSheet("color: palette(mid);")
+        layout.addWidget(self.forensic_note)
 
-        forensic_group = QtWidgets.QGroupBox("Forensic Comparison")
-        forensic_layout = QtWidgets.QGridLayout(forensic_group)
-        forensic_group.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Expanding,
-        )
+        self.forensic_tabs = QtWidgets.QTabWidget()
+        self.forensic_panels: dict[str, ImagePanel] = {}
+        for key, title, placeholder in (
+            ("diff_spectrum_path", "Difference Spectrum",
+             "Difference spectrum needs a reference file."),
+            ("delta_eq_path", "EQ Delta Over Time",
+             "EQ delta needs a reference file."),
+            ("clipping_heatmap_path", "Clipping Heatmap",
+             "No clipping heatmap for this file."),
+            ("limiting_heatmap_path", "Limiting Heatmap",
+             "No limiting heatmap for this file."),
+            ("limiting_waveform_paths", "Limiting Waveform",
+             "No limiting was detected, so there is no waveform to show."),
+        ):
+            image = ImagePanel(placeholder)
+            self.forensic_panels[key] = image
+            self.forensic_tabs.addTab(image, title)
+        layout.addWidget(self.forensic_tabs, 1)
 
-        for idx in range(4):
-            card = QtWidgets.QGroupBox(f"File {idx + 1}")
-            card_layout = QtWidgets.QVBoxLayout(card)
-
-            diff_label = QtWidgets.QLabel("Difference spectrum unavailable")
-            diff_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            diff_label.setMinimumHeight(180)
-            diff_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
-            heat_label = QtWidgets.QLabel("Clipping heatmap unavailable")
-            heat_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            heat_label.setMinimumHeight(120)
-            heat_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
-
-            delta_label = QtWidgets.QLabel("Delta EQ map unavailable")
-            delta_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            delta_label.setMinimumHeight(180)
-            delta_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
-
-            limiting_label = QtWidgets.QLabel("Limiting heatmap unavailable")
-            limiting_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            limiting_label.setMinimumHeight(120)
-            limiting_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
-
-            zoom_label = QtWidgets.QLabel("Waveform zoom unavailable")
-            zoom_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            zoom_label.setMinimumHeight(120)
-            zoom_label.setFrameStyle(QtWidgets.QFrame.Shape.StyledPanel | QtWidgets.QFrame.Shadow.Sunken)
-
-            self.diff_spectrum_labels.append(diff_label)
-            self.clipping_heatmap_labels.append(heat_label)
-            self.delta_eq_labels.append(delta_label)
-            self.limiting_heatmap_labels.append(limiting_label)
-            self.limiting_waveform_labels.append(zoom_label)
-
-            card_layout.addWidget(diff_label)
-            card_layout.addWidget(delta_label)
-            card_layout.addWidget(heat_label)
-            card_layout.addWidget(limiting_label)
-            card_layout.addWidget(zoom_label)
-            forensic_layout.addWidget(card, idx // 2, idx % 2)
-
-        content_layout.addWidget(forensic_group, 1)
-        scroll_area.setWidget(content)
-
+        hint = QtWidgets.QLabel("Click an image to open it full size (Ctrl+wheel zooms).")
+        hint.setStyleSheet("color: palette(mid);")
+        layout.addWidget(hint)
         return panel
 
     def _create_log_panel(self) -> QtWidgets.QWidget:
@@ -837,9 +986,12 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
     def _setup_worker(self):
         self.thread = QtCore.QThread(self)
         self.worker = Worker()
+        self.worker.reset()
         self.worker.moveToThread(self.thread)
         self.worker.analysis_complete.connect(self._on_analysis_complete)
         self.worker.error.connect(self._on_error)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.status.connect(self._on_status)
         self.thread.start()
 
     def _check_dependencies(self):
@@ -1056,83 +1208,148 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             "weight_mastering": self.weight_mastering.value(),
         }
 
-    def _browse_file(self, index: int):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select Audio File",
-            os.path.expanduser("~"),
-            "Audio/Video Files (*.flac *.wav *.mka *.mkv *.mp4 *.m4a *.aac *.ac3 *.eac3 *.dts *.ogg);;All (*)",
-        )
-        if path:
-            self.file_inputs[index].setText(path)
+    def _add_paths(self, paths):
+        added = 0
+        for raw in paths:
+            path = Path(raw)
+            if path.is_dir():
+                for f in sorted(path.rglob("*")):
+                    if f.suffix.lower() in MEDIA_SUFFIXES and self._add_one(str(f)):
+                        added += 1
+            elif self._add_one(str(path)):
+                added += 1
+        if self.source_list.count() > self.CARD_SLOTS:
+            self.status_label.setText(
+                f"{self.source_list.count()} sources listed; only the first "
+                f"{self.CARD_SLOTS} will be analysed.")
+        elif added:
+            self.status_label.setText(
+                f"Added {added} file(s); {self.source_list.count()} source(s) listed.")
+        elif paths:
+            self.status_label.setText("Nothing added - already listed, or no media files found.")
 
-    def _show_reference_menu(self, index: int, pos: QtCore.QPoint) -> None:
-        menu = QtWidgets.QMenu(self)
-        set_action = menu.addAction("Set as Reference")
-        clear_action = menu.addAction("Clear Reference")
-        action = menu.exec(self.file_inputs[index].mapToGlobal(pos))
-        if action == set_action:
-            self._set_reference_index(index)
-        elif action == clear_action:
-            self._set_reference_index(None)
+    def _add_one(self, path: str) -> bool:
+        if not os.path.isfile(path):
+            return False
+        if any(self.source_list.item(i).data(QtCore.Qt.ItemDataRole.UserRole) == path
+               for i in range(self.source_list.count())):
+            return False
+        item = QtWidgets.QListWidgetItem(os.path.basename(path))
+        item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
+        item.setToolTip(path)
+        self.source_list.addItem(item)
+        return True
+
+    def _browse_files(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Select Audio Files", os.path.expanduser("~"),
+            "Audio/Video Files (*.flac *.wav *.mka *.mkv *.mp4 *.m4a *.aac *.ac3 "
+            "*.eac3 *.dts *.thd *.ogg);;All (*)")
+        if paths:
+            self._add_paths(paths)
+
+    def _browse_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select Folder", os.path.expanduser("~"))
+        if folder:
+            self._add_paths([folder])
+
+    def _remove_selected(self):
+        rows = sorted((self.source_list.row(i) for i in self.source_list.selectedItems()),
+                      reverse=True)
+        for row in rows:
+            self.source_list.takeItem(row)
+            if self.reference_index == row:
+                self.reference_index = None
+            elif self.reference_index is not None and self.reference_index > row:
+                self.reference_index -= 1
+        self._refresh_source_labels()
+
+    def _set_reference_from_selection(self):
+        items = self.source_list.selectedItems()
+        if not items:
+            self.status_label.setText("Select a source first, then Set as Reference.")
+            return
+        self._set_reference_index(self.source_list.row(items[0]))
 
     def _set_reference_index(self, index: int | None) -> None:
         self.reference_index = index
-        if index is None:
-            self.reference_label.setText("Reference: None")
+        self._refresh_source_labels()
+
+    def _refresh_source_labels(self):
+        for i in range(self.source_list.count()):
+            item = self.source_list.item(i)
+            path = item.data(QtCore.Qt.ItemDataRole.UserRole) or ""
+            name = os.path.basename(path)
+            beyond = "  (not analysed - over the limit)" if i >= self.CARD_SLOTS else ""
+            if i == self.reference_index:
+                item.setText(f"★ REFERENCE - {name}{beyond}")
+                font = item.font(); font.setBold(True); item.setFont(font)
+            else:
+                item.setText(f"{name}{beyond}")
+                font = item.font(); font.setBold(False); item.setFont(font)
+        if self.reference_index is None:
+            self.reference_label.setText(
+                "Reference: None - set one to get the difference spectrum and EQ delta.")
         else:
-            name = os.path.basename(self.file_inputs[index].text().strip()) or f"File {index + 1}"
+            item = self.source_list.item(self.reference_index)
+            name = os.path.basename(item.data(QtCore.Qt.ItemDataRole.UserRole)) if item else "?"
             self.reference_label.setText(f"Reference: {name}")
 
     def _clear_inputs(self):
-        for line_edit in self.file_inputs:
-            line_edit.clear()
+        self.source_list.clear()
+        self.reference_index = None
+        self._refresh_source_labels()
         self.summary_box.clear()
         self.verdict_box.clear()
         self.log_box.clear()
-        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
-        self._set_reference_index(None)
         self._latest_results = []
         for labels in self.file_cards:
             for label in labels.values():
                 label.setText("-")
-        for label in self.spectrogram_labels:
-            label.setText("No spectrogram")
-            label.setPixmap(QtGui.QPixmap())
-        for label in self.diff_spectrum_labels:
-            label.setText("Difference spectrum unavailable")
-            label.setPixmap(QtGui.QPixmap())
-        for label in self.clipping_heatmap_labels:
-            label.setText("Clipping heatmap unavailable")
-            label.setPixmap(QtGui.QPixmap())
-        for label in self.delta_eq_labels:
-            label.setText("Delta EQ map unavailable")
-            label.setPixmap(QtGui.QPixmap())
-        for label in self.limiting_heatmap_labels:
-            label.setText("Limiting heatmap unavailable")
-            label.setPixmap(QtGui.QPixmap())
-        for label in self.limiting_waveform_labels:
-            label.setText("Waveform zoom unavailable")
-            label.setPixmap(QtGui.QPixmap())
+        for card in self.file_card_boxes:
+            card.setVisible(False)
+        self.spec_picker_a.clear()
+        self.spec_picker_b.clear()
+        self.forensic_picker.clear()
+        self.spec_panel_a.set_source(None)
+        self.spec_panel_b.set_source(None)
+        for panel in self.forensic_panels.values():
+            panel.set_source(None)
+        self.status_label.setText("Add sources, then Run Analysis.")
 
     def _collect_files(self) -> list[str]:
-        paths = [edit.text().strip() for edit in self.file_inputs if edit.text().strip()]
-        return paths[:4]
+        paths = [self.source_list.item(i).data(QtCore.Qt.ItemDataRole.UserRole)
+                 for i in range(self.source_list.count())]
+        return [p for p in paths if p][: self.CARD_SLOTS]
 
     def _run_analysis(self):
+        if self._running:
+            return
         file_paths = self._collect_files()
         if not file_paths:
-            QtWidgets.QMessageBox.warning(self, "No files", "Please select up to 4 audio files.")
+            QtWidgets.QMessageBox.warning(
+                self, "No files", "Add at least one audio file to analyse.")
             return
+
+        # A previous run must be fully joined first: QThread.start() silently
+        # does nothing on a thread that has not finished.
+        self._join_thread()
+        self._setup_worker()
+
+        self._running = True
         self.run_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
         self.summary_box.setText("Analyzing audio files...")
-        self.log_box.append("Starting analysis...")
-        self.progress_bar.setRange(0, 0)
+        self.log_box.append(f"Starting analysis of {len(file_paths)} file(s)...")
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(0)
         temp_dir = self.app_manager.get_temp_dir(self.tool_name)
         reference_path = None
-        if self.reference_index is not None and self.reference_index < len(self.file_inputs):
-            reference_path = self.file_inputs[self.reference_index].text().strip() or None
+        if self.reference_index is not None and self.reference_index < len(file_paths):
+            reference_path = file_paths[self.reference_index]
         QtCore.QMetaObject.invokeMethod(
             self.worker,
             "run",
@@ -1142,6 +1359,24 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             QtCore.Q_ARG(str, temp_dir),
             QtCore.Q_ARG(str, reference_path or ""),
         )
+
+    def _stop_analysis(self):
+        if self._running and self.worker:
+            self.worker.stop()
+            self.stop_button.setEnabled(False)
+            self.status_label.setText("Stopping…")
+
+    def _on_progress(self, fraction: float):
+        self.progress_bar.setValue(int(fraction * 1000))
+
+    def _on_status(self, text: str):
+        self.status_label.setText(text)
+        self.log_box.append(text)
+
+    def _finish_run(self):
+        self._running = False
+        self.run_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
 
     def _export_results(self):
         if not getattr(self, "_latest_results", None):
@@ -1172,29 +1407,39 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
         self.log_box.append(f"Exported results to {path}")
 
     def _on_analysis_complete(self, results: list[dict]):
-        self.run_button.setEnabled(True)
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setValue(1)
+        self._finish_run()
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(1000)
         self.log_box.append("Analysis complete.")
         self._latest_results = results
         self._populate_results(results)
         self._update_summary(results)
         self._load_spectrograms(results)
-        self._load_forensics(results)
+        graded = sum(1 for r in results if not r.get("disqualified"))
+        self.status_label.setText(
+            f"Done: {len(results)} file(s) analysed, {len(results) - graded} disqualified."
+            + ("" if self.reference_index is not None else
+               "  No reference set - forensic comparison images were skipped."))
 
     def _on_error(self, message: str):
-        self.run_button.setEnabled(True)
-        self.progress_bar.setRange(0, 1)
+        self._finish_run()
         self.progress_bar.setValue(0)
         self.log_box.append(f"Error: {message}")
         self.summary_box.setText(f"Error: {message}")
+        self.status_label.setText(message)
 
     def _populate_results(self, results: list[dict]):
         for labels in self.file_cards:
             for label in labels.values():
                 label.setText("-")
 
-        for idx, result in enumerate(results[:4]):
+        for card in self.file_card_boxes:
+            card.setVisible(False)
+        for idx, result in enumerate(results[: self.CARD_SLOTS]):
+            if idx < len(self.file_card_boxes):
+                self.file_card_boxes[idx].setVisible(True)
+                self.file_card_boxes[idx].setTitle(
+                    os.path.basename(result.get("path") or f"File {idx + 1}"))
             labels = self.file_cards[idx]
             flags = []
             if result.get("disqualified"):
@@ -1377,108 +1622,117 @@ class AudioComparisonAnalysisWidget(QtWidgets.QWidget):
             self.verdict_box.clear()
 
     def _load_spectrograms(self, results: list[dict]):
-        for label in self.spectrogram_labels:
-            label.setText("No spectrogram")
-            label.setPixmap(QtGui.QPixmap())
-        for idx, result in enumerate(results[:4]):
-            path = result.get("spectrogram_path")
-            if not path or not os.path.exists(path):
-                continue
-            pixmap = QtGui.QPixmap(path)
-            if pixmap.isNull():
-                continue
-            scaled = pixmap.scaled(400, 200, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
-            self.spectrogram_labels[idx].setPixmap(scaled)
-            self.spectrogram_labels[idx].setText("")
+        for picker in (self.spec_picker_a, self.spec_picker_b, self.forensic_picker):
+            picker.blockSignals(True)
+            picker.clear()
+        for idx, result in enumerate(results):
+            name = os.path.basename(result.get("path") or f"File {idx + 1}")
+            if result.get("reference_path") and result.get("path") == result.get("reference_path"):
+                name += "  [reference]"
+            for picker in (self.spec_picker_a, self.spec_picker_b, self.forensic_picker):
+                picker.addItem(name, idx)
+        for picker in (self.spec_picker_a, self.spec_picker_b, self.forensic_picker):
+            picker.blockSignals(False)
+        if self.spec_picker_a.count():
+            self.spec_picker_a.setCurrentIndex(0)
+            self.spec_picker_b.setCurrentIndex(min(1, self.spec_picker_b.count() - 1))
+            self.forensic_picker.setCurrentIndex(0)
+        self._update_spectrogram_view()
+        self._update_forensic_view()
 
-    def _load_forensics(self, results: list[dict]):
-        for label in self.diff_spectrum_labels:
-            label.setText("Difference spectrum unavailable")
-            label.setPixmap(QtGui.QPixmap())
-        for label in self.clipping_heatmap_labels:
-            label.setText("Clipping heatmap unavailable")
-            label.setPixmap(QtGui.QPixmap())
-        for label in self.delta_eq_labels:
-            label.setText("Delta EQ map unavailable")
-            label.setPixmap(QtGui.QPixmap())
-        for label in self.limiting_heatmap_labels:
-            label.setText("Limiting heatmap unavailable")
-            label.setPixmap(QtGui.QPixmap())
-        for label in self.limiting_waveform_labels:
-            label.setText("Waveform zoom unavailable")
-            label.setPixmap(QtGui.QPixmap())
+    def _result_at(self, picker: QtWidgets.QComboBox) -> dict | None:
+        idx = picker.currentData()
+        if idx is None or idx >= len(self._latest_results):
+            return None
+        return self._latest_results[idx]
 
-        for idx, result in enumerate(results[:4]):
-            diff_path = result.get("diff_spectrum_path")
-            if diff_path and os.path.exists(diff_path):
-                pixmap = QtGui.QPixmap(diff_path)
-                if not pixmap.isNull():
-                    scaled = pixmap.scaled(400, 200, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
-                    self.diff_spectrum_labels[idx].setPixmap(scaled)
-                    self.diff_spectrum_labels[idx].setText("")
-            elif result.get("reference_path") and result.get("path") == result.get("reference_path"):
-                self.diff_spectrum_labels[idx].setText("Reference file")
+    def _update_spectrogram_view(self):
+        compare = self.spec_compare.isChecked()
+        self.spec_picker_b.setVisible(compare)
+        self.spec_right_label.setVisible(compare)
+        self.spec_panel_b.setVisible(compare)
 
-            heat_path = result.get("clipping_heatmap_path")
-            if heat_path and os.path.exists(heat_path):
-                pixmap = QtGui.QPixmap(heat_path)
-                if not pixmap.isNull():
-                    scaled = pixmap.scaled(400, 140, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
-                    self.clipping_heatmap_labels[idx].setPixmap(scaled)
-                    self.clipping_heatmap_labels[idx].setText("")
+        result_a = self._result_at(self.spec_picker_a)
+        self.spec_panel_a.set_source(
+            (result_a or {}).get("spectrogram_path"),
+            "No spectrogram for this file." if result_a else
+            "Run an analysis to see spectrograms.")
+        if compare:
+            result_b = self._result_at(self.spec_picker_b)
+            self.spec_panel_b.set_source(
+                (result_b or {}).get("spectrogram_path"),
+                "No spectrogram for this file." if result_b else
+                "Pick a second file to compare.")
 
-            delta_path = result.get("delta_eq_path")
-            if delta_path and os.path.exists(delta_path):
-                pixmap = QtGui.QPixmap(delta_path)
-                if not pixmap.isNull():
-                    scaled = pixmap.scaled(400, 200, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
-                    self.delta_eq_labels[idx].setPixmap(scaled)
-                    self.delta_eq_labels[idx].setText("")
+    def _update_forensic_view(self):
+        result = self._result_at(self.forensic_picker)
+        if result is None:
+            for panel in self.forensic_panels.values():
+                panel.set_source(None)
+            self.forensic_note.setText("")
+            return
 
-            limiting_path = result.get("limiting_heatmap_path")
-            if limiting_path and os.path.exists(limiting_path):
-                pixmap = QtGui.QPixmap(limiting_path)
-                if not pixmap.isNull():
-                    scaled = pixmap.scaled(400, 140, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
-                    self.limiting_heatmap_labels[idx].setPixmap(scaled)
-                    self.limiting_heatmap_labels[idx].setText("")
+        is_reference = bool(result.get("reference_path")) and \
+            result.get("path") == result.get("reference_path")
+        has_reference = bool(result.get("reference_path"))
+        if not has_reference:
+            self.forensic_note.setText(
+                "No reference file was set, so there is nothing to difference against - "
+                "the difference spectrum and EQ delta need one. "
+                "Select a source and press 'Set as Reference', then run again.")
+        elif is_reference:
+            self.forensic_note.setText(
+                "This file IS the reference, so it is not differenced against itself. "
+                "Pick one of the other files to see the comparison images.")
+        else:
+            self.forensic_note.setText("")
 
-            zoom_paths = result.get("limiting_waveform_paths") or []
-            if zoom_paths:
-                zoom_path = zoom_paths[0]
-                if os.path.exists(zoom_path):
-                    pixmap = QtGui.QPixmap(zoom_path)
-                    if not pixmap.isNull():
-                        scaled = pixmap.scaled(400, 140, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
-                        self.limiting_waveform_labels[idx].setPixmap(scaled)
-                        self.limiting_waveform_labels[idx].setText("")
+        for key, panel in self.forensic_panels.items():
+            value = result.get(key)
+            path = value[0] if isinstance(value, list) and value else (
+                value if isinstance(value, str) else None)
+            if key in ("diff_spectrum_path", "delta_eq_path") and not path:
+                reason = ("This file is the reference - nothing to compare it against."
+                          if is_reference else
+                          "Needs a reference file. Set one and run the analysis again."
+                          if not has_reference else
+                          "Could not be produced for this pair.")
+            elif key == "limiting_waveform_paths" and not path:
+                reason = "No limiting was detected in this file, so there is nothing to show."
+            else:
+                reason = ""
+            panel.set_source(path, reason)
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
-            event.ignore()
+            super().dragEnterEvent(event)
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        urls = event.mimeData().urls()
-        if not urls:
-            return
-        paths = [url.toLocalFile() for url in urls if url.toLocalFile()]
-        self._fill_files(paths)
-        event.acceptProposedAction()
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile()]
+        if paths:
+            self._add_paths(paths)
+            event.acceptProposedAction()
 
-    def _fill_files(self, paths: Iterable[str]):
-        for path in paths:
-            if not path:
-                continue
-            for edit in self.file_inputs:
-                if not edit.text().strip():
-                    edit.setText(path)
-                    break
-
-    def shutdown(self):
-        if self.thread and self.thread.isRunning():
-            self.thread.quit()
-            self.thread.wait(2000)
+    def _join_thread(self, timeout_ms: int = 15000):
+        """Stop the worker and wait for its thread to really finish."""
+        if self.worker is not None:
+            self.worker.stop()
+        if self.thread is not None:
+            if self.thread.isRunning():
+                self.thread.quit()
+                self.thread.wait(timeout_ms)
+            self.thread.deleteLater()
         self.thread = None
         self.worker = None
+
+    def shutdown(self):
+        """Closing the tab should free everything, like closing an app."""
+        self._join_thread(10000)
+        self._latest_results = []
+        self.spec_panel_a.set_source(None)
+        self.spec_panel_b.set_source(None)
+        for panel in self.forensic_panels.values():
+            panel.set_source(None)
+        self.log_box.clear()

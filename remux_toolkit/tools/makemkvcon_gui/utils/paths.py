@@ -100,28 +100,21 @@ def find_disc_roots_with_structure(path: Path, max_depth: int = 5) -> list[DiscI
                 ))
                 return
 
-            iso_files = []
-            subdirs = []
+            # Walk the folder in name order, taking ISOs and descending into
+            # subfolders as they come. Finding a loose ISO here says nothing
+            # about whether the subfolders hold discs too - a season folder
+            # often has both (extras as an ISO, the volumes as BDMV folders) -
+            # so this must not stop at the first ISO it sees.
             for item in sorted(current_path.iterdir()):
                 if item.is_file() and is_iso(item):
-                    iso_files.append(item)
+                    discs.append(DiscInfo(
+                        disc_path=item,
+                        display_name=item.stem,
+                        relative_path=item.relative_to(drop_root),
+                        drop_root=drop_root
+                    ))
                 elif item.is_dir():
-                    subdirs.append(item)
-
-            for iso_file in iso_files:
-                rel_path = iso_file.relative_to(drop_root)
-                discs.append(DiscInfo(
-                    disc_path=iso_file,
-                    display_name=iso_file.stem,
-                    relative_path=rel_path,
-                    drop_root=drop_root
-                ))
-
-            if iso_files:
-                return
-
-            for subdir in subdirs:
-                _find_discs_recursive(subdir, depth + 1)
+                    _find_discs_recursive(item, depth + 1)
 
         except (PermissionError, OSError):
             pass
