@@ -33,6 +33,9 @@ class MakeMKVConGUIWidget(QWidget):
         self.running = False
         self.completed_jobs = {}
         self.current_job_row: Optional[int] = None
+        # Drops signals still queued from a batch that was stopped/cleared, so
+        # they can't land on rows belonging to a newer queue.
+        self._accept_worker_events = False
 
         self._init_ui()
         self._load_settings()
@@ -113,6 +116,7 @@ class MakeMKVConGUIWidget(QWidget):
         self.worker.status_text.connect(self.on_status_text)
         self.worker.line_out.connect(self.on_line)
         self.worker.job_done.connect(self.on_done)
+        self.worker.batch_done.connect(self._on_batch_done)
         self.work_thread.started.connect(self.worker.run)
 
     def _load_settings(self):
@@ -134,11 +138,28 @@ class MakeMKVConGUIWidget(QWidget):
         self.settings["v_split_sizes"] = self.v_split.sizes()
         self.app_manager.save_config(self.tool_name, self.settings)
 
+    def _stop_and_join(self, timeout_ms: int = 15000) -> bool:
+        """
+        Ask the rip worker to stop and wait for its thread to really finish.
+
+        QThread.start() is a silent no-op on a thread that has not finished yet,
+        so a run must be fully joined before the queue can be started again.
+        """
+        self._accept_worker_events = False
+        if not self.work_thread.isRunning():
+            return True
+
+        self.worker.stop()
+        self.work_thread.quit()
+        if self.work_thread.wait(timeout_ms):
+            return True
+
+        self.console.append("Rip thread did not shut down cleanly.", "error")
+        return False
+
     def shutdown(self):
-        if hasattr(self, 'worker') and self.worker: self.worker.stop()
-        if hasattr(self, 'work_thread') and self.work_thread.isRunning():
-            self.work_thread.quit()
-            self.work_thread.wait(2000)
+        if hasattr(self, 'work_thread'):
+            self._stop_and_join(10000)
         if hasattr(self, 'probe_thread') and self.probe_thread.isRunning():
             self.probe_thread.quit()
             self.probe_thread.wait(2000)
@@ -384,16 +405,13 @@ class MakeMKVConGUIWidget(QWidget):
             self.details.clear()
 
     def clear_all(self):
-        """Clear all jobs and reset state - FIXED to handle running queue"""
-        # Stop any running queue first
-        if self.running:
-            self.worker.stop()
-            if self.work_thread.isRunning():
-                self.work_thread.quit()
-                self.work_thread.wait(1000)
-            self.running = False
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
+        """Clear all jobs and reset state, stopping any run that is still going."""
+        # Unconditionally - a prior Stop leaves self.running False while the
+        # worker thread is still unwinding.
+        self._stop_and_join()
+        self.running = False
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
 
         # Clear everything
         self.tree.clear()
@@ -413,25 +431,30 @@ class MakeMKVConGUIWidget(QWidget):
             self.console.append("=== No jobs or titles selected to run ===", "warning")
             return
 
+        # A previous run may still be unwinding (e.g. right after a Stop).
+        if not self._stop_and_join():
+            self.console.append("=== Cannot start: previous run is still busy ===", "error")
+            return
+
         self.console.clear()
         self.console.append("=== Starting queue ===", "info")
+        self._accept_worker_events = True
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.running = True
         self.completed_jobs.clear()
-        self.worker.set_jobs(jobs_to_run)
+        self.worker.set_jobs(jobs_to_run)  # also clears the worker's stop flag
         self.work_thread.start()
 
     def stop_queue(self):
-        """Stop the queue - FIXED to immediately reset state"""
-        if self.running:
-            self.worker.stop()
-            self.console.append(">>> Stop requested…", "warning")
+        """Request a stop; the run state is reset when the worker reports back."""
+        if not self.running:
+            return
 
-            # Immediately reset state
-            self.running = False
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
+        self.worker.stop()
+        self.console.append(">>> Stop requested, finishing up…", "warning")
+        self.btn_stop.setEnabled(False)
+        self.btn_start.setEnabled(False)
 
     def _calculate_estimated_size(self) -> int:
         """Calculate estimated total output size for selected titles"""
@@ -461,49 +484,62 @@ class MakeMKVConGUIWidget(QWidget):
         self.queue_label.setText(f"Queue: {job_count} jobs loaded (Estimated: {size_str})")
 
     def on_progress(self, row, pct):
+        if not self._accept_worker_events: return
         if 0 <= row < self.tree.topLevelItemCount():
             if item := self.tree.topLevelItem(row):
                 if bar := self.tree.itemWidget(item, 7):
                     bar.setValue(max(0, min(100, pct)))
 
     def on_status_text(self, row, text):
+        if not self._accept_worker_events: return
         if 0 <= row < self.tree.topLevelItemCount():
             if item := self.tree.topLevelItem(row):
                 item.setText(6, text)
 
     def on_line(self, row, line, severity="info"):
         """Handle console output with severity for color coding"""
+        if not self._accept_worker_events: return
         self.console.append(line, severity)
 
     def on_done(self, row, ok, error_message: str):
         """Handle job completion with detailed error information"""
+        if not self._accept_worker_events: return
         self.completed_jobs[row] = ok
+        stopped = (error_message == "Stopped by user")
         if item := self.tree.topLevelItem(row):
             if ok:
                 item.setText(6, "Done")
+            elif stopped:
+                item.setText(6, "Stopped")
             else:
                 status = "Failed"
                 if error_message:
                     status = f"Failed: {error_message[:50]}..." if len(error_message) > 50 else f"Failed: {error_message}"
                 item.setText(6, status)
 
-        if not ok and error_message:
+        if not ok and error_message and not stopped:
             self.console.append(f"Job {row} failed: {error_message}", "error")
 
-        is_last = (len(self.completed_jobs) >= len(self.worker.jobs_to_run))
-        if self.worker._stop or is_last:
-            self.console.append("=== Queue finished ===", "info")
+    def _on_batch_done(self, stopped: bool):
+        """The worker finished the whole batch - the only place run state resets."""
+        self.work_thread.quit()
 
-            success_count = sum(1 for success in self.completed_jobs.values() if success)
-            total_count = len(self.completed_jobs)
-
-            if success_count == total_count:
-                self.console.append(f"Completed: {success_count}/{total_count} jobs successful", "success")
+        if self._accept_worker_events:
+            if stopped:
+                self.console.append("=== Queue stopped ===", "warning")
             else:
-                self.console.append(f"Completed: {success_count}/{total_count} jobs successful", "warning")
+                self.console.append("=== Queue finished ===", "info")
 
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
-            self.running = False
-            self.current_job_row = None
-            self.work_thread.quit()
+            total_count = len(self.completed_jobs)
+            success_count = sum(1 for success in self.completed_jobs.values() if success)
+            if total_count:
+                self.console.append(
+                    f"Completed: {success_count}/{total_count} jobs successful",
+                    "success" if success_count == total_count else "warning"
+                )
+
+        self._accept_worker_events = False
+        self.running = False
+        self.current_job_row = None
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
