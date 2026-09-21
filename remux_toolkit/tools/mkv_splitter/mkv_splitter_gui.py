@@ -33,19 +33,59 @@ def format_target_duration(minutes):
         m, s = m + 1, 0
     return f"{m}:{s:02d}"
 
+class DropLineEdit(QtWidgets.QLineEdit):
+    """Path box that accepts an MKV file or a folder dragged onto it."""
+    pathsDropped = QtCore.pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    @staticmethod
+    def _local_paths(mime):
+        if not mime.hasUrls():
+            return []
+        return [u.toLocalFile() for u in mime.urls() if u.isLocalFile() and u.toLocalFile()]
+
+    def dragEnterEvent(self, event):
+        if self._local_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._local_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        paths = self._local_paths(event.mimeData())
+        if not paths:
+            # Plain text drag - let QLineEdit do its normal thing.
+            super().dropEvent(event)
+            return
+        self.setText(paths[0])
+        event.acceptProposedAction()
+        self.pathsDropped.emit(paths)
+
+
 class AnalysisWorker(QtCore.QThread):
     """Worker to handle the file analysis in the background."""
     # Emits: mkv_info dict, analysis log string, split_points list
     result = QtCore.pyqtSignal(dict, str, list)
     error = QtCore.pyqtSignal(str)
 
-    def __init__(self, file_path, min_duration, num_episodes, analysis_mode, target_duration):
+    def __init__(self, file_path, min_duration, num_episodes, analysis_mode, target_duration,
+                 manual_chapters=None, manual_timestamps=""):
         super().__init__()
         self.file_path = file_path
         self.min_duration = min_duration
         self.num_episodes = num_episodes
         self.analysis_mode = analysis_mode
         self.target_duration = target_duration
+        self.manual_chapters = manual_chapters
+        self.manual_timestamps = manual_timestamps
 
     def run(self):
         try:
@@ -55,7 +95,9 @@ class AnalysisWorker(QtCore.QThread):
 
             log, split_points = core.analyze_chapters(
                 mkv_info, self.min_duration, self.num_episodes,
-                self.analysis_mode, self.target_duration
+                self.analysis_mode, self.target_duration,
+                manual_chapters=self.manual_chapters,
+                manual_timestamps=self.manual_timestamps,
             )
             self.result.emit(mkv_info, log, split_points)
         except Exception as e:
@@ -231,6 +273,8 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.execution_worker = None
         self.analysis_results = {}
         self._batch_commands = []  # for batch mode
+        self._chapter_rows = []
+        self._populating_chapters = False
         self._init_ui()
         self._load_settings()
 
@@ -244,8 +288,9 @@ class MKVSplitterWidget(QtWidgets.QWidget):
 
         input_group = QtWidgets.QGroupBox("Input")
         input_layout = QtWidgets.QHBoxLayout(input_group)
-        self.file_path_input = QtWidgets.QLineEdit()
-        self.file_path_input.setPlaceholderText("Select or paste MKV file path...")
+        self.file_path_input = DropLineEdit()
+        self.file_path_input.setPlaceholderText("Drag an MKV here, or select/paste a path...")
+        self.file_path_input.pathsDropped.connect(self._on_paths_dropped)
         browse_btn = QtWidgets.QPushButton("Browse File...")
         browse_btn.clicked.connect(self._select_file)
         self.browse_folder_btn = QtWidgets.QPushButton("Browse Folder...")
@@ -259,7 +304,9 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         analysis_group = QtWidgets.QGroupBox("Analysis Configuration")
         analysis_layout = QtWidgets.QFormLayout(analysis_group)
         self.analysis_mode_combo = QtWidgets.QComboBox()
-        self.analysis_modes = ["Time-based Grouping", "Pattern Recognition", "Statistical Gap Analysis", "Shortest Chapter Analysis", "Manual Episode Count", "Remove Chapters from End"]
+        self.analysis_modes = ["Time-based Grouping", "Pattern Recognition", "Statistical Gap Analysis",
+                               "Shortest Chapter Analysis", "Manual Episode Count", "Remove Chapters from End",
+                               core.MANUAL_CHAPTERS_MODE, core.MANUAL_TIMESTAMPS_MODE]
         self.analysis_mode_combo.addItems(self.analysis_modes)
         self.analysis_mode_combo.currentTextChanged.connect(self._on_mode_changed)
         analysis_layout.addRow("Analysis Mode:", self.analysis_mode_combo)
@@ -277,7 +324,39 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         param_layout3 = QtWidgets.QFormLayout(); param_layout3.addRow("Expected # of Episodes:", self.num_episodes_input); w3 = QtWidgets.QWidget(); w3.setLayout(param_layout3)
         param_layout4 = QtWidgets.QFormLayout(); param_layout4.addRow("Chapters to Remove from End:", self.chapters_from_end_input); w4 = QtWidgets.QWidget(); w4.setLayout(param_layout4)
 
+        # Page 5: Before Chapters (Manual) - the picking happens in the chapter table
+        param_layout5 = QtWidgets.QVBoxLayout()
+        chapters_hint = QtWidgets.QLabel(
+            "Analyze the file, then tick chapters in the Chapters table to split before them."
+        )
+        chapters_hint.setWordWrap(True)
+        chapter_btn_row = QtWidgets.QHBoxLayout()
+        self.chapters_all_btn = QtWidgets.QPushButton("Select All Chapters")
+        self.chapters_all_btn.clicked.connect(lambda: self._set_all_chapter_checks(True))
+        self.chapters_none_btn = QtWidgets.QPushButton("Clear Selection")
+        self.chapters_none_btn.clicked.connect(lambda: self._set_all_chapter_checks(False))
+        chapter_btn_row.addWidget(self.chapters_all_btn)
+        chapter_btn_row.addWidget(self.chapters_none_btn)
+        chapter_btn_row.addStretch()
+        param_layout5.addWidget(chapters_hint)
+        param_layout5.addLayout(chapter_btn_row)
+        w5 = QtWidgets.QWidget(); w5.setLayout(param_layout5)
+
+        # Page 6: After Timestamps (Manual)
+        param_layout6 = QtWidgets.QFormLayout()
+        self.timestamps_input = QtWidgets.QLineEdit()
+        self.timestamps_input.setPlaceholderText("e.g. 21:30, 44:10.500  (HH:MM:SS, MM:SS, or 90s)")
+        self.timestamps_input.setToolTip(
+            "mkvmerge starts a new file once the stream reaches each timestamp, at the\n"
+            "next key frame. Same as mkvtoolnix's 'After specific timestamps'.\n"
+            "Double-click a row in the Chapters table to paste that chapter's start time."
+        )
+        self.timestamps_input.textChanged.connect(self._on_timestamps_changed)
+        param_layout6.addRow("Split after timestamps:", self.timestamps_input)
+        w6 = QtWidgets.QWidget(); w6.setLayout(param_layout6)
+
         self.params_stack.addWidget(w1); self.params_stack.addWidget(w2); self.params_stack.addWidget(w3); self.params_stack.addWidget(w4)
+        self.params_stack.addWidget(w5); self.params_stack.addWidget(w6)
         analysis_layout.addRow(self.params_stack)
 
         self.analyze_button = QtWidgets.QPushButton("Analyze File")
@@ -310,6 +389,27 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         tracks_layout.addWidget(self.track_table)
         results_splitter.addWidget(tracks_widget)
 
+        self.chapters_widget = QtWidgets.QWidget()
+        chapters_layout = QtWidgets.QVBoxLayout(self.chapters_widget)
+        chapters_layout.setContentsMargins(0, 0, 0, 0)
+        self.chapters_label = QtWidgets.QLabel("Chapters:")
+        chapters_layout.addWidget(self.chapters_label)
+        self.chapter_table = QtWidgets.QTableWidget()
+        self.chapter_table.setColumnCount(4)
+        self.chapter_table.setHorizontalHeaderLabels(["Chapter", "Start", "Duration", "Title"])
+        ch_hdr = self.chapter_table.horizontalHeader()
+        ch_hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        ch_hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        ch_hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        ch_hdr.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.chapter_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.chapter_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.chapter_table.itemChanged.connect(self._on_chapter_item_changed)
+        self.chapter_table.itemDoubleClicked.connect(self._on_chapter_double_clicked)
+        chapters_layout.addWidget(self.chapter_table)
+        self.chapters_widget.setVisible(False)
+        results_splitter.addWidget(self.chapters_widget)
+
         log_widget = QtWidgets.QWidget()
         log_layout = QtWidgets.QVBoxLayout(log_widget)
         log_layout.setContentsMargins(0,0,0,0)
@@ -318,7 +418,7 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         log_layout.addWidget(self.log_output)
         results_splitter.addWidget(log_widget)
 
-        results_splitter.setSizes([300, 400])
+        results_splitter.setSizes([250, 320, 400])
         results_layout.addWidget(results_splitter)
 
         command_row = QtWidgets.QHBoxLayout()
@@ -348,21 +448,141 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.generate_btn.setEnabled(enabled)
         self.execute_btn.setEnabled(enabled)
 
+    def _is_manual_mode(self, mode=None):
+        mode = mode if mode is not None else self.analysis_mode_combo.currentText()
+        return mode in (core.MANUAL_CHAPTERS_MODE, core.MANUAL_TIMESTAMPS_MODE)
+
     def _on_mode_changed(self, mode):
         if mode == "Time-based Grouping": self.params_stack.setCurrentIndex(0)
         elif mode == "Manual Episode Count": self.params_stack.setCurrentIndex(2)
         elif mode == "Remove Chapters from End": self.params_stack.setCurrentIndex(3)
+        elif mode == core.MANUAL_CHAPTERS_MODE: self.params_stack.setCurrentIndex(4)
+        elif mode == core.MANUAL_TIMESTAMPS_MODE: self.params_stack.setCurrentIndex(5)
         else: self.params_stack.setCurrentIndex(1)
 
         # Show/hide folder browse and update placeholder based on mode
         is_remove_mode = mode == "Remove Chapters from End"
         self.browse_folder_btn.setVisible(is_remove_mode)
         if is_remove_mode:
-            self.file_path_input.setPlaceholderText("Select MKV file or folder of MKV files...")
+            self.file_path_input.setPlaceholderText("Drag an MKV or folder here, or select/paste a path...")
             self.analyze_button.setText("Analyze")
         else:
-            self.file_path_input.setPlaceholderText("Select or paste MKV file path...")
+            self.file_path_input.setPlaceholderText("Drag an MKV here, or select/paste a path...")
             self.analyze_button.setText("Analyze File")
+
+        # The chapter table only means something in the manual modes.
+        self.chapters_widget.setVisible(self._is_manual_mode(mode))
+        if mode == core.MANUAL_CHAPTERS_MODE:
+            self.chapters_label.setText("Chapters (tick to split before):")
+        elif mode == core.MANUAL_TIMESTAMPS_MODE:
+            self.chapters_label.setText("Chapters (double-click to use a start time):")
+        self._apply_chapter_check_mode()
+
+    def _on_paths_dropped(self, paths):
+        """A file or folder was dragged onto the path box."""
+        path = paths[0]
+        notes = []
+        if len(paths) > 1:
+            notes.append(f"{len(paths)} items dropped - using the first: {os.path.basename(path)}")
+        if os.path.isdir(path) and self.analysis_mode_combo.currentText() != "Remove Chapters from End":
+            notes.append("This is a folder. Folder input only works in 'Remove Chapters from End' mode.")
+        elif not os.path.isdir(path) and not path.lower().endswith('.mkv'):
+            notes.append(f"'{os.path.basename(path)}' is not an .mkv - analysis will probably fail.")
+        if not notes:
+            what = "folder" if os.path.isdir(path) else "file"
+            notes.append(f"Loaded {what}: {os.path.basename(path) or path}")
+        # Always replace - a log about the previous input is stale now.
+        self.log_output.setPlainText("\n".join(notes))
+
+    # ---- chapter table -----------------------------------------------------
+    def _populate_chapter_table(self, mkv_info):
+        self._chapter_rows = core.build_chapter_rows(mkv_info) if mkv_info else []
+        self._populating_chapters = True
+        try:
+            self.chapter_table.setRowCount(0)
+            for chapter in self._chapter_rows:
+                row = self.chapter_table.rowCount()
+                self.chapter_table.insertRow(row)
+
+                num_item = QtWidgets.QTableWidgetItem(str(chapter['num']))
+                num_item.setData(QtCore.Qt.ItemDataRole.UserRole, chapter['start_str'])
+                self.chapter_table.setItem(row, 0, num_item)
+                self.chapter_table.setItem(row, 1, QtWidgets.QTableWidgetItem(chapter['start_str']))
+                self.chapter_table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{chapter['duration_min']:.2f} min"))
+                self.chapter_table.setItem(row, 3, QtWidgets.QTableWidgetItem(chapter['title'] or ""))
+        finally:
+            self._populating_chapters = False
+        self._apply_chapter_check_mode()
+
+    def _apply_chapter_check_mode(self):
+        """Checkboxes only exist in 'Before Chapters' mode, and never on a 0:00 chapter."""
+        checkable = self.analysis_mode_combo.currentText() == core.MANUAL_CHAPTERS_MODE
+        self._populating_chapters = True
+        try:
+            for row, chapter in enumerate(self._chapter_rows):
+                item = self.chapter_table.item(row, 0)
+                if item is None:
+                    continue
+                flags = item.flags() & ~QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                if checkable and chapter['start_min'] > 0:
+                    item.setFlags(flags | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                    if item.checkState() not in (QtCore.Qt.CheckState.Checked,
+                                                 QtCore.Qt.CheckState.Unchecked):
+                        item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                else:
+                    item.setFlags(flags)
+                    item.setData(QtCore.Qt.ItemDataRole.CheckStateRole, None)
+                    if checkable:
+                        item.setToolTip("Starts at 0:00 - mkvmerge never splits here.")
+        finally:
+            self._populating_chapters = False
+
+    def _set_all_chapter_checks(self, checked):
+        if self.analysis_mode_combo.currentText() != core.MANUAL_CHAPTERS_MODE:
+            return
+        state = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
+        self._populating_chapters = True
+        try:
+            for row in range(self.chapter_table.rowCount()):
+                item = self.chapter_table.item(row, 0)
+                if item is not None and item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable:
+                    item.setCheckState(state)
+        finally:
+            self._populating_chapters = False
+        self._generate_command()
+
+    def _checked_chapters(self):
+        nums = []
+        for row in range(self.chapter_table.rowCount()):
+            item = self.chapter_table.item(row, 0)
+            if item is None or not (item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable):
+                continue
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                try:
+                    nums.append(int(item.text()))
+                except ValueError:
+                    continue
+        return nums
+
+    def _on_chapter_item_changed(self, item):
+        if self._populating_chapters or item.column() != 0:
+            return
+        self._generate_command()
+
+    def _on_chapter_double_clicked(self, item):
+        """In timestamps mode, append the double-clicked chapter's start time."""
+        if self.analysis_mode_combo.currentText() != core.MANUAL_TIMESTAMPS_MODE:
+            return
+        row_item = self.chapter_table.item(item.row(), 0)
+        stamp = row_item.data(QtCore.Qt.ItemDataRole.UserRole) if row_item else None
+        if not stamp:
+            return
+        existing = self.timestamps_input.text().strip()
+        self.timestamps_input.setText(f"{existing}, {stamp}" if existing else stamp)
+
+    def _on_timestamps_changed(self, _text):
+        if self.analysis_mode_combo.currentText() == core.MANUAL_TIMESTAMPS_MODE:
+            self._generate_command()
 
     def _select_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select MKV File", "", "MKV Files (*.mkv)")
@@ -398,6 +618,7 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.log_output.setPlainText("Analyzing, please wait...")
         self.final_command_output.clear()
         self.track_table.setRowCount(0)
+        self._populate_chapter_table(None)
         self._batch_commands = []
         self._set_controls_enabled(False)
 
@@ -417,7 +638,11 @@ class MKVSplitterWidget(QtWidgets.QWidget):
             path, self.min_duration_input.value(),
             num_episodes_val,
             current_mode,
-            target_duration_min
+            target_duration_min,
+            manual_chapters=(self._checked_chapters()
+                             if current_mode == core.MANUAL_CHAPTERS_MODE else None),
+            manual_timestamps=(self.timestamps_input.text()
+                               if current_mode == core.MANUAL_TIMESTAMPS_MODE else ""),
         )
         self.analysis_worker.result.connect(self._on_analysis_result)
         self.analysis_worker.error.connect(self._on_analysis_error)
@@ -461,6 +686,7 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self._batch_commands = []
         self.log_output.setPlainText(log)
         self._populate_track_table(mkv_info.get('tracks', []))
+        self._populate_chapter_table(mkv_info)
         self._generate_command()
 
     def _populate_track_table(self, tracks):
@@ -486,6 +712,32 @@ class MKVSplitterWidget(QtWidgets.QWidget):
     def _on_analysis_error(self, error_msg):
         self.log_output.setPlainText(error_msg)
 
+    def _current_split_points(self):
+        """
+        Split points for the current mode, as (points, split_kind, error).
+
+        The manual modes read live from the chapter table / timestamps box so
+        ticking a chapter or editing a timestamp updates the command without
+        re-analysing the file.
+        """
+        mode = self.analysis_mode_combo.currentText()
+        kind = core.split_kind_for_mode(mode)
+
+        if mode == core.MANUAL_CHAPTERS_MODE:
+            return self._checked_chapters(), kind, None
+
+        if mode == core.MANUAL_TIMESTAMPS_MODE:
+            text = self.timestamps_input.text().strip()
+            if not text:
+                return [], kind, None
+            try:
+                stamps, _seconds, _warnings = core.parse_timestamp_list(text)
+            except ValueError as e:
+                return [], kind, str(e)
+            return stamps, kind, None
+
+        return self.analysis_results.get('split_points', []), kind, None
+
     def _generate_command(self):
         if not self.analysis_results: return
         track_mods = []
@@ -499,10 +751,18 @@ class MKVSplitterWidget(QtWidgets.QWidget):
                     track_mods.append({'tid': tid, 'language': new_lang})
             except (ValueError, AttributeError): continue
 
+        split_points, split_kind, error = self._current_split_points()
+        if error:
+            self.final_command_output.setText("")
+            self.final_command_output.setPlaceholderText(error)
+            return
+        self.final_command_output.setPlaceholderText("")
+
         command = core.generate_mkvmerge_command(
             self.file_path_input.text(),
-            self.analysis_results.get('split_points', []),
-            track_mods
+            split_points,
+            track_mods,
+            split_kind
         )
         self.final_command_output.setText(command)
 
@@ -552,6 +812,8 @@ class MKVSplitterWidget(QtWidgets.QWidget):
         self.min_duration_input.setValue(settings.get('min_duration', config.DEFAULTS['min_duration']))
         self.num_episodes_input.setValue(settings.get('num_episodes', config.DEFAULTS['num_episodes']))
         self.chapters_from_end_input.setValue(settings.get('chapters_from_end', config.DEFAULTS['chapters_from_end']))
+        self.timestamps_input.setText(settings.get('timestamps', config.DEFAULTS['timestamps']))
+        self._on_mode_changed(self.analysis_mode_combo.currentText())
 
     def save_settings(self):
         try:
@@ -565,6 +827,7 @@ class MKVSplitterWidget(QtWidgets.QWidget):
             'min_duration': self.min_duration_input.value(),
             'num_episodes': self.num_episodes_input.value(),
             'chapters_from_end': self.chapters_from_end_input.value(),
+            'timestamps': self.timestamps_input.text(),
         }
         self.app_manager.save_config(self.tool_name, settings)
 

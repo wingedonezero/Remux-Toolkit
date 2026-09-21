@@ -1,6 +1,7 @@
 # remux_toolkit/tools/mkv_splitter/mkv_splitter_core.py
 
 import json
+import re
 import subprocess
 from collections import Counter
 from datetime import timedelta
@@ -8,6 +9,14 @@ import os
 import xml.etree.ElementTree as ET
 import tempfile
 import statistics
+
+# Manual modes mirror mkvtoolnix's own split modes of the same name.
+MANUAL_CHAPTERS_MODE = "Before Chapters (Manual)"
+MANUAL_TIMESTAMPS_MODE = "After Timestamps (Manual)"
+
+def split_kind_for_mode(analysis_mode):
+    """Which mkvmerge --split flavour a mode produces: 'chapters' or 'timestamps'."""
+    return "timestamps" if analysis_mode == MANUAL_TIMESTAMPS_MODE else "chapters"
 
 def run_command(command, tool_name, capture_json=True):
     try:
@@ -45,7 +54,7 @@ def get_mkv_info(file_path):
         if error:
             # Not a fatal error, the file might just not have chapters
             pass
-        else:
+        elif os.path.getsize(temp_xml_path) > 0:
             tree = ET.parse(temp_xml_path)
             root = tree.getroot()
             ns = {'c': 'urn:matroskachapters'}
@@ -67,6 +76,10 @@ def get_mkv_info(file_path):
                             'title': title
                         }
                     })
+    except ET.ParseError:
+        # mkvextract can exit 0 and still leave nothing usable behind for a
+        # file that simply has no chapters - that is not a failure.
+        chapters = []
     except Exception as e:
         error_msg = f"An unexpected error occurred while parsing chapters: {e}"
     finally:
@@ -87,6 +100,127 @@ def parse_time(time_str):
     else:
         s, ms = s_ms_part, '0'
     return timedelta(hours=h, minutes=m, seconds=int(s), microseconds=int(ms))
+
+def format_timestamp(td):
+    """timedelta -> 'H:MM:SS.mmm' for display."""
+    total = td.total_seconds()
+    h = int(total // 3600)
+    m = int((total % 3600) // 60)
+    sec = total % 60
+    return f"{h}:{m:02d}:{sec:06.3f}"
+
+def build_chapter_rows(mkv_info):
+    """
+    Chapter list with start/duration, shared by the analysis modes and the GUI's
+    chapter table.
+
+    Chapter numbers follow mkvmerge's: the position in the file's chapter list,
+    counting from 1, whether or not a given atom carried a usable start time.
+    """
+    chapters = mkv_info.get("chapters", [])
+    container_duration_ns = mkv_info.get("container", {}).get("properties", {}).get("duration", 0)
+    container_duration = timedelta(microseconds=container_duration_ns / 1000)
+
+    rows = []
+    for i, chapter in enumerate(chapters):
+        start_time_str = chapter.get("properties", {}).get("time_start")
+        chapter_title = chapter.get("properties", {}).get("title", "")
+        if not start_time_str: continue
+        start_time = parse_time(start_time_str)
+        end_time = container_duration
+        if i + 1 < len(chapters):
+            next_chapter = chapters[i + 1]
+            end_time_str = next_chapter.get("properties", {}).get("time_start")
+            if end_time_str: end_time = parse_time(end_time_str)
+        duration = end_time - start_time
+        rows.append({
+            "num": i + 1,
+            "start_min": start_time.total_seconds() / 60,
+            "duration_min": duration.total_seconds() / 60,
+            "title": chapter_title,
+            "start_td": start_time,
+            "start_str": format_timestamp(start_time),
+        })
+    return rows
+
+_TS_CLOCK_RE = re.compile(r'^(?:(\d+):)?(\d{1,2}):(\d{1,2})(?:\.(\d{1,9}))?$')
+_TS_UNIT_RE = re.compile(r'^(\d+(?:\.\d+)?)(s|ms|us)$', re.IGNORECASE)
+
+TIMESTAMP_HELP = ("Use HH:MM:SS[.mmm], MM:SS[.mmm], or a number with a unit "
+                  "(90s, 1500ms). A bare number is rejected on purpose - "
+                  "'90' could mean seconds or minutes.")
+
+def normalize_timestamp(token):
+    """
+    Parse one user-typed timestamp into mkvmerge's canonical
+    'HH:MM:SS.nnnnnnnnn' form. Returns (canonical_string, seconds).
+
+    Raises ValueError with a usable message on anything ambiguous.
+    """
+    token = token.strip()
+    if not token:
+        raise ValueError("empty timestamp")
+
+    if m := _TS_CLOCK_RE.match(token):
+        hours = int(m.group(1)) if m.group(1) is not None else 0
+        minutes, seconds = int(m.group(2)), int(m.group(3))
+        frac = (m.group(4) or "").ljust(9, "0")[:9]
+        if seconds > 59:
+            raise ValueError(f"'{token}' has a seconds field above 59")
+        if m.group(1) is None:
+            # Two fields: mm:ss, the way mkvtoolnix's own field reads them.
+            # Minutes may exceed 59 here ("95:00" is a valid way to say 1h35m).
+            hours, minutes = divmod(hours + minutes, 60)
+        elif minutes > 59:
+            raise ValueError(f"'{token}' has a minutes field above 59")
+        total = hours * 3600 + minutes * 60 + seconds + int(frac) / 1e9
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{frac}", total
+
+    if m := _TS_UNIT_RE.match(token):
+        value, unit = float(m.group(1)), m.group(2).lower()
+        total = value * {"s": 1.0, "ms": 1e-3, "us": 1e-6}[unit]
+    else:
+        raise ValueError(f"'{token}' is not a timestamp. {TIMESTAMP_HELP}")
+
+    hours = int(total // 3600)
+    minutes = int((total % 3600) // 60)
+    seconds = int(total % 60)
+    nanos = int(round((total - int(total)) * 1e9))
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{nanos:09d}", total
+
+def parse_timestamp_list(text):
+    """
+    Parse a comma/newline separated list of timestamps.
+
+    Returns (canonical_timestamps, seconds, warnings). Raises ValueError if any
+    entry is unparseable - a silently misread timestamp would cut in the wrong
+    place across a whole batch.
+    """
+    tokens = [t for t in re.split(r'[,\n;]+', text or "") if t.strip()]
+    if not tokens:
+        raise ValueError(f"No timestamps given. {TIMESTAMP_HELP}")
+
+    parsed = []
+    for token in tokens:
+        canonical, seconds = normalize_timestamp(token)
+        parsed.append((seconds, canonical, token.strip()))
+
+    warnings = []
+    ordered = sorted(parsed, key=lambda p: p[0])
+    if [p[2] for p in ordered] != [p[2] for p in parsed]:
+        warnings.append("Timestamps were not in ascending order and have been sorted - "
+                        "mkvmerge consumes them in order, so an out-of-order entry "
+                        "would never be reached.")
+
+    deduped, seen = [], set()
+    for seconds, canonical, raw in ordered:
+        if canonical in seen:
+            warnings.append(f"Duplicate timestamp {raw} ignored.")
+            continue
+        seen.add(canonical)
+        deduped.append((seconds, canonical))
+
+    return [c for _, c in deduped], [sec for sec, _ in deduped], warnings
 
 def is_likely_credits(duration_min, position, chapter_title=""):
     """
@@ -137,36 +271,80 @@ def fuzzy_pattern_match(pattern1, pattern2, allowed_mismatches=1):
     mismatches = sum(c1 != c2 for c1, c2 in zip(pattern1, pattern2))
     return mismatches <= allowed_mismatches
 
-def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target_duration):
+def _analyze_manual_timestamps(mkv_info, container_duration_ns, manual_timestamps):
+    """
+    'After Timestamps' - mkvmerge starts a new file once the stream reaches each
+    timestamp. Chapters are irrelevant here (and optional), so this path runs
+    before the chapter requirement the other modes have.
+    """
+    log = ["--- After Timestamps (Manual) ---"]
+    total_min = (container_duration_ns / 1e9) / 60 if container_duration_ns else 0.0
+    if total_min:
+        log.append(f"  File duration: {total_min:.2f} min "
+                   f"({format_timestamp(timedelta(seconds=container_duration_ns / 1e9))})")
+
+    rows = build_chapter_rows(mkv_info)
+    if rows:
+        log.append("\n  Chapter starts, for reference (double-click one to use it):")
+        for row in rows:
+            title_display = f"  {row['title']}" if row['title'] else ""
+            log.append(f"    Chapter {row['num']:<3} | Start {row['start_str']}{title_display}")
+    else:
+        log.append("  (File has no chapters - that is fine for this mode.)")
+
+    if not (manual_timestamps or "").strip():
+        log.append(f"\n  Enter one or more timestamps to split after. {TIMESTAMP_HELP}")
+        log.append("  mkvmerge starts a new file once the stream reaches each timestamp,")
+        log.append("  at the next key frame - the same as mkvtoolnix's 'After specific timestamps'.")
+        return "\n".join(log), []
+
+    try:
+        stamps, seconds, warnings = parse_timestamp_list(manual_timestamps)
+    except ValueError as e:
+        log.append(f"\n❌ {e}")
+        return "\n".join(log), []
+
+    log.append("\n--- Split points ---")
+    for warning in warnings:
+        log.append(f"  ⚠️ {warning}")
+
+    bounds = [0.0] + [sec / 60 for sec in seconds] + ([total_min] if total_min else [])
+    for i, (stamp, sec) in enumerate(zip(stamps, seconds), 1):
+        note = ""
+        if sec <= 0:
+            note = "  ⚠️ at 0:00 - produces an empty first file"
+        elif total_min and sec / 60 >= total_min:
+            note = f"  ⚠️ at or past the end of the file ({total_min:.2f} min) - mkvmerge will not split here"
+        log.append(f"  Split {i}: {stamp}  ({sec / 60:.2f} min){note}")
+
+    if total_min:
+        parts = [bounds[k + 1] - bounds[k] for k in range(len(bounds) - 1)]
+        log.append("\n  📊 Resulting part durations: " + ", ".join(f"{d:.2f}" for d in parts) + " min")
+
+    log.append("\n--- Final Step: Finalizing Split Points ---")
+    log.append(f"Final split points (timestamps to split AFTER): {', '.join(stamps)}")
+    log.append(f"\n✅ Total Parts: {len(stamps) + 1}")
+    return "\n".join(log), stamps
+
+def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target_duration,
+                     manual_chapters=None, manual_timestamps=""):
     """Performs chapter analysis and returns the log and a list of split points."""
     analysis_log, split_points = [], []
     chapters = mkv_info.get("chapters", [])
     container_duration_ns = mkv_info.get("container", {}).get("properties", {}).get("duration", 0)
+
+    if analysis_mode == MANUAL_TIMESTAMPS_MODE:
+        return _analyze_manual_timestamps(mkv_info, container_duration_ns, manual_timestamps)
+
     if not chapters: return "❌ No chapters found in this file.", []
     if container_duration_ns == 0: return "❌ Could not determine container duration.", []
 
     container_duration = timedelta(microseconds=container_duration_ns / 1000)
     analysis_log.append("--- Step 1: Chapter Analysis ---")
-    chapter_durations = []
-    for i, chapter in enumerate(chapters):
-        start_time_str = chapter.get("properties", {}).get("time_start")
-        chapter_title = chapter.get("properties", {}).get("title", "")
-        if not start_time_str: continue
-        start_time = parse_time(start_time_str)
-        end_time = container_duration
-        if i + 1 < len(chapters):
-            next_chapter = chapters[i + 1]
-            end_time_str = next_chapter.get("properties", {}).get("time_start")
-            if end_time_str: end_time = parse_time(end_time_str)
-        duration = end_time - start_time
-        chapter_durations.append({
-            "num": i + 1,
-            "start_min": start_time.total_seconds() / 60,
-            "duration_min": duration.total_seconds() / 60,
-            "title": chapter_title
-        })
-        title_display = f" ({chapter_title})" if chapter_title else ""
-        analysis_log.append(f"  Chapter {i+1:<3} | Duration: {duration.total_seconds() / 60:.2f} minutes{title_display}")
+    chapter_durations = build_chapter_rows(mkv_info)
+    for row in chapter_durations:
+        title_display = f" ({row['title']})" if row['title'] else ""
+        analysis_log.append(f"  Chapter {row['num']:<3} | Duration: {row['duration_min']:.2f} minutes{title_display}")
 
     if analysis_mode == "Time-based Grouping":
         analysis_log.append(f"\n--- Step 2 (Time-based): Snapping to Chapter Boundaries ---")
@@ -429,6 +607,25 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
         analysis_log.append(f"  Splitting before chapter {split_before} to keep chapters 1-{split_before - 1}")
         split_points.append(split_before)
 
+    elif analysis_mode == MANUAL_CHAPTERS_MODE:
+        analysis_log.append("\n--- Step 2 (Before Chapters): Chapter starts ---")
+        analysis_log.append("  Tick chapters in the Chapters table to split before them, then Generate Command.")
+        analysis_log.append("  Same as mkvtoolnix's 'Before chapters' mode: mkvmerge splits at the first")
+        analysis_log.append("  key frame at or after the chapter's start time.")
+        for row in chapter_durations:
+            title_display = f"  {row['title']}" if row['title'] else ""
+            note = "   (starts at 0:00 - mkvmerge never splits here)" if row['start_min'] <= 0 else ""
+            analysis_log.append(
+                f"  Chapter {row['num']:<3} | Start {row['start_str']} | {row['duration_min']:.2f} min{title_display}{note}"
+            )
+
+        valid_nums = {row['num'] for row in chapter_durations if row['start_min'] > 0}
+        for num in sorted(set(manual_chapters or [])):
+            if num in valid_nums:
+                split_points.append(num)
+            else:
+                analysis_log.append(f"  ⚠️ Chapter {num} cannot be a split point - skipped.")
+
     elif analysis_mode == "Manual Episode Count":
         analysis_log.append(f"\n--- Step 2: Finding Main Content (Min Duration > {min_duration} min) ---")
         long_chapters = [ch for ch in chapter_durations if ch["duration_min"] > min_duration]
@@ -462,7 +659,7 @@ def analyze_chapters(mkv_info, min_duration, num_episodes, analysis_mode, target
 
     return "\n".join(analysis_log), split_points
 
-def generate_mkvmerge_command(input_file_path, split_points, track_mods):
+def generate_mkvmerge_command(input_file_path, split_points, track_mods, split_kind="chapters"):
     """Generates the final mkvmerge command string including track modifications."""
     if not input_file_path:
         return ""
@@ -485,8 +682,9 @@ def generate_mkvmerge_command(input_file_path, split_points, track_mods):
 
     # Add split command if there are split points
     if split_points:
-        split_string = ",".join(str(ch) for ch in split_points)
-        command_parts.append(f'--split chapters:{split_string}')
+        split_string = ",".join(str(sp) for sp in split_points)
+        prefix = "timestamps" if split_kind == "timestamps" else "chapters"
+        command_parts.append(f'--split {prefix}:{split_string}')
 
     command_parts.append(f'"{input_file_path}"')
 
