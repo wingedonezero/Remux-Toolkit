@@ -16,6 +16,9 @@ from remux_toolkit.tools.telecine_detector.telecine_detector_gui import Telecine
 from remux_toolkit.tools.media_info.media_info_gui import MediaInfoWidget
 from remux_toolkit.tools.mkv_combiner.mkv_combiner_gui import MKVCombinerWidget
 from remux_toolkit.tools.video_sync.video_sync_gui import VideoSyncWidget
+from remux_toolkit.tools.audio_authenticity.audio_authenticity_gui import (
+    AudioAuthenticityWidget,
+)
 from remux_toolkit.tools.audio_comparison_analysis.audio_comparison_analysis_gui import (
     AudioComparisonAnalysisWidget,
 )
@@ -83,6 +86,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.open_audio_comparison_analysis_action = QtGui.QAction("Audio Comparison Analysis", self)
         self.open_audio_comparison_analysis_action.triggered.connect(self.open_audio_comparison_analysis)
+        self.open_audio_authenticity_action = QtGui.QAction("Audio Authenticity && Provenance", self)
+        self.open_audio_authenticity_action.triggered.connect(self.open_audio_authenticity)
 
         self.open_ffmpeg_dvd_gui_action = QtGui.QAction("FFmpeg DVD Remuxer", self)
         self.open_ffmpeg_dvd_gui_action.triggered.connect(self.open_ffmpeg_dvd_gui)
@@ -117,6 +122,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tools_menu.addAction(self.open_mkv_combiner_action)
         tools_menu.addAction(self.open_video_sync_action)
         tools_menu.addAction(self.open_audio_comparison_analysis_action)
+        tools_menu.addAction(self.open_audio_authenticity_action)
         tools_menu.addAction(self.open_ffmpeg_dvd_gui_action)
         tools_menu.addAction(self.open_video_source_analyzer_action)
         tools_menu.addAction(self.open_crc_tool_action)
@@ -139,6 +145,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_video_sync(self): self._open_tool("VideoSync", "Video Sync", VideoSyncWidget)
     def open_audio_comparison_analysis(self): self._open_tool(
         "AudioComparisonAnalysis", "Audio Comparison Analysis", AudioComparisonAnalysisWidget
+    )
+    def open_audio_authenticity(self): self._open_tool(
+        "AudioAuthenticity", "Audio Authenticity", AudioAuthenticityWidget
     )
     def open_ffmpeg_dvd_gui(self): self._open_tool("FFmpegDVDGUI", "FFmpeg DVD Remuxer", FFmpegDVDGUIWidget)
     def open_video_source_analyzer(self): self._open_tool("VideoSourceAnalyzer", "Video Source Analyzer", VideoSourceAnalyzerWidget)
