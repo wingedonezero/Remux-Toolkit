@@ -31,6 +31,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,12 +56,18 @@ class Settings:
     hf_energy_frac: float = 1.0e-6
     dual_mono_corr: float = 0.99999
     fake_stereo_corr: float = 0.98
+    matrix_corr: float = 0.90
     dead_channel_db: float = -90.0
     lfe_dead_db: float = -90.0
     clip_threshold: float = 0.9995
     clip_warn_frac: float = 0.0001
     dc_offset_warn: float = 0.002
     envelope_lock: float = 0.5
+    envelope_skip: float = 0.12
+    spectrogram: bool = True
+    spectrogram_cols: int = 900
+    spectrogram_rows: int = 480
+    subsample_align: bool = True
     edit_min_ms: float = 1.0
     null_retimed_db: float = -10.0
     retimed_corr: float = 0.85
@@ -120,6 +127,9 @@ class TrackReport:
     channel_reasons: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
     error: str = ""
+
+    # Spek-style view: dB magnitudes, shape (freq_rows, time_cols), low freq first
+    spectrogram: object = None
 
     @property
     def name(self) -> str:
@@ -244,6 +254,7 @@ class Decoded:
     sample_rate: int
     frames: int
     full_scale: float
+    env: object = None          # cached 100 Hz envelope, see _envelope()
 
     def memmap(self) -> np.ndarray:
         a = np.memmap(self.raw_path, dtype=self.dtype, mode="r")
@@ -261,7 +272,7 @@ def decode_track(path: str, stream: dict, settings: Settings, speed: float = 1.0
     deep = (stream.get("declared_bits") or 16) > 16 or stream.get("sample_fmt", "").startswith("flt")
     dtype, fmt, acodec = ("int32", "s32le", "pcm_s32le") if deep else ("int16", "s16le", "pcm_s16le")
 
-    work = Path(settings.work_dir or (Path.home() / ".cache" / "remux_toolkit" / "audio_authenticity"))
+    work = work_dir_for(settings)
     work.mkdir(parents=True, exist_ok=True)
     raw_path = work / f"aa_{uuid.uuid4().hex[:12]}.{fmt}"
 
@@ -282,6 +293,35 @@ def decode_track(path: str, stream: dict, settings: Settings, speed: float = 1.0
     frames = raw_path.stat().st_size // (itemsize * ch)
     return Decoded(str(raw_path), dtype, ch, stream["sample_rate"] or 48000,
                    frames, 2.0 ** (31 if dtype == "int32" else 15))
+
+
+def work_dir_for(settings: Settings) -> Path:
+    return Path(settings.work_dir or
+                (Path.home() / ".cache" / "remux_toolkit" / "audio_authenticity"))
+
+
+def sweep_work_dir(settings: Settings, max_age_s: float = 0.0) -> int:
+    """
+    Delete staged decodes left behind by a previous run.
+
+    Normal runs clean up after themselves; this catches the case where the app
+    was killed mid-analysis, so closing and reopening the tool does not leak
+    gigabytes of raw audio into the cache directory.
+    """
+    work = work_dir_for(settings)
+    if not work.is_dir():
+        return 0
+    now = time.time()
+    removed = 0
+    for f in work.glob("aa_*"):
+        try:
+            if max_age_s and (now - f.stat().st_mtime) < max_age_s:
+                continue
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def release(dec: Decoded, settings: Settings) -> None:
@@ -318,6 +358,13 @@ def _stream_stats(dec: Decoded, settings: Settings, progress=None, cancel=None) 
     psd = np.zeros((ch, NFFT // 2 + 1))
     windows = 0
 
+    cols = max(1, settings.spectrogram_cols) if settings.spectrogram else 0
+    rows = max(1, settings.spectrogram_rows)
+    gram_img = np.zeros((rows, cols)) if cols else None
+    gram_hits = np.zeros(cols) if cols else None
+    expected_windows = max(1, dec.frames // NFFT)
+    row_group = max(1, (NFFT // 2 + 1) // rows)
+
     total = np.zeros(ch)
     sq = np.zeros(ch)
     peak = np.zeros(ch)
@@ -350,8 +397,17 @@ def _stream_stats(dec: Decoded, settings: Settings, progress=None, cancel=None) 
         nwin = len(buf) // NFFT
         for w in range(nwin):
             seg = buf[w * NFFT:(w + 1) * NFFT]
+            mono_power = None
             for c in range(ch):
-                psd[c] += np.abs(np.fft.rfft(seg[:, c] * win)) ** 2
+                power = np.abs(np.fft.rfft(seg[:, c] * win)) ** 2
+                psd[c] += power
+                mono_power = power if mono_power is None else mono_power + power
+            if gram_img is not None:
+                col = min(cols - 1, int(windows / expected_windows * cols))
+                usable = row_group * rows
+                binned = (mono_power[:usable] / ch).reshape(rows, row_group).mean(1)
+                gram_img[:, col] += binned
+                gram_hits[col] += 1
             windows += 1
         carry = buf[nwin * NFFT:]
         if progress:
@@ -374,7 +430,21 @@ def _stream_stats(dec: Decoded, settings: Settings, progress=None, cancel=None) 
     container_bits = 32 if dec.dtype == "int32" else 16
     effective = None if bit_or == 0 else max(1, container_bits - trailing)
 
-    return dict(psd=psd, freqs=np.fft.rfftfreq(NFFT, 1 / dec.sample_rate),
+    spectrogram = None
+    if gram_img is not None and gram_hits.any():
+        live = gram_hits > 0
+        gram_img[:, live] /= gram_hits[live]
+        # Carry the last live column across any gap so the image has no stripes.
+        last = None
+        for i in range(cols):
+            if live[i]:
+                last = gram_img[:, i]
+            elif last is not None:
+                gram_img[:, i] = last
+        spectrogram = (10 * np.log10(np.maximum(gram_img, 1e-30))).astype(np.float32)
+        spectrogram -= spectrogram.max()
+
+    return dict(spectrogram=spectrogram, gram=gram, n=n, psd=psd, freqs=np.fft.rfftfreq(NFFT, 1 / dec.sample_rate),
                 rms=rms, peak=peak, dc=total / n, clipped=clipped / n,
                 corr=corr, effective_bits=effective, identical_lr=identical_lr,
                 frames=n)
@@ -489,33 +559,63 @@ def _judge_channels(rep: TrackReport, stats: dict, settings: Settings) -> None:
         rep.channel_verdict = "MONO"
         return
 
+    # A matrix upmix does NOT have to have mono fronts - the classic one keeps
+    # the original stereo up front and derives everything else, so gating on
+    # "fronts are mono" misses it entirely. What gives it away is that the other
+    # channels are linear combinations of the fronts, which the covariance
+    # matrix already contains: corr(surround, FL-FR) and corr(FC, FL+FR).
+    gram, n_samples = stats["gram"], stats["n"]
+
+    def combo_corr(target: str, weights: dict[str, float]):
+        if target not in idx or any(k not in idx for k in weights):
+            return None
+        w = np.zeros(gram.shape[0])
+        for name, weight in weights.items():
+            w[idx[name]] = weight
+        var_w = float(w @ gram @ w)
+        var_t = float(gram[idx[target], idx[target]])
+        if var_w <= 0 or var_t <= 0:
+            return None
+        return float((w @ gram[idx[target], :]) / np.sqrt(var_t * var_w))
+
     front = c("FL", "FR")
-    surr = c("BL", "BR") or c("SL", "SR")
+    back_l, back_r = ("BL", "BR") if "BL" in idx else ("SL", "SR")
+    surr = c(back_l, back_r)
     lfe_db = rms_db[idx["LFE"]] if "LFE" in idx else None
     centre_dup = max([v for v in (c("FC", "FL"), c("FC", "FR")) if v is not None], default=None)
+    matrix_l = combo_corr(back_l, {"FL": 1.0, "FR": -1.0})
+    matrix_r = combo_corr(back_r, {"FL": 1.0, "FR": -1.0})
+    centre_sum = combo_corr("FC", {"FL": 1.0, "FR": 1.0})
 
-    signs = []
+    strong, supporting = [], []
+    matrix_hit = max((abs(v) for v in (matrix_l, matrix_r) if v is not None), default=0.0)
+    if matrix_hit >= settings.matrix_corr:
+        strong.append(f"surrounds are the front difference: corr(surround, FL-FR) = {matrix_hit:.4f}")
+    if centre_sum is not None and abs(centre_sum) >= settings.matrix_corr:
+        strong.append(f"centre is the front sum: corr(FC, FL+FR) = {centre_sum:.4f}")
     if front is not None and front >= settings.fake_stereo_corr:
-        signs.append(f"front pair correlation {front:.4f} (mono fronts)")
-    if surr is not None and surr >= settings.fake_stereo_corr:
-        signs.append(f"surround pair correlation {surr:.4f} (mono surrounds)")
-    if centre_dup is not None and centre_dup >= settings.fake_stereo_corr:
-        signs.append(f"centre duplicates the fronts ({centre_dup:.4f})")
-    if lfe_db is not None and lfe_db <= settings.lfe_dead_db:
-        signs.append(f"LFE is dead ({lfe_db:.0f} dBFS)")
+        strong.append(f"front pair correlation {front:.4f} (mono fronts)")
 
-    if front is not None and front >= settings.fake_stereo_corr and len(signs) >= 2:
+    if surr is not None and abs(surr) >= settings.fake_stereo_corr:
+        supporting.append(f"surround pair correlation {surr:+.4f} - the two surrounds are "
+                          f"{'copies' if surr > 0 else 'inversions'} of one another")
+    if centre_dup is not None and centre_dup >= settings.fake_stereo_corr:
+        supporting.append(f"centre duplicates the fronts ({centre_dup:.4f})")
+    if lfe_db is not None and lfe_db <= settings.lfe_dead_db:
+        supporting.append(f"LFE is dead ({lfe_db:.0f} dBFS)")
+
+    if strong and (supporting or len(strong) >= 2):
         rep.channel_verdict = "FAKE MULTICHANNEL"
-        rep.channel_reasons.extend(signs)
+        rep.channel_reasons.extend(strong + supporting)
         rep.channel_reasons.append(
-            "Consistent with a matrix upmix of a stereo (or mono) master rather than a "
-            "discrete multichannel mix.")
+            "These channels are linear combinations of the front pair - a matrix upmix of a "
+            "stereo (or mono) master, not a discrete multichannel mix.")
     else:
         rep.channel_verdict = "DISCRETE MULTICHANNEL"
-        if signs:
-            rep.channel_reasons.extend(signs)
+        rep.channel_reasons.extend(strong + supporting)
     rep.pair_correlations = {
-        "FL/FR": front, "surround": surr, "FC vs fronts": centre_dup,
+        "FL/FR": front, "surround pair": surr, "FC vs fronts": centre_dup,
+        "surround vs FL-FR": matrix_hit or None, "FC vs FL+FR": centre_sum,
     }
 
 
@@ -558,6 +658,7 @@ def analyze_track(path: str, stream: dict, source_label: str, settings: Settings
     rep.channel_dc = [float(v) for v in stats["dc"]]
     rep.clipped_frac = float(stats["clipped"].max())
     rep.identical_lr = bool(stats["identical_lr"])
+    rep.spectrogram = stats["spectrogram"]
     rep.effective_bits = stats["effective_bits"]
 
     _judge_content(rep, settings)
@@ -608,7 +709,14 @@ def describe_ratio(ratio: float, tol: float = 3.0e-4) -> str:
 
 
 def _envelope(dec: Decoded) -> np.ndarray:
-    """Low-rate RMS envelope of the mono mix - robust to codec and level."""
+    """
+    Low-rate RMS envelope of the mono mix - robust to codec and level.
+
+    Cached on the Decoded: every pair needs it, and recomputing means re-reading
+    the whole track from disk once per pair instead of once per track.
+    """
+    if dec.env is not None:
+        return dec.env
     frame = max(1, int(dec.sample_rate / ENV_HZ))
     data = dec.memmap()
     out = []
@@ -621,9 +729,11 @@ def _envelope(dec: Decoded) -> np.ndarray:
         if usable:
             out.append(np.sqrt((mono[:usable].reshape(-1, frame) ** 2).mean(1)))
     if not out:
-        return np.zeros(0)
+        dec.env = np.zeros(0)
+        return dec.env
     env = np.concatenate(out)
-    return env - env.mean()
+    dec.env = env - env.mean()
+    return dec.env
 
 
 def _xcorr_lag(x: np.ndarray, y: np.ndarray, max_lag: int) -> tuple[int, float]:
@@ -679,19 +789,35 @@ def _refine_windows(a: Decoded, b: Decoded, coarse: int, settings: Settings) -> 
 
     out = []
     for s in range(0, a.frames - win + 1, step):
-        x, _ = _mono_slice(a, s, s + win)
-        if x.size < win or not np.any(x):
-            continue
-        y, y_lo = _mono_slice(b, s - coarse - search, s - coarse + win + search)
-        if y.size < win:
-            continue
-        N = 1 << int(np.ceil(np.log2(len(y) + len(x))))
-        cc = np.fft.irfft(np.fft.rfft(y, N) * np.conj(np.fft.rfft(x, N)), N)[:len(y) - win + 1]
-        k = int(np.argmax(np.abs(cc)))
-        seg = y[k:k + win]
-        denom = np.linalg.norm(x) * np.linalg.norm(seg) + 1e-12
-        out.append((s, s - (y_lo + k), float(abs(cc[k]) / denom)))
+        got = _probe_full(a, b, s, win, coarse, search)
+        if got is not None:
+            out.append(got)
     return out
+
+
+def _probe_full(a: Decoded, b: Decoded, s: int, win: int, coarse: int, search: int):
+    """One full-rate probe window: (start, integer lag, correlation, fractional lag)."""
+    x, _ = _mono_slice(a, s, s + win)
+    if x.size < win or not np.any(x):
+        return None
+    y, y_lo = _mono_slice(b, s - coarse - search, s - coarse + win + search)
+    if y.size < win:
+        return None
+    N = 1 << int(np.ceil(np.log2(len(y) + len(x))))
+    cc = np.fft.irfft(np.fft.rfft(y, N) * np.conj(np.fft.rfft(x, N)), N)[:len(y) - win + 1]
+    mag = np.abs(cc)
+    k = int(np.argmax(mag))
+    frac = 0.0
+    if 0 < k < len(mag) - 1:
+        y1, y2, y3 = float(mag[k - 1]), float(mag[k]), float(mag[k + 1])
+        denom_f = y1 - 2.0 * y2 + y3
+        if abs(denom_f) > 1e-12:
+            delta = 0.5 * (y1 - y3) / denom_f
+            if -1.0 < delta < 1.0:
+                frac = delta
+    seg = y[k:k + win]
+    denom = np.linalg.norm(x) * np.linalg.norm(seg) + 1e-12
+    return (s, s - (y_lo + k), float(mag[k] / denom), frac)
 
 
 def _null_at(a: Decoded, b: Decoded, lag: int, invert: bool = False) -> tuple[float, float, bool]:
@@ -738,6 +864,16 @@ def _null_at(a: Decoded, b: Decoded, lag: int, invert: bool = False) -> tuple[fl
     return float(20 * np.log10(max(rr, 1e-12) / ra)), float(20 * np.log10(gain)), exact
 
 
+def _frac_shift(x: np.ndarray, frac: float) -> np.ndarray:
+    """Shift by a fractional number of samples with an FFT phase ramp."""
+    if abs(frac) < 1e-6:
+        return x
+    n = x.shape[0]
+    spec = np.fft.rfft(x, axis=0)
+    ramp = np.exp(-2j * np.pi * np.fft.rfftfreq(n) * frac)
+    return np.fft.irfft(spec * ramp[:, None], n, axis=0)
+
+
 def _segment_nulls(a: Decoded, b: Decoded, windows: list, settings: Settings) -> list[tuple[int, int, float]]:
     """
     Null every locked window at that window's own lag.
@@ -751,13 +887,20 @@ def _segment_nulls(a: Decoded, b: Decoded, windows: list, settings: Settings) ->
     out = []
     n = int(settings.window_s * a.sample_rate)
     ch = min(a.channels, b.channels)
+    edge = 128                                   # drop the FFT-shift wrap-around
     A, B = a.memmap(), b.memmap()
-    for (s, lag, _corr) in windows:
+    for win in windows:
+        s, lag = win[0], win[1]
+        frac = win[3] if len(win) > 3 else 0.0
         bs = s - lag
         if bs < 0 or s + n > a.frames or bs + n > b.frames:
             continue
         xa = np.asarray(A[s:s + n, :ch], dtype=np.float64) / a.full_scale
         xb = np.asarray(B[bs:bs + n, :ch], dtype=np.float64) / b.full_scale
+        if settings.subsample_align and frac:
+            xb = _frac_shift(xb, -frac)
+        if n > 4 * edge:
+            xa, xb = xa[edge:-edge], xb[edge:-edge]
         ra = np.sqrt((xa ** 2).mean())
         rb = np.sqrt((xb ** 2).mean())
         if ra <= 0 or rb <= 0:
@@ -820,10 +963,21 @@ def _probe(x: np.ndarray, y: np.ndarray, s: int, win: int, search: int):
     N = 1 << int(np.ceil(np.log2(len(y_win) + win)))
     cc = np.fft.irfft(np.fft.rfft(y_win, N) * np.conj(np.fft.rfft(seg_x, N)), N)
     cc = cc[:len(y_win) - win + 1]
-    k = int(np.argmax(np.abs(cc)))
+    mag = np.abs(cc)
+    k = int(np.argmax(mag))
+    # Parabolic sub-sample peak fit. Integer alignment is not good enough for a
+    # null: half a sample of error caps cancellation at about -4 dB by 10 kHz.
+    frac = 0.0
+    if 0 < k < len(mag) - 1:
+        y1, y2, y3 = float(mag[k - 1]), float(mag[k]), float(mag[k + 1])
+        denom_f = y1 - 2.0 * y2 + y3
+        if abs(denom_f) > 1e-12:
+            delta = 0.5 * (y1 - y3) / denom_f
+            if -1.0 < delta < 1.0:
+                frac = delta
     seg_y = y_win[k:k + win]
     denom = np.linalg.norm(seg_x) * np.linalg.norm(seg_y) + 1e-12
-    return s - (lo + k), float(abs(cc[k]) / denom)
+    return s - (lo + k), float(abs(cc[k]) / denom), frac
 
 
 def _envelope_align(env_a: np.ndarray, env_b: np.ndarray, settings: Settings) -> list[tuple[int, int, float]]:
@@ -843,7 +997,7 @@ def _envelope_align(env_a: np.ndarray, env_b: np.ndarray, settings: Settings) ->
     for s in range(0, len(env_a) - win + 1, step):
         got = _probe(env_a, env_b, s, win, search)
         if got is not None:
-            pts.append((s, got[0], got[1]))
+            pts.append((s, got[0], got[1]))          # frac unused at 100 Hz
     return pts
 
 
@@ -858,6 +1012,12 @@ def _align(a: Decoded, b: Decoded, settings: Settings, cancel=None) -> dict | No
 
     scale = a.sample_rate / ENV_HZ
     env_pts = _envelope_align(env_a, env_b, settings)
+    if env_pts and max(p[2] for p in env_pts) < settings.envelope_skip:
+        # Nothing in the envelopes lines up anywhere; a full-rate search would
+        # only confirm that at a hundred times the cost.
+        return dict(total=len(env_pts), locked=0, env_corr=max(p[2] for p in env_pts),
+                    best_corr=0.0, median_corr=0.0, lag=0, drift_ms=0.0,
+                    speed_ratio=1.0, env_locked=0, prev_drift_ms=0.0, windows=[])
     good = [p for p in env_pts if p[2] >= settings.envelope_lock]
     env_corr = max((p[2] for p in env_pts), default=0.0)
 

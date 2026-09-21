@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from . import audio_authenticity_config as config
@@ -34,6 +35,112 @@ VERDICT_COLOURS = {
     "DECODE FAILED": "#c0392b",
     "ANALYSIS FAILED": "#c0392b",
 }
+
+
+def _colour_lut() -> np.ndarray:
+    """Spek-ish ramp: near-black -> blue -> green -> yellow -> red -> white."""
+    stops = [(0.00, (0, 0, 10)), (0.20, (20, 20, 120)), (0.40, (0, 150, 140)),
+             (0.62, (180, 210, 40)), (0.82, (240, 120, 30)), (1.00, (255, 255, 235))]
+    lut = np.zeros((256, 3), dtype=np.uint8)
+    for i in range(256):
+        f = i / 255.0
+        for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+            if p0 <= f <= p1:
+                t = (f - p0) / max(p1 - p0, 1e-9)
+                lut[i] = [int(c0[k] + t * (c1[k] - c0[k])) for k in range(3)]
+                break
+    return lut
+
+
+class SpectrogramView(QtWidgets.QWidget):
+    """Spek-style spectrogram with a frequency axis and the detected wall marked."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._image: QtGui.QImage | None = None
+        self._nyquist = 24000.0
+        self._cutoff = 0.0
+        self._title = ""
+        self._duration = 0.0
+        self._floor_db = -120.0
+        self.setMinimumHeight(260)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Expanding)
+
+    def set_track(self, track):
+        data = getattr(track, "spectrogram", None) if track is not None else None
+        if data is None:
+            self._image = None
+            self._title = "No spectrogram for this track."
+            self.update()
+            return
+        db = np.asarray(data, dtype=np.float32)
+        norm = np.clip((db - self._floor_db) / (0.0 - self._floor_db), 0.0, 1.0)
+        idx = (norm * 255).astype(np.uint8)
+        rgb = _colour_lut()[idx]                     # (rows, cols, 3)
+        rgb = np.flipud(rgb).copy()                  # low frequency at the bottom
+        h, w, _ = rgb.shape
+        self._image = QtGui.QImage(rgb.data, w, h, 3 * w,
+                                   QtGui.QImage.Format.Format_RGB888).copy()
+        self._nyquist = track.nyquist_hz or 24000.0
+        self._cutoff = track.cutoff_hz or 0.0
+        self._duration = track.duration_s or 0.0
+        self._title = f"{track.name} - {track.content_verdict}"
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor("#111318"))
+        left, right, top, bottom = 64, 12, 22, 26
+        plot = QtCore.QRect(left, top, max(1, self.width() - left - right),
+                            max(1, self.height() - top - bottom))
+        painter.setPen(QtGui.QColor("#d0d4dc"))
+        if self._image is None:
+            painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter,
+                             self._title or "Run an analysis to see spectrograms.")
+            painter.end()
+            return
+
+        painter.drawText(QtCore.QRect(left, 2, plot.width(), 18),
+                         QtCore.Qt.AlignmentFlag.AlignLeft, self._title)
+        painter.drawImage(plot, self._image)
+        painter.setPen(QtGui.QColor("#555a66"))
+        painter.drawRect(plot)
+
+        # frequency axis
+        painter.setPen(QtGui.QColor("#aab0bb"))
+        step = 2000 if self._nyquist <= 26000 else 5000
+        f = 0
+        while f <= self._nyquist:
+            y = plot.bottom() - int(plot.height() * f / max(self._nyquist, 1))
+            painter.drawText(QtCore.QRect(0, y - 8, left - 6, 16),
+                             QtCore.Qt.AlignmentFlag.AlignRight, f"{f//1000} kHz")
+            painter.drawLine(left - 4, y, left, y)
+            f += step
+
+        # time axis
+        if self._duration > 0:
+            for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+                x = plot.left() + int(plot.width() * frac)
+                secs = self._duration * frac
+                painter.drawText(QtCore.QRect(x - 30, plot.bottom() + 4, 60, 18),
+                                 QtCore.Qt.AlignmentFlag.AlignCenter,
+                                 f"{int(secs//60)}:{int(secs%60):02d}")
+
+        # the wall, where there is one
+        if 0 < self._cutoff < self._nyquist * 0.999:
+            y = plot.bottom() - int(plot.height() * self._cutoff / max(self._nyquist, 1))
+            pen = QtGui.QPen(QtGui.QColor("#ff5252"))
+            pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(plot.left(), y, plot.right(), y)
+            label = f"content ends at {self._cutoff/1000:.2f} kHz"
+            box = QtCore.QRect(plot.left() + 6, y - 20, 200, 17)
+            painter.fillRect(box, QtGui.QColor(0, 0, 0, 190))
+            painter.setPen(QtGui.QColor("#ff8a80"))
+            painter.drawText(box.adjusted(5, 0, 0, 0),
+                             QtCore.Qt.AlignmentFlag.AlignVCenter, label)
+        painter.end()
 
 
 class DropList(QtWidgets.QListWidget):
@@ -110,6 +217,15 @@ class AudioAuthenticityWidget(QtWidgets.QWidget):
 
         self._init_ui()
         self._load_settings()
+        # A previous session that was killed mid-run can leave staged decodes
+        # behind; opening the tool is the natural moment to clear them.
+        try:
+            stale = core.sweep_work_dir(core.Settings.from_dict(self.settings))
+            if stale:
+                self.status_label.setText(
+                    f"Cleared {stale} leftover decode file(s) from an interrupted run.")
+        except Exception:
+            pass
 
     # ---------------- UI ----------------
     def _init_ui(self):
@@ -160,10 +276,24 @@ class AudioAuthenticityWidget(QtWidgets.QWidget):
         self.tabs = QtWidgets.QTabWidget()
         self.track_table = self._make_table(
             ["Source", "Track", "Codec", "Ch", "Rate", "Bandwidth", "Content", "Channels", "Issues"])
+        self.track_table.itemSelectionChanged.connect(self._track_row_selected)
         self.tabs.addTab(self.track_table, "Tracks")
         self.match_table = self._make_table(
             ["Track A", "Track B", "Verdict", "Offset", "Null", "Windows", "Notes"])
         self.tabs.addTab(self.match_table, "Source Matching")
+        spec_page = QtWidgets.QWidget()
+        spec_layout = QtWidgets.QVBoxLayout(spec_page)
+        spec_layout.setContentsMargins(4, 4, 4, 4)
+        picker_row = QtWidgets.QHBoxLayout()
+        picker_row.addWidget(QtWidgets.QLabel("Track:"))
+        self.spec_picker = QtWidgets.QComboBox()
+        self.spec_picker.currentIndexChanged.connect(self._show_spectrogram)
+        picker_row.addWidget(self.spec_picker, 1)
+        spec_layout.addLayout(picker_row)
+        self.spectrogram_view = SpectrogramView()
+        spec_layout.addWidget(self.spectrogram_view, 1)
+        self.tabs.addTab(spec_page, "Spectrogram")
+
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QtGui.QFontDatabase.systemFont(
@@ -312,6 +442,7 @@ class AudioAuthenticityWidget(QtWidgets.QWidget):
         self.report = report
         self._fill_tracks(report)
         self._fill_matches(report)
+        self._fill_spectrograms(report)
         self.log.setPlainText(core.format_report(report))
         self.btn_save.setEnabled(True)
         self.progress.setValue(1000)
@@ -366,6 +497,16 @@ class AudioAuthenticityWidget(QtWidgets.QWidget):
             for c, item in enumerate(cells):
                 self.track_table.setItem(r, c, item)
 
+    def _track_row_selected(self):
+        rows = {i.row() for i in self.track_table.selectedIndexes()}
+        if not rows or not self.report:
+            return
+        row = next(iter(rows))
+        for i in range(self.spec_picker.count()):
+            if self.spec_picker.itemData(i) == row:
+                self.spec_picker.setCurrentIndex(i)
+                break
+
     def _fill_matches(self, report: core.Report):
         self.match_table.setRowCount(0)
         order = {"IDENTICAL": 0, "SAME MASTER": 1, "SAME MASTER (RE-TIMED)": 2,
@@ -383,6 +524,27 @@ class AudioAuthenticityWidget(QtWidgets.QWidget):
             ]
             for c, item in enumerate(cells):
                 self.match_table.setItem(r, c, item)
+
+    def _fill_spectrograms(self, report: core.Report):
+        self.spec_picker.blockSignals(True)
+        self.spec_picker.clear()
+        for i, t in enumerate(report.tracks):
+            if getattr(t, "spectrogram", None) is not None:
+                self.spec_picker.addItem(f"{t.name} - {t.content_verdict}", i)
+        self.spec_picker.blockSignals(False)
+        if self.spec_picker.count():
+            self.spec_picker.setCurrentIndex(0)
+            self._show_spectrogram(0)
+        else:
+            self.spectrogram_view.set_track(None)
+
+    def _show_spectrogram(self, _index: int):
+        if not self.report:
+            return
+        data = self.spec_picker.currentData()
+        if data is None:
+            return
+        self.spectrogram_view.set_track(self.report.tracks[data])
 
     def _save_report(self):
         if not self.report:
@@ -409,4 +571,15 @@ class AudioAuthenticityWidget(QtWidgets.QWidget):
         self.app_manager.save_config(self.tool_name, self.settings)
 
     def shutdown(self):
+        """Closing the tab should free everything, like closing an app."""
         self._join_thread(10000)
+        self.report = None
+        self.spectrogram_view.set_track(None)
+        self.spec_picker.clear()
+        self.track_table.setRowCount(0)
+        self.match_table.setRowCount(0)
+        self.log.clear()
+        try:
+            core.sweep_work_dir(core.Settings.from_dict(self.settings))
+        except Exception:
+            pass

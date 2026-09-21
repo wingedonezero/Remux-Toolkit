@@ -24,6 +24,9 @@ DEFAULTS = {
     # --- channel authenticity ---
     "dual_mono_corr": 0.99999,      # L/R this correlated is mono in a stereo wrapper
     "fake_stereo_corr": 0.98,
+    # A matrix upmix keeps real stereo up front, so it is caught by the
+    # other channels being linear combinations of the front pair.
+    "matrix_corr": 0.90,
     "dead_channel_db": -90.0,
     "lfe_dead_db": -90.0,
 
@@ -34,8 +37,18 @@ DEFAULTS = {
 
     # --- cross-source matching ---
     "envelope_lock": 0.5,
+    # Below this envelope correlation nothing lines up anywhere, so the
+    # expensive full-rate search is skipped.
+    "envelope_skip": 0.12,
     # Re-timing means re-sampling, which sets a floor on null depth,
     # so a corrected pair is judged on correlation as well.
+    # Parabolic peak fit + fractional-delay correction: half a sample of
+    # misalignment caps a null at about -4 dB by 10 kHz.
+    # Spek-style spectrogram per track (computed from FFTs already being taken)
+    "spectrogram": True,
+    "spectrogram_cols": 900,
+    "spectrogram_rows": 480,
+    "subsample_align": True,
     "edit_min_ms": 1.0,
     "null_retimed_db": -10.0,
     "retimed_corr": 0.85,
