@@ -526,8 +526,11 @@ class MKVSplitterWidget(QtWidgets.QWidget):
                 flags = item.flags() & ~QtCore.Qt.ItemFlag.ItemIsUserCheckable
                 if checkable and chapter['start_min'] > 0:
                     item.setFlags(flags | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                    if item.checkState() not in (QtCore.Qt.CheckState.Checked,
-                                                 QtCore.Qt.CheckState.Unchecked):
+                    # Qt only draws a checkbox once CheckStateRole actually holds
+                    # a value; the flag alone is not enough, and checkState()
+                    # reports Unchecked even when the role is unset - so test the
+                    # role itself to decide whether this is a first-time setup.
+                    if item.data(QtCore.Qt.ItemDataRole.CheckStateRole) is None:
                         item.setCheckState(QtCore.Qt.CheckState.Unchecked)
                 else:
                     item.setFlags(flags)
