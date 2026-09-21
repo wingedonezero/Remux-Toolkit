@@ -74,26 +74,47 @@ def probe_disc(source_path: str | Path,
 # without Qt installed.
 
 try:
-    from PyQt6.QtCore import QObject, pyqtSignal  # type: ignore
+    from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot  # type: ignore
 
     class DVDProbeWorker(QObject):
-        """Emits `probed(row, label, titles_total, titles_info, disc_info, err)`.
+        """Emits `probed(probe_id, label, titles_total, titles_info, disc_info, err)`.
 
         `titles_info` is a {title_num: dict} compatible with the existing GUI;
         the dict contains all keys the GUI's `_on_probed` reads, plus analyzer
         extensions (`hidden_by_default`, `duplicate_of`, `classification`, etc.)
         that future GUI work can use without breaking the current code.
+
+        `probe()` is a slot, so it must be reached through a queued signal (see
+        the widget's `probe_requested`) rather than called directly - a direct
+        call would run the scan on the GUI thread and freeze the window.
         """
 
         probed = pyqtSignal(int, object, object, object, object, str)
+        probe_started = pyqtSignal(int)  # probe_id
 
         def __init__(self, settings: dict):
             super().__init__()
             self.settings = settings
+            self._cancelled = False
 
-        def probe(self, row: int, job) -> None:
+        def cancel(self) -> None:
+            """Abandon probing (called from the GUI thread, e.g. on tab close).
+
+            A scan already under way runs to completion - libdvdread has no
+            interruption point - but every queued probe returns immediately, so
+            the probe thread can be joined without waiting out the whole batch.
+            """
+            self._cancelled = True
+
+        @pyqtSlot(int, object)
+        def probe(self, probe_id: int, job) -> None:
+            if self._cancelled:
+                self.probed.emit(probe_id, None, None, None, None, "Probe cancelled")
+                return
+
+            self.probe_started.emit(probe_id)
             r = probe_disc(job.source_path, default_label=getattr(job, "child_name", None))
-            self.probed.emit(row, r.label, r.titles_total, r.titles_info,
+            self.probed.emit(probe_id, r.label, r.titles_total, r.titles_info,
                              r.disc_info, r.err)
 
 except ImportError:

@@ -169,6 +169,7 @@ class MakeMKVWorker(QObject):
     status_text = pyqtSignal(int, str)
     line_out = pyqtSignal(int, str, str)  # row, text, severity
     job_done = pyqtSignal(int, bool, str)  # row, success, error_message
+    batch_done = pyqtSignal(bool)  # stopped_by_user
 
     def __init__(self, settings: dict):
         super().__init__()
@@ -179,10 +180,44 @@ class MakeMKVWorker(QObject):
     def stop(self):
         self._stop = True
 
+    def is_stopping(self) -> bool:
+        return self._stop
+
     def set_jobs(self, jobs_to_run):
+        """
+        Assign a fresh batch.
+
+        Clears the stop flag so the worker stays reusable after a Stop - without
+        this, every later run() would trip the stop checks on its first job.
+        """
         self.jobs_to_run = jobs_to_run
+        self._stop = False
+
+    @staticmethod
+    def _terminate_process(proc, grace: float = 3.0):
+        """Stop makemkvcon, escalating to SIGKILL if it ignores SIGTERM."""
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=grace)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def run(self):
+        """Run the assigned batch, always reporting completion to the GUI."""
+        try:
+            self._run_batch()
+        finally:
+            self.batch_done.emit(self._stop)
+
+    def _run_batch(self):
         for job_data in self.jobs_to_run:
             if len(job_data) == 3:
                 original_row, job, captured_selection = job_data
@@ -267,9 +302,6 @@ class MakeMKVWorker(QObject):
 
                 for title_idx, title_id in enumerate(titles_to_rip):
                     if self._stop:
-                        self.status_text.emit(original_row, "Stopped")
-                        overall_success = False
-                        error_message = "Stopped by user"
                         break
 
                     current_title_num = title_idx + 1
@@ -341,7 +373,7 @@ class MakeMKVWorker(QObject):
                         # Process output
                         while True:
                             if self._stop:
-                                proc.terminate()
+                                self._terminate_process(proc)
                                 break
 
                             tail_messages()
@@ -402,7 +434,11 @@ class MakeMKVWorker(QObject):
                         returncode = proc.wait()
                         title_success = returncode == 0
 
-                        if not title_success:
+                        if self._stop:
+                            # Non-zero here is just our own terminate()/kill();
+                            # the batch-level stop message covers it.
+                            pass
+                        elif not title_success:
                             overall_success = False
                             if returncode == 1:
                                 err_msg = f"Title {title_id} failed (check log for details)"
@@ -427,6 +463,11 @@ class MakeMKVWorker(QObject):
 
                     # Advance progress tracker to next title
                     progress_tracker.advance_title()
+
+                if self._stop:
+                    self.status_text.emit(original_row, "Stopped")
+                    overall_success = False
+                    error_message = "Stopped by user"
 
             except FileNotFoundError:
                 error_message = "makemkvcon not found. Check path in Preferences."

@@ -7,4 +7,5 @@ DEFAULTS = {
     'min_duration': 15.0,
     'num_episodes': 2,
     'chapters_from_end': 1,
+    'timestamps': '',
 }
