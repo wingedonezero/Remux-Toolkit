@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, QUrl
+from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QHBoxLayout, QPushButton, QSplitter,
@@ -29,6 +29,9 @@ from .gui.prefs_dialog import PrefsDialog
 class FFmpegDVDGUIWidget(QWidget):
     """Main widget for FFmpeg DVD Remuxer tool."""
 
+    # Queued across to the probe thread so disc scanning never blocks the GUI.
+    probe_requested = pyqtSignal(int, object)  # probe_id, job
+
     def __init__(self, app_manager, parent=None):
         super().__init__(parent)
         self.app_manager = app_manager
@@ -39,6 +42,13 @@ class FFmpegDVDGUIWidget(QWidget):
         self.running = False
         self.completed_jobs = {}
         self.current_job_row: Optional[int] = None
+        self._stopping = False
+        # Drops signals still queued from a batch that was stopped/cleared, so
+        # they can't land on rows belonging to a newer queue.
+        self._accept_worker_events = False
+        # In-flight disc scans, keyed by an opaque id: {probe_id: Job}
+        self._pending_probes: dict[int, Job] = {}
+        self._probe_seq = 0
 
         self._init_ui()
         self._load_settings()
@@ -113,6 +123,9 @@ class FFmpegDVDGUIWidget(QWidget):
         self.probe_thread = QThread(self)
         self.probe_worker.moveToThread(self.probe_thread)
         self.probe_worker.probed.connect(self._on_probed)
+        self.probe_worker.probe_started.connect(self._on_probe_started)
+        # Queued connection: probe() runs on probe_thread, not the GUI thread.
+        self.probe_requested.connect(self.probe_worker.probe)
         self.probe_thread.start()
 
         self.worker = FFmpegDVDWorker(self.settings)
@@ -122,6 +135,7 @@ class FFmpegDVDGUIWidget(QWidget):
         self.worker.status_text.connect(self.on_status_text)
         self.worker.line_out.connect(self.on_line)
         self.worker.job_done.connect(self.on_done)
+        self.worker.batch_done.connect(self._on_batch_done)
         self.work_thread.started.connect(self.worker.run)
 
     def _load_settings(self):
@@ -148,15 +162,41 @@ class FFmpegDVDGUIWidget(QWidget):
         self.settings["v_split_sizes"] = self.v_split.sizes()
         self.app_manager.save_config(self.tool_name, self.settings)
 
+    def _update_controls(self):
+        """Single source of truth for the Start/Stop buttons."""
+        probing = bool(self._pending_probes)
+        self.btn_start.setEnabled(not self.running and not probing)
+        self.btn_stop.setEnabled(self.running and not self._stopping)
+
+    def _stop_and_join(self, timeout_ms: int = 15000) -> bool:
+        """
+        Ask the remux worker to stop and wait for its thread to really finish.
+
+        QThread.start() is a silent no-op on a thread that has not finished yet,
+        so a run must be fully joined before the queue can be started again.
+        """
+        self._accept_worker_events = False
+        if not self.work_thread.isRunning():
+            return True
+
+        self.worker.stop()
+        self.work_thread.quit()
+        if self.work_thread.wait(timeout_ms):
+            return True
+
+        self.console.append("Remux thread did not shut down cleanly.", "error")
+        return False
+
     def shutdown(self):
-        if hasattr(self, 'worker') and self.worker:
-            self.worker.stop()
-        if hasattr(self, 'work_thread') and self.work_thread.isRunning():
-            self.work_thread.quit()
-            self.work_thread.wait(2000)
+        # Cancel first so queued scans return at once instead of the join
+        # waiting out the whole backlog.
+        if hasattr(self, 'probe_worker'):
+            self.probe_worker.cancel()
+        if hasattr(self, 'work_thread'):
+            self._stop_and_join(10000)
         if hasattr(self, 'probe_thread') and self.probe_thread.isRunning():
             self.probe_thread.quit()
-            self.probe_thread.wait(2000)
+            self.probe_thread.wait(10000)
 
     def open_prefs(self):
         dlg = PrefsDialog(self.settings, self)
@@ -240,8 +280,13 @@ class FFmpegDVDGUIWidget(QWidget):
         bar.setTextVisible(False)
         self.tree.setItemWidget(item, 7, bar)
 
-        # Trigger probe
-        self.probe_worker.probe(self.tree.indexOfTopLevelItem(item), job)
+        # Scan off the GUI thread; the row says what it is doing until it lands.
+        self._probe_seq += 1
+        self._pending_probes[self._probe_seq] = job
+        item.setText(6, "Waiting to scan...")
+        bar.setRange(0, 0)  # busy indicator while the disc is read
+        self._update_controls()
+        self.probe_requested.emit(self._probe_seq, job)
 
     def _on_jobs_reordered(self):
         new_jobs = [
@@ -250,13 +295,35 @@ class FFmpegDVDGUIWidget(QWidget):
         ]
         self.jobs = [j for j in new_jobs if isinstance(j, Job)]
 
-    def _on_probed(self, row: int, label: Optional[str], titles_total: Optional[int],
+    def _find_item_for_job(self, job) -> Optional[QTreeWidgetItem]:
+        """Locate a job's row by identity - rows move, indices go stale."""
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.data(0, Qt.ItemDataRole.UserRole) is job:
+                return item
+        return None
+
+    def _on_probe_started(self, probe_id: int):
+        """The probe thread has actually reached this disc."""
+        job = self._pending_probes.get(probe_id)
+        if job and (item := self._find_item_for_job(job)):
+            item.setText(6, "Scanning disc...")
+
+    def _on_probed(self, probe_id: int, label: Optional[str], titles_total: Optional[int],
                    titles_info: Optional[dict], disc_info: Optional[dict], err: str):
-        if not (0 <= row < len(self.jobs)):
+        job = self._pending_probes.pop(probe_id, None)
+        if job is None:
+            return  # belonged to a queue that has since been cleared
+
+        item = self._find_item_for_job(job)
+        if not item:  # row was removed while the scan was running
+            self._update_controls()
+            self._refresh_queue_label()
             return
-        job, item = self.jobs[row], self.tree.topLevelItem(row)
-        if not item:
-            return
+
+        if bar := self.tree.itemWidget(item, 7):
+            bar.setRange(0, 100)
+            bar.setValue(0)
 
         if label:
             job.label_hint = label
@@ -385,6 +452,7 @@ class FFmpegDVDGUIWidget(QWidget):
         if err:
             self.console.append(f"ERROR for {job.child_name}: {err}", "error")
 
+        self._update_controls()
         self._refresh_queue_label()
 
     def _set_children_check(self, parent_item: QTreeWidgetItem, state: Qt.CheckState):
@@ -497,14 +565,11 @@ class FFmpegDVDGUIWidget(QWidget):
             self.details.clear()
 
     def clear_all(self):
-        if self.running:
-            self.worker.stop()
-            if self.work_thread.isRunning():
-                self.work_thread.quit()
-                self.work_thread.wait(1000)
-            self.running = False
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
+        # Unconditionally - a prior Stop leaves self.running False while the
+        # worker thread is still unwinding.
+        self._stop_and_join()
+        self.running = False
+        self._stopping = False
 
         self.tree.clear()
         self.jobs.clear()
@@ -512,6 +577,9 @@ class FFmpegDVDGUIWidget(QWidget):
         self.details.clear()
         self.completed_jobs.clear()
         self.current_job_row = None
+        # Results for these scans are ignored when they land.
+        self._pending_probes.clear()
+        self._update_controls()
         self._refresh_queue_label()
 
     def start_queue(self):
@@ -528,22 +596,34 @@ class FFmpegDVDGUIWidget(QWidget):
             self.console.append("=== No jobs or titles selected to run ===", "warning")
             return
 
+        if self._pending_probes:
+            self.console.append("=== Still scanning discs, try again in a moment ===", "warning")
+            return
+
+        # A previous run may still be unwinding (e.g. right after a Stop).
+        if not self._stop_and_join():
+            self.console.append("=== Cannot start: previous run is still busy ===", "error")
+            return
+
         self.console.clear()
         self.console.append("=== Starting queue ===", "info")
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        self._accept_worker_events = True
         self.running = True
+        self._stopping = False
+        self._update_controls()
         self.completed_jobs.clear()
-        self.worker.set_jobs(jobs_to_run)
+        self.worker.set_jobs(jobs_to_run)  # also clears the worker's stop flag
         self.work_thread.start()
 
     def stop_queue(self):
-        if self.running:
-            self.worker.stop()
-            self.console.append(">>> Stop requested...", "warning")
-            self.running = False
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
+        """Request a stop; the run state is reset when the worker reports back."""
+        if not self.running:
+            return
+
+        self.worker.stop()
+        self.console.append(">>> Stop requested, finishing up...", "warning")
+        self._stopping = True
+        self._update_controls()
 
     def _calculate_estimated_duration(self) -> float:
         """Calculate estimated total duration for selected titles."""
@@ -574,50 +654,70 @@ class FFmpegDVDGUIWidget(QWidget):
             duration_str = f"{hours}h {minutes}m"
         else:
             duration_str = "Unknown"
-        self.queue_label.setText(f"Queue: {job_count} jobs loaded (Total duration: {duration_str})")
+        text = f"Queue: {job_count} jobs loaded (Total duration: {duration_str})"
+        if pending := len(self._pending_probes):
+            text += f" - scanning {pending} disc(s)..."
+        self.queue_label.setText(text)
 
     def on_progress(self, row, pct):
+        if not self._accept_worker_events:
+            return
         if 0 <= row < self.tree.topLevelItemCount():
             if item := self.tree.topLevelItem(row):
                 if bar := self.tree.itemWidget(item, 7):
                     bar.setValue(max(0, min(100, pct)))
 
     def on_status_text(self, row, text):
+        if not self._accept_worker_events:
+            return
         if 0 <= row < self.tree.topLevelItemCount():
             if item := self.tree.topLevelItem(row):
                 item.setText(6, text)
 
     def on_line(self, row, line, severity="info"):
+        if not self._accept_worker_events:
+            return
         self.console.append(line, severity)
 
     def on_done(self, row, ok, error_message: str):
+        if not self._accept_worker_events:
+            return
         self.completed_jobs[row] = ok
+        stopped = (error_message == "Stopped by user")
         if item := self.tree.topLevelItem(row):
             if ok:
                 item.setText(6, "Done")
+            elif stopped:
+                item.setText(6, "Stopped")
             else:
                 status = "Failed"
                 if error_message:
                     status = f"Failed: {error_message[:50]}..." if len(error_message) > 50 else f"Failed: {error_message}"
                 item.setText(6, status)
 
-        if not ok and error_message:
+        if not ok and error_message and not stopped:
             self.console.append(f"Job {row} failed: {error_message}", "error")
 
-        is_last = (len(self.completed_jobs) >= len(self.worker.jobs_to_run))
-        if self.worker._stop or is_last:
-            self.console.append("=== Queue finished ===", "info")
+    def _on_batch_done(self, stopped: bool):
+        """The worker finished the whole batch - the only place run state resets."""
+        self.work_thread.quit()
 
-            success_count = sum(1 for success in self.completed_jobs.values() if success)
-            total_count = len(self.completed_jobs)
-
-            if success_count == total_count:
-                self.console.append(f"Completed: {success_count}/{total_count} jobs successful", "success")
+        if self._accept_worker_events:
+            if stopped:
+                self.console.append("=== Queue stopped ===", "warning")
             else:
-                self.console.append(f"Completed: {success_count}/{total_count} jobs successful", "warning")
+                self.console.append("=== Queue finished ===", "info")
 
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
-            self.running = False
-            self.current_job_row = None
-            self.work_thread.quit()
+            total_count = len(self.completed_jobs)
+            success_count = sum(1 for success in self.completed_jobs.values() if success)
+            if total_count:
+                self.console.append(
+                    f"Completed: {success_count}/{total_count} jobs successful",
+                    "success" if success_count == total_count else "warning"
+                )
+
+        self._accept_worker_events = False
+        self.running = False
+        self._stopping = False
+        self.current_job_row = None
+        self._update_controls()
